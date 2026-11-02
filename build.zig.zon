@@ -1,0 +1,14 @@
+.{
+    .name = .visar,
+    .version = "0.1.0",
+    .fingerprint = 0x62c4c604faf660ed,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "include",
+        "README.md",
+        "LICENSE",
+    },
+}
