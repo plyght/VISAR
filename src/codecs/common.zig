@@ -49,12 +49,12 @@ pub const DecodeError = error{
     TooLarge,
     /// Ran out of data.
     Truncated,
-} || std.mem.Allocator.Error;
+} || core.Error || std.mem.Allocator.Error;
 
 pub const EncodeError = error{
     /// The image's depth or channel count cannot be stored in this format.
     Unsupported,
-} || std.mem.Allocator.Error;
+} || core.Error || std.mem.Allocator.Error;
 
 /// Applies `mode` and `order` to a freshly decoded 8- or 16-bit image whose
 /// colour channels are in RGB(A) order. Takes ownership of `img`; returns a

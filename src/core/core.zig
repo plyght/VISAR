@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 pub const image = @import("image.zig");
 pub const pool = @import("pool.zig");
 pub const sat = @import("saturate.zig");
+pub const arith = @import("arith.zig");
 
 pub const Image = image.Image;
 pub const AnyImage = image.AnyImage;
