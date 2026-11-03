@@ -263,6 +263,14 @@ inline fn hi8(v: anytype) @Vector(8, i16) {
     return a[8..16].*;
 }
 
+/// Sum-only variant of madd: lanes pair a[i] with a[i + 8] instead of
+/// neighbours, which NEON does with smull + smlal2 and no shuffles. Only
+/// for accumulators that are reduced over all lanes.
+inline fn maddSum(a: V16, b: V16) V8 {
+    if (comptime use_asm_madd) return madd(a, b);
+    return @as(V8, lo8(a)) * @as(V8, lo8(b)) + @as(V8, hi8(a)) * @as(V8, hi8(b));
+}
+
 inline fn load16(comptime T: type, p: [*]const T, i: usize) V16 {
     const v: @Vector(16, T) = p[i..][0..16].*;
     return v;
@@ -271,6 +279,21 @@ inline fn load16(comptime T: type, p: [*]const T, i: usize) V16 {
 /// Bilinear samples of 16 consecutive elements at p[x] (neighbours at +cn
 /// and one row down), descaled by `shift`: the two halves as i32.
 inline fn bilin16(comptime T: type, p: [*]const T, stride: usize, x: usize, cn: usize, w01: V16, w23: V16, comptime shift: comptime_int) [2]V8 {
+    if (comptime !use_asm_madd) {
+        // Without pmaddwd (NEON): planar widening multiply-accumulates
+        // (smull/smlal), no interleave/deinterleave. Same integers.
+        const wa: [16]i16 = w01;
+        const wb: [16]i16 = w23;
+        const t: [4]V16 = .{ load16(T, p, x), load16(T, p, x + cn), load16(T, p, x + stride), load16(T, p, x + stride + cn) };
+        const ws = [4]V8{ @splat(wa[0]), @splat(wa[1]), @splat(wb[0]), @splat(wb[1]) };
+        var lo: V8 = @splat(1 << (shift - 1));
+        var hi: V8 = lo;
+        inline for (0..4) |k| {
+            lo += @as(V8, lo8(t[k])) * ws[k];
+            hi += @as(V8, hi8(t[k])) * ws[k];
+        }
+        return .{ lo >> @splat(shift), hi >> @splat(shift) };
+    }
     if (T == u8) {
         // Interleave the bytes first, then widen: cheaper than zipping
         // 16-bit lanes across register halves.
@@ -527,9 +550,9 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                         iwin[k + 8 ..][0..8].* = ival[1];
                         ixw[k..][0..16].* = gx;
                         iyw[k..][0..16].* = gy;
-                        s11 += madd(gx, gx);
-                        s12 += madd(gx, gy);
-                        s22 += madd(gy, gy);
+                        s11 += maddSum(gx, gx);
+                        s12 += maddSum(gx, gy);
+                        s22 += maddSum(gy, gy);
                         cnt += 1;
                         if (cnt == flush_every) {
                             a11 += @as(VL, s11);
@@ -586,8 +609,8 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                             const k = y * rl + x;
                             const jval = bilin16(u8, jrow, pJ.stride, x, cn, w01, w23, w_bits - 5);
                             const diff = pack(.{ jval[0] - @as(V8, iwin[k..][0..8].*), jval[1] - @as(V8, iwin[k + 8 ..][0..8].*) });
-                            t1 += madd(diff, ixw[k..][0..16].*);
-                            t2 += madd(diff, iyw[k..][0..16].*);
+                            t1 += maddSum(diff, ixw[k..][0..16].*);
+                            t2 += maddSum(diff, iyw[k..][0..16].*);
                             tc += 1;
                             if (tc == flush_every) {
                                 b1 += @as(VL, t1);
