@@ -346,7 +346,7 @@ fn Weights(comptime T: type) type {
                 const c: @Vector(N, i32) = r1[x..][0..N].*;
                 const t = (mulhi(a >> @splat(4), b0v) + mulhi(c >> @splat(4), b1v) + two) >> @splat(2);
                 const cl = @max(@min(t, @as(@Vector(N, i32), @splat(255))), @as(@Vector(N, i32), @splat(0)));
-                const out: @Vector(N, u8) = @intCast(cl);
+                const out: @Vector(N, u8) = core.simd.narrow(u8, cl);
                 d[x..][0..N].* = out;
             }
             while (x < d.len) : (x += 1) {

@@ -483,7 +483,7 @@ fn vcubic(r: [4][]const i32, b: [4]i32, d: []u8) void {
         const v = @mulAdd(F, s[0], bv[0], @mulAdd(F, s[1], bv[1], @mulAdd(F, s[2], bv[2], s[3] * bv[3])));
         const q: I = @intFromFloat(@min(@max(sat.rint(v), @as(F, @splat(-1.0))), @as(F, @splat(256.0))));
         const cl = @max(@min(q, @as(I, @splat(255))), @as(I, @splat(0)));
-        d[x..][0..N].* = @as(@Vector(N, u8), @intCast(cl));
+        d[x..][0..N].* = simd.narrow(u8, cl);
     }
     const bs = [4]f32{ bv[0][0], bv[1][0], bv[2][0], bv[3][0] };
     while (x < d.len) : (x += 1) {

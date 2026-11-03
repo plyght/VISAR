@@ -547,7 +547,7 @@ inline fn warpLinear16(comptime cn: usize, s: Image(u8), fx: VF, fy: VF, ax: VF,
         const bits: @Vector(WN, i32) = @bitCast(v + @as(VF, @splat(12582912.0)));
         const q = bits - @as(@Vector(WN, i32), @splat(0x4B400000));
         const cl = @min(@max(q, @as(@Vector(WN, i32), @splat(0))), @as(@Vector(WN, i32), @splat(255)));
-        outs[ch] = @intCast(cl);
+        outs[ch] = core.simd.narrow(u8, cl);
     }
     if (cn == 1) {
         d[0..16].* = outs[0];
