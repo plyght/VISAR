@@ -87,6 +87,7 @@ pub const Animation = struct {
     pub fn finish(self: *Animation) Allocator.Error![]u8 {
         try self.out.append(self.gpa, 0x3B);
         self.gpa.free(self.indices);
+        self.indices = &.{}; // `deinit` may still run after this.
         return self.out.toOwnedSlice(self.gpa);
     }
 
