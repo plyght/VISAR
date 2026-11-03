@@ -224,3 +224,238 @@ def connected_components_with_stats(a, connectivity=8):
                                           stats.shape[0], ctypes.byref(count)))
     n = count.value
     return n, labels, stats[:n].copy(), cents[:n].copy()
+
+
+# ------------------------------------------------------------- contours
+
+class Contours(ctypes.Structure):
+    _fields_ = [
+        ("count", ctypes.c_size_t),
+        ("total", ctypes.c_size_t),
+        ("points", ctypes.POINTER(ctypes.c_int32)),
+        ("starts", ctypes.POINTER(ctypes.c_size_t)),
+        ("hierarchy", ctypes.POINTER(ctypes.c_int32)),
+    ]
+
+
+def find_contours(a, mode, method, offset=(0, 0), raw=False):
+    """Returns (contours, hierarchy) shaped like cv2.findContours: a tuple of
+    N x 1 x 2 int32 arrays and a 1 x N x 4 hierarchy (None when empty).
+    With raw=True returns (points (P x 2), starts (N + 1), hierarchy (N x 4))."""
+    out = Contours()
+    _check(lib.visar_find_contours(ctypes.byref(desc(a)), mode, method, offset[0], offset[1], ctypes.byref(out)))
+    try:
+        n, total = out.count, out.total
+        if n == 0:
+            if raw:
+                return np.zeros((0, 2), np.int32), np.zeros(1, np.uintp), np.zeros((0, 4), np.int32)
+            return (), None
+        pts = np.ctypeslib.as_array(out.points, (total * 2,)).reshape(-1, 2).copy()
+        starts = np.ctypeslib.as_array(out.starts, (n + 1,)).copy()
+        hier = np.ctypeslib.as_array(out.hierarchy, (n * 4,)).reshape(n, 4).copy()
+    finally:
+        lib.visar_contours_free(ctypes.byref(out))
+    if raw:
+        return pts, starts, hier
+    cs = tuple(pts[starts[i]:starts[i + 1]].reshape(-1, 1, 2) for i in range(n))
+    return cs, hier.reshape(1, n, 4)
+
+
+def _poly_args(polys):
+    """(points, starts) arrays for a list of point arrays (any N x ... x 2 shape)."""
+    arrs = [np.ascontiguousarray(np.asarray(p, np.int32).reshape(-1, 2)) for p in polys]
+    starts = np.zeros(len(arrs) + 1, np.uintp)
+    if arrs:
+        starts[1:] = np.cumsum([len(a) for a in arrs])
+    pts = np.ascontiguousarray(np.concatenate(arrs) if arrs else np.zeros((0, 2), np.int32))
+    return pts, starts
+
+
+def _color(c):
+    c = list(c) if isinstance(c, (tuple, list)) else [c]
+    c = (c + [c[-1]] * 4)[:4] if len(c) < 4 else c[:4]
+    return (ctypes.c_double * 4)(*c)
+
+
+def _iptr(a):
+    return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+
+
+def _sptr(a):
+    return a.ctypes.data_as(ctypes.POINTER(ctypes.c_size_t))
+
+
+def draw_contours(img, contours, idx, color, thickness=1, line_type=8, hierarchy=None, max_level=2**31 - 1, offset=(0, 0)):
+    """In place, like cv2.drawContours."""
+    pts, starts = _poly_args(contours)
+    h = None if hierarchy is None else np.ascontiguousarray(np.asarray(hierarchy, np.int32).reshape(-1, 4))
+    _check(lib.visar_draw_contours(ctypes.byref(desc(img)), _iptr(pts), _sptr(starts), len(contours),
+                                   None if h is None else _iptr(h), idx, _color(color), thickness, line_type,
+                                   max_level, offset[0], offset[1]))
+    return img
+
+
+def fill_poly(img, polys, color, line_type=8, offset=(0, 0)):
+    pts, starts = _poly_args(polys)
+    _check(lib.visar_fill_poly(ctypes.byref(desc(img)), _iptr(pts), _sptr(starts), len(polys), _color(color),
+                               line_type, offset[0], offset[1]))
+    return img
+
+
+def polylines(img, polys, closed, color, thickness=1, line_type=8):
+    pts, starts = _poly_args(polys)
+    _check(lib.visar_polylines(ctypes.byref(desc(img)), _iptr(pts), _sptr(starts), len(polys), int(closed),
+                               _color(color), thickness, line_type))
+    return img
+
+
+# ---------------------------------------------------------------- shape
+
+MOMENT_KEYS = ["m00", "m10", "m01", "m20", "m11", "m02", "m30", "m21", "m12", "m03",
+               "mu20", "mu11", "mu02", "mu30", "mu21", "mu12", "mu03",
+               "nu20", "nu11", "nu02", "nu30", "nu21", "nu12", "nu03"]
+
+
+class Moments(ctypes.Structure):
+    _fields_ = [(k, ctypes.c_double) for k in MOMENT_KEYS]
+
+    def as_dict(self):
+        return {k: getattr(self, k) for k in MOMENT_KEYS}
+
+
+class RotatedRect(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_float), ("cy", ctypes.c_float), ("w", ctypes.c_float),
+                ("h", ctypes.c_float), ("angle", ctypes.c_float)]
+
+
+def _pts(p):
+    """(pointer, count, depth) for a point set given as an int32 or float32 array of N (x, y) pairs."""
+    a = np.asarray(p)
+    if a.dtype not in (np.int32, np.float32):
+        raise ValueError("points must be int32 or float32")
+    a = np.ascontiguousarray(a.reshape(-1, 2))
+    return a, ctypes.c_void_p(a.ctypes.data if len(a) else None), len(a), 4 if a.dtype == np.int32 else 5
+
+
+def moments(a, binary=False):
+    """cv2.moments: a point set (int32/float32 N x 2) or a single-channel image."""
+    m = Moments()
+    a = np.asarray(a)
+    if a.dtype in (np.int32, np.float32) and ((a.ndim == 3 and a.shape[1:] == (1, 2)) or (a.ndim == 2 and a.shape[1] == 2)):
+        keep, ptr, n, d = _pts(a)
+        _check(lib.visar_contour_moments(ptr, ctypes.c_size_t(n), d, ctypes.byref(m)))
+    else:
+        _check(lib.visar_moments(ctypes.byref(desc(a)), int(binary), ctypes.byref(m)))
+    return m.as_dict()
+
+
+def hu_moments(md):
+    m = Moments(*[md[k] for k in MOMENT_KEYS])
+    hu = (ctypes.c_double * 7)()
+    lib.visar_hu_moments(ctypes.byref(m), hu)
+    return np.array(hu[:]).reshape(7, 1)
+
+
+def _scalar(fn, p, *args, ctype=ctypes.c_double):
+    keep, ptr, n, d = _pts(p)
+    out = ctype()
+    _check(fn(ptr, ctypes.c_size_t(n), d, *args, ctypes.byref(out)))
+    return out.value
+
+
+def contour_area(p, oriented=False):
+    return _scalar(lib.visar_contour_area, p, int(oriented))
+
+
+def arc_length(p, closed):
+    return _scalar(lib.visar_arc_length, p, int(closed))
+
+
+def is_contour_convex(p):
+    return bool(_scalar(lib.visar_is_contour_convex, p, ctype=ctypes.c_int))
+
+
+def point_polygon_test(p, pt, measure_dist):
+    return _scalar(lib.visar_point_polygon_test, p, ctypes.c_float(pt[0]), ctypes.c_float(pt[1]), int(measure_dist))
+
+
+def bounding_rect(a):
+    r = (ctypes.c_int32 * 4)()
+    a = np.asarray(a)
+    if a.dtype == np.uint8:
+        _check(lib.visar_mask_bounding_rect(ctypes.byref(desc(a)), r))
+    else:
+        keep, ptr, n, d = _pts(a)
+        _check(lib.visar_bounding_rect(ptr, ctypes.c_size_t(n), d, r))
+    return tuple(r[:])
+
+
+def convex_hull(p, clockwise=False, return_points=True):
+    keep, ptr, n, d = _pts(p)
+    idx = np.empty(max(n, 1), np.int32)
+    cnt = ctypes.c_size_t(0)
+    _check(lib.visar_convex_hull(ptr, ctypes.c_size_t(n), d, int(clockwise), int(return_points),
+                                 idx.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), ctypes.byref(cnt)))
+    idx = idx[:cnt.value]
+    if return_points:
+        return keep[idx].reshape(-1, 1, 2)
+    return idx.reshape(-1, 1)
+
+
+def convexity_defects(p, hull):
+    keep, ptr, n, d = _pts(p)
+    h = np.ascontiguousarray(np.asarray(hull, np.int32).ravel())
+    out = np.empty((max(len(h), 1), 4), np.int32)
+    cnt = ctypes.c_size_t(0)
+    _check(lib.visar_convexity_defects(ptr, ctypes.c_size_t(n), h.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                                       ctypes.c_size_t(len(h)), out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                                       ctypes.byref(cnt)))
+    if cnt.value == 0:
+        return None
+    return out[:cnt.value].copy()
+
+
+def min_area_rect(p):
+    keep, ptr, n, d = _pts(p)
+    r = RotatedRect()
+    _check(lib.visar_min_area_rect(ptr, ctypes.c_size_t(n), d, ctypes.byref(r)))
+    return (r.cx, r.cy), (r.w, r.h), r.angle
+
+
+def box_points(box):
+    (cx, cy), (w, h), a = box
+    r = RotatedRect(cx, cy, w, h, a)
+    out = (ctypes.c_float * 8)()
+    lib.visar_box_points(ctypes.byref(r), out)
+    return np.array(out[:], np.float32).reshape(4, 2)
+
+
+def min_enclosing_circle(p):
+    keep, ptr, n, d = _pts(p)
+    out = (ctypes.c_float * 3)()
+    _check(lib.visar_min_enclosing_circle(ptr, ctypes.c_size_t(n), d, out))
+    return (out[0], out[1]), out[2]
+
+
+def approx_poly_dp(p, epsilon, closed):
+    keep, ptr, n, d = _pts(p)
+    out = np.empty((max(n, 1), 2), keep.dtype)
+    cnt = ctypes.c_size_t(0)
+    _check(lib.visar_approx_poly_dp(ptr, ctypes.c_size_t(n), d, ctypes.c_double(epsilon), int(closed),
+                                    ctypes.c_void_p(out.ctypes.data), ctypes.byref(cnt)))
+    return out[:cnt.value].reshape(-1, 1, 2)
+
+
+def match_shapes(a, b, method):
+    ka, pa, na, da = _pts(a)
+    kb, pb, nb, db = _pts(b)
+    out = ctypes.c_double()
+    _check(lib.visar_match_shapes(pa, ctypes.c_size_t(na), da, pb, ctypes.c_size_t(nb), db, method, ctypes.byref(out)))
+    return out.value
+
+
+def fit_ellipse(p):
+    keep, ptr, n, d = _pts(p)
+    r = RotatedRect()
+    _check(lib.visar_fit_ellipse(ptr, ctypes.c_size_t(n), d, ctypes.byref(r)))
+    return (r.cx, r.cy), (r.w, r.h), r.angle

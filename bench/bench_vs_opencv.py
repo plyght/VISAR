@@ -96,6 +96,30 @@ def cases(h, w):
     jpgb = jpg.tobytes()
     yield "imdecode JPEG", lambda: vs.imdecode(jpgb), lambda: cv2.imdecode(jpg, cv2.IMREAD_UNCHANGED)
     yield "imencode JPEG q90", lambda: vs.imencode(".jpg", bgr, quality=90), lambda: cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    yield from contour_cases(h, w)
+
+
+def blob_mask(h, w, n=None, seed=7):
+    """A binary mask with many filled and ring-shaped blobs."""
+    rng = np.random.default_rng(seed)
+    m = np.zeros((h, w), np.uint8)
+    for _ in range(n or max(1, h * w // 700)):
+        x, y, r = int(rng.integers(0, w)), int(rng.integers(0, h)), int(rng.integers(2, max(3, min(h, w) // 40)))
+        cv2.circle(m, (x, y), r, 255, -1 if rng.random() < 0.7 else 2)
+    return m
+
+
+def contour_cases(h, w):
+    mask = blob_mask(h, w)
+    yield "findContours TREE simple", lambda: vs.find_contours(mask, 3, 2, raw=True), lambda: cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    yield "findContours EXT none", lambda: vs.find_contours(mask, 0, 1, raw=True), lambda: cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    yield "moments binary", lambda: vs.moments(mask, True), lambda: cv2.moments(mask, True)
+    big = max(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0], key=len)
+    rng = np.random.default_rng(3)
+    cloud = rng.integers(0, max(h, w), (20000, 1, 2)).astype(np.int32)
+    yield "contour moments", lambda: vs.moments(big), lambda: cv2.moments(big)
+    yield "convexHull 20k pts", lambda: vs.convex_hull(cloud), lambda: cv2.convexHull(cloud)
+    yield "approxPolyDP", lambda: vs.approx_poly_dp(big, 2.0, True), lambda: cv2.approxPolyDP(big, 2.0, True)
 
 
 def main():

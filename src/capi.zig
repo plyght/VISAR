@@ -318,6 +318,294 @@ export fn visar_connected_components(src: *const CImage, labels: *const CImage, 
     return 0;
 }
 
+// -------------------------------------------------------------- contours
+
+/// Variable-length contour output, owned by VISAR until visar_contours_free.
+pub const CContours = extern struct {
+    count: usize,
+    total: usize,
+    points: ?[*]i32,
+    starts: ?[*]usize,
+    hierarchy: ?[*]i32,
+};
+
+/// findContours. mode: RETR_EXTERNAL 0, LIST 1, CCOMP 2, TREE 3; method:
+/// CHAIN_APPROX_NONE 1, SIMPLE 2, TC89_L1 3, TC89_KCOS 4.
+export fn visar_find_contours(src: *const CImage, mode: c_int, method: c_int, ox: c_int, oy: c_int, out: *CContours) c_int {
+    out.* = .{ .count = 0, .total = 0, .points = null, .starts = null, .hierarchy = null };
+    const s = typed(u8, src) catch |e| return fail(e);
+    const m = std.enums.fromInt(ip.ContourMode, mode) orelse return fail(error.Unsupported);
+    const a = std.enums.fromInt(ip.ContourMethod, method) orelse return fail(error.Unsupported);
+    const c = ip.findContours(gpa, s, m, a, .{ .x = ox, .y = oy }) catch |e| return fail(e);
+    if (c.len() == 0) return 0;
+    out.* = .{
+        .count = c.len(),
+        .total = c.points.len,
+        .points = @ptrCast(c.points.ptr),
+        .starts = c.starts.ptr,
+        .hierarchy = @ptrCast(c.hierarchy.ptr),
+    };
+    return 0;
+}
+
+export fn visar_contours_free(c: *CContours) void {
+    if (c.count != 0) {
+        var r: ip.Contours = .{
+            .points = @as([*]ip.Point, @ptrCast(c.points.?))[0..c.total],
+            .starts = c.starts.?[0 .. c.count + 1],
+            .hierarchy = @as([*][4]i32, @ptrCast(c.hierarchy.?))[0..c.count],
+        };
+        r.deinit(gpa);
+    }
+    c.* = .{ .count = 0, .total = 0, .points = null, .starts = null, .hierarchy = null };
+}
+
+fn colorBytes(color: *const [4]f64) [4]u8 {
+    var c: [4]u8 = undefined;
+    for (color, &c) |v, *o| o.* = core.sat.cast(u8, v);
+    return c;
+}
+
+fn lineType(t: c_int) !ip.LineType {
+    return switch (t) {
+        1, 4 => .four,
+        0, 8 => .eight,
+        else => error.Unsupported, // LINE_AA is not implemented
+    };
+}
+
+fn contourView(points: [*]const i32, starts: [*]const usize, count: usize) ip.Contours {
+    const total = starts[count];
+    return .{
+        .points = @constCast(@as([*]const ip.Point, @ptrCast(points))[0..total]),
+        .starts = @constCast(starts[0 .. count + 1]),
+        .hierarchy = &.{},
+    };
+}
+
+/// drawContours on an 8-bit image. The contours use the visar_contours
+/// layout (points, starts with count + 1 entries); hierarchy (count * 4)
+/// may be NULL. thickness < 0 fills. line_type: 8 or 4.
+export fn visar_draw_contours(img: *const CImage, points: [*]const i32, starts: [*]const usize, count: usize, hierarchy: ?[*]const i32, index: c_int, color: *const [4]f64, thickness: c_int, line_type: c_int, max_level: c_int, ox: c_int, oy: c_int) c_int {
+    const im = typed(u8, img) catch |e| return fail(e);
+    const lt = lineType(line_type) catch |e| return fail(e);
+    const cs = contourView(points, starts, count);
+    const h: ?[]const [4]i32 = if (hierarchy) |p| @as([*]const [4]i32, @ptrCast(p))[0..count] else null;
+    const col = colorBytes(color);
+    return run(ip.drawContours(gpa, im, cs, index, &col, thickness, lt, h, max_level, .{ .x = ox, .y = oy }));
+}
+
+/// fillPoly with the same polygon layout as visar_draw_contours.
+export fn visar_fill_poly(img: *const CImage, points: [*]const i32, starts: [*]const usize, count: usize, color: *const [4]f64, line_type: c_int, ox: c_int, oy: c_int) c_int {
+    const im = typed(u8, img) catch |e| return fail(e);
+    const lt = lineType(line_type) catch |e| return fail(e);
+    const cs = contourView(points, starts, count);
+    const polys = gpa.alloc([]const ip.Point, count) catch |e| return fail(e);
+    defer gpa.free(polys);
+    for (polys, 0..) |*p, i| p.* = cs.get(i);
+    const col = colorBytes(color);
+    return run(ip.fillPoly(gpa, im, polys, &col, lt, .{ .x = ox, .y = oy }));
+}
+
+/// polylines with the same polygon layout as visar_draw_contours.
+export fn visar_polylines(img: *const CImage, points: [*]const i32, starts: [*]const usize, count: usize, closed: c_int, color: *const [4]f64, thickness: c_int, line_type: c_int) c_int {
+    const im = typed(u8, img) catch |e| return fail(e);
+    const lt = lineType(line_type) catch |e| return fail(e);
+    if (thickness < 0) return fail(error.InvalidArgument);
+    const cs = contourView(points, starts, count);
+    const col = colorBytes(color);
+    for (0..count) |i| ip.polylines(im, cs.get(i), closed != 0, &col, @intCast(thickness), lt);
+    return 0;
+}
+
+// ----------------------------------------------------------------- shape
+
+/// Calls `f(pts, ctx)` with the point set as []const Point (depth
+/// VISAR_32S) or []const Point2f (VISAR_32F).
+fn withPoints(pts: ?*const anyopaque, n: usize, depth: c_int, ctx: anytype, comptime f: anytype) anyerror!void {
+    if (n != 0 and pts == null) return error.InvalidArgument;
+    return switch (depth) {
+        4 => f(if (n == 0) @as([]const ip.Point, &.{}) else @as([*]const ip.Point, @ptrCast(@alignCast(pts.?)))[0..n], ctx),
+        5 => f(if (n == 0) @as([]const ip.Point2f, &.{}) else @as([*]const ip.Point2f, @ptrCast(@alignCast(pts.?)))[0..n], ctx),
+        else => error.Unsupported,
+    };
+}
+
+/// Raster moments of a single-channel image (8U, 16U, 16S or 32F).
+export fn visar_moments(img: *const CImage, binary: c_int, out: *ip.Moments) c_int {
+    return run(switch (img.depth) {
+        0 => blk: {
+            const s = typed(u8, img) catch |e| break :blk e;
+            break :blk if (ip.imageMoments(u8, exec(), gpa, s, binary != 0)) |m| {
+                out.* = m;
+            } else |e| e;
+        },
+        2 => blk: {
+            const s = typed(u16, img) catch |e| break :blk e;
+            break :blk if (ip.imageMoments(u16, exec(), gpa, s, binary != 0)) |m| {
+                out.* = m;
+            } else |e| e;
+        },
+        3 => blk: {
+            const s = typed(i16, img) catch |e| break :blk e;
+            break :blk if (ip.imageMoments(i16, exec(), gpa, s, binary != 0)) |m| {
+                out.* = m;
+            } else |e| e;
+        },
+        5 => blk: {
+            const s = typed(f32, img) catch |e| break :blk e;
+            break :blk if (ip.imageMoments(f32, exec(), gpa, s, binary != 0)) |m| {
+                out.* = m;
+            } else |e| e;
+        },
+        else => error.Unsupported,
+    });
+}
+
+export fn visar_contour_moments(pts: ?*const anyopaque, n: usize, depth: c_int, out: *ip.Moments) c_int {
+    return run(withPoints(pts, n, depth, out, struct {
+        fn f(p: anytype, o: *ip.Moments) !void {
+            o.* = ip.contourMoments(p);
+        }
+    }.f));
+}
+
+export fn visar_hu_moments(m: *const ip.Moments, hu: *[7]f64) void {
+    hu.* = ip.huMoments(m.*);
+}
+
+export fn visar_contour_area(pts: ?*const anyopaque, n: usize, depth: c_int, oriented: c_int, out: *f64) c_int {
+    return run(withPoints(pts, n, depth, .{ out, oriented != 0 }, struct {
+        fn f(p: anytype, c: anytype) !void {
+            c[0].* = ip.contourArea(p, c[1]);
+        }
+    }.f));
+}
+
+export fn visar_arc_length(pts: ?*const anyopaque, n: usize, depth: c_int, closed: c_int, out: *f64) c_int {
+    return run(withPoints(pts, n, depth, .{ out, closed != 0 }, struct {
+        fn f(p: anytype, c: anytype) !void {
+            c[0].* = ip.arcLength(p, c[1]);
+        }
+    }.f));
+}
+
+export fn visar_bounding_rect(pts: ?*const anyopaque, n: usize, depth: c_int, out: *ip.Rect) c_int {
+    return run(withPoints(pts, n, depth, out, struct {
+        fn f(p: anytype, o: *ip.Rect) !void {
+            o.* = ip.boundingRect(p);
+        }
+    }.f));
+}
+
+export fn visar_mask_bounding_rect(img: *const CImage, out: *ip.Rect) c_int {
+    const s = typed(u8, img) catch |e| return fail(e);
+    if (s.channels != 1) return fail(error.UnsupportedChannels);
+    out.* = ip.maskBoundingRect(s);
+    return 0;
+}
+
+/// Writes up to n hull indices (into the input) to `indices`.
+export fn visar_convex_hull(pts: ?*const anyopaque, n: usize, depth: c_int, clockwise: c_int, return_points: c_int, indices: [*]i32, count: *usize) c_int {
+    count.* = 0;
+    return run(withPoints(pts, n, depth, .{ indices, count, clockwise != 0, return_points != 0 }, struct {
+        fn f(p: anytype, c: anytype) !void {
+            const h = try ip.convexHull(gpa, p, c[2], c[3]);
+            defer gpa.free(h);
+            for (h, 0..) |v, i| c[0][i] = @intCast(v);
+            c[1].* = h.len;
+        }
+    }.f));
+}
+
+/// Writes up to hull_len defects (start, end, farthest, depth * 256).
+export fn visar_convexity_defects(pts: [*]const ip.Point, n: usize, hull: [*]const i32, hull_len: usize, out: [*]i32, count: *usize) c_int {
+    count.* = 0;
+    const h = gpa.alloc(u32, hull_len) catch |e| return fail(e);
+    defer gpa.free(h);
+    for (h, hull[0..hull_len]) |*d, s| {
+        if (s < 0) return fail(error.InvalidArgument);
+        d.* = @intCast(s);
+    }
+    const d = ip.convexityDefects(gpa, pts[0..n], h) catch |e| return fail(e);
+    defer gpa.free(d);
+    for (d, 0..) |v, i| out[i * 4 ..][0..4].* = v;
+    count.* = d.len;
+    return 0;
+}
+
+export fn visar_is_contour_convex(pts: ?*const anyopaque, n: usize, depth: c_int, out: *c_int) c_int {
+    return run(withPoints(pts, n, depth, out, struct {
+        fn f(p: anytype, o: *c_int) !void {
+            o.* = @intFromBool(ip.isContourConvex(p));
+        }
+    }.f));
+}
+
+export fn visar_min_area_rect(pts: ?*const anyopaque, n: usize, depth: c_int, out: *ip.RotatedRect) c_int {
+    return run(withPoints(pts, n, depth, out, struct {
+        fn f(p: anytype, o: *ip.RotatedRect) !void {
+            o.* = try ip.minAreaRect(gpa, p);
+        }
+    }.f));
+}
+
+export fn visar_box_points(box: *const ip.RotatedRect, out: *[4]ip.Point2f) void {
+    out.* = ip.boxPoints(box.*);
+}
+
+/// out: center x, center y, radius.
+export fn visar_min_enclosing_circle(pts: ?*const anyopaque, n: usize, depth: c_int, out: *[3]f32) c_int {
+    return run(withPoints(pts, n, depth, out, struct {
+        fn f(p: anytype, o: *[3]f32) !void {
+            const c = try ip.minEnclosingCircle(gpa, p);
+            o.* = .{ c.cx, c.cy, c.radius };
+        }
+    }.f));
+}
+
+/// out: room for n points of the input's depth.
+export fn visar_approx_poly_dp(pts: ?*const anyopaque, n: usize, depth: c_int, epsilon: f64, closed: c_int, out: *anyopaque, count: *usize) c_int {
+    count.* = 0;
+    return run(withPoints(pts, n, depth, .{ out, count, epsilon, closed != 0 }, struct {
+        fn f(p: anytype, c: anytype) !void {
+            const P = std.meta.Elem(@TypeOf(p));
+            const o = @as([*]P, @ptrCast(@alignCast(c[0])))[0..p.len];
+            c[1].* = try ip.approxPolyDP(gpa, p, o, c[2], c[3]);
+        }
+    }.f));
+}
+
+export fn visar_point_polygon_test(pts: ?*const anyopaque, n: usize, depth: c_int, x: f32, y: f32, measure_dist: c_int, out: *f64) c_int {
+    return run(withPoints(pts, n, depth, .{ out, ip.Point2f{ .x = x, .y = y }, measure_dist != 0 }, struct {
+        fn f(p: anytype, c: anytype) !void {
+            c[0].* = ip.pointPolygonTest(p, c[1], c[2]);
+        }
+    }.f));
+}
+
+/// matchShapes of two contours; method CONTOURS_MATCH_I1..I3 (1..3).
+export fn visar_match_shapes(a: ?*const anyopaque, na: usize, da: c_int, b: ?*const anyopaque, nb: usize, db: c_int, method: c_int, out: *f64) c_int {
+    var ma: ip.Moments = undefined;
+    var mb: ip.Moments = undefined;
+    const r1 = visar_contour_moments(a, na, da, &ma);
+    if (r1 != 0) return r1;
+    const r2 = visar_contour_moments(b, nb, db, &mb);
+    if (r2 != 0) return r2;
+    if (method < 1 or method > 3) return fail(error.InvalidArgument);
+    out.* = ip.matchShapes(ma, mb, @intCast(method)) catch |e| return fail(e);
+    return 0;
+}
+
+/// fitEllipse (at least 5 points).
+export fn visar_fit_ellipse(pts: ?*const anyopaque, n: usize, depth: c_int, out: *ip.RotatedRect) c_int {
+    return run(withPoints(pts, n, depth, out, struct {
+        fn f(p: anytype, o: *ip.RotatedRect) !void {
+            o.* = try ip.fitEllipse(gpa, p);
+        }
+    }.f));
+}
+
 // ---------------------------------------------------------------- codecs
 
 /// Decodes an image file held in memory. `mode` is OpenCV's IMREAD flag

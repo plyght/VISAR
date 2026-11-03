@@ -61,6 +61,62 @@ int visar_equalize_hist(const visar_image *src, const visar_image *dst);
 /* labels: VISAR_32S image; stats: max rows of left, top, width, height, area; centroids: max rows of cx, cy */
 int visar_connected_components(const visar_image *src, const visar_image *labels, int connectivity, int32_t *stats, double *centroids, size_t max, size_t *count);
 
+/* contours: results are VISAR-owned buffers, released with visar_contours_free.
+ * Contour i is points[2*starts[i] .. 2*starts[i+1]) as (x, y) pairs;
+ * hierarchy[4*i .. 4*i+4) is OpenCV's [next, previous, first child, parent]. */
+typedef struct visar_contours {
+    size_t count;       /* number of contours */
+    size_t total;       /* number of points over all contours */
+    int32_t *points;    /* total (x, y) pairs */
+    size_t *starts;     /* count + 1 offsets into points (in points, not ints) */
+    int32_t *hierarchy; /* count * 4 */
+} visar_contours;
+/* mode: RETR_EXTERNAL 0, RETR_LIST 1, RETR_CCOMP 2, RETR_TREE 3;
+ * method: CHAIN_APPROX_NONE 1, SIMPLE 2, TC89_L1 3, TC89_KCOS 4. src: 8-bit, 1 channel, nonzero = foreground */
+int visar_find_contours(const visar_image *src, int mode, int method, int offset_x, int offset_y, visar_contours *out);
+void visar_contours_free(visar_contours *contours);
+
+/* drawing (8-bit images; matches OpenCV pixel for pixel). Polygons use the
+ * visar_contours layout: points (x, y pairs) and starts (count + 1 entries).
+ * color: per-channel values (like cv::Scalar); line_type: 8 (LINE_8) or 4 (LINE_4). */
+int visar_draw_contours(const visar_image *img, const int32_t *points, const size_t *starts, size_t count,
+                        const int32_t *hierarchy /* count * 4 or NULL */, int contour_idx /* -1 = all */,
+                        const double color[4], int thickness /* < 0 fills */, int line_type, int max_level,
+                        int offset_x, int offset_y);
+int visar_fill_poly(const visar_image *img, const int32_t *points, const size_t *starts, size_t count,
+                    const double color[4], int line_type, int offset_x, int offset_y);
+int visar_polylines(const visar_image *img, const int32_t *points, const size_t *starts, size_t count, int closed,
+                    const double color[4], int thickness, int line_type);
+
+/* shape analysis. Point sets are n (x, y) pairs of int32 (depth VISAR_32S)
+ * or float (VISAR_32F), like OpenCV's CV_32SC2 / CV_32FC2. */
+typedef struct visar_moments {
+    double m00, m10, m01, m20, m11, m02, m30, m21, m12, m03;
+    double mu20, mu11, mu02, mu30, mu21, mu12, mu03;
+    double nu20, nu11, nu02, nu30, nu21, nu12, nu03;
+} visar_moments;
+typedef struct visar_rotated_rect { float cx, cy, width, height, angle; } visar_rotated_rect;
+int visar_moments(const visar_image *img /* 1 channel: 8U, 16U, 16S, 32F */, int binary, visar_moments *out);
+int visar_contour_moments(const void *pts, size_t n, int depth, visar_moments *out);
+void visar_hu_moments(const visar_moments *m, double hu[7]);
+int visar_contour_area(const void *pts, size_t n, int depth, int oriented, double *out);
+int visar_arc_length(const void *pts, size_t n, int depth, int closed, double *out);
+int visar_bounding_rect(const void *pts, size_t n, int depth, int32_t rect[4] /* x, y, w, h */);
+int visar_mask_bounding_rect(const visar_image *mask /* 8U, 1 channel */, int32_t rect[4]);
+/* indices: room for n; receives hull indices into pts in OpenCV's order */
+int visar_convex_hull(const void *pts, size_t n, int depth, int clockwise, int return_points, int32_t *indices, size_t *count);
+/* pts: int32; hull: indices from visar_convex_hull(return_points = 0); out: room for hull_len * 4 */
+int visar_convexity_defects(const int32_t *pts, size_t n, const int32_t *hull, size_t hull_len, int32_t *out, size_t *count);
+int visar_is_contour_convex(const void *pts, size_t n, int depth, int *out);
+int visar_min_area_rect(const void *pts, size_t n, int depth, visar_rotated_rect *out);
+void visar_box_points(const visar_rotated_rect *box, float out[8]);
+int visar_min_enclosing_circle(const void *pts, size_t n, int depth, float out[3] /* cx, cy, radius */);
+int visar_fit_ellipse(const void *pts, size_t n, int depth, visar_rotated_rect *out);
+/* out: room for n points of the input depth */
+int visar_approx_poly_dp(const void *pts, size_t n, int depth, double epsilon, int closed, void *out, size_t *count);
+int visar_point_polygon_test(const void *pts, size_t n, int depth, float x, float y, int measure_dist, double *out);
+int visar_match_shapes(const void *a, size_t na, int depth_a, const void *b, size_t nb, int depth_b, int method, double *out);
+
 /* core: op 0 add, 1 subtract, 2 absdiff, 3 multiply, 4 divide, 5 min, 6 max, 7 and, 8 or, 9 xor */
 int visar_arith(int op, const visar_image *a, const visar_image *b, const visar_image *dst);
 int visar_add_weighted(const visar_image *a, double alpha, const visar_image *b, double beta, double gamma, const visar_image *dst);
