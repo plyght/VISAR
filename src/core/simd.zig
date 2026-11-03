@@ -30,6 +30,11 @@ pub inline fn splat(comptime V: type, x: @typeInfo(V).vector.child) V {
 /// Round half to even for f32 values already clamped to |x| < 2^22.
 const arm_cvt = @import("builtin").zig_backend == .stage2_llvm and @import("builtin").cpu.arch == .aarch64;
 extern fn @"llvm.aarch64.neon.fcvtns.v4i32.v4f32"(@Vector(4, f32)) @Vector(4, i32);
+const x86_llvm = @import("builtin").zig_backend == .stage2_llvm and @import("builtin").cpu.arch == .x86_64;
+const x86_avx_cvt = x86_llvm and std.Target.x86.featureSetHas(@import("builtin").cpu.features, .avx);
+const x86_sse_cvt = x86_llvm and std.Target.x86.featureSetHas(@import("builtin").cpu.features, .sse2);
+extern fn @"llvm.x86.avx.cvt.ps2dq.256"(@Vector(8, f32)) @Vector(8, i32);
+extern fn @"llvm.x86.sse2.cvtps2dq"(@Vector(4, f32)) @Vector(4, i32);
 extern fn @"llvm.aarch64.neon.sqxtun.v4i16"(@Vector(4, i32)) @Vector(4, u16);
 extern fn @"llvm.aarch64.neon.uqxtn.v8i8"(@Vector(8, u16)) @Vector(8, u8);
 
@@ -45,6 +50,19 @@ pub inline fn roundI32(comptime n: comptime_int, v: @Vector(n, f32)) @Vector(n, 
         const fv: [n]f32 = v;
         var r: [n]i32 = undefined;
         inline for (0..n / 4) |k| r[k * 4 ..][0..4].* = @"llvm.aarch64.neon.fcvtns.v4i32.v4f32"(fv[k * 4 ..][0..4].*);
+        return r;
+    }
+    // x86: cvtps2dq rounds with MXCSR's default mode, half to even.
+    if (comptime x86_avx_cvt and n % 8 == 0) {
+        const fv: [n]f32 = v;
+        var r: [n]i32 = undefined;
+        inline for (0..n / 8) |k| r[k * 8 ..][0..8].* = @"llvm.x86.avx.cvt.ps2dq.256"(fv[k * 8 ..][0..8].*);
+        return r;
+    }
+    if (comptime x86_sse_cvt and n % 4 == 0) {
+        const fv: [n]f32 = v;
+        var r: [n]i32 = undefined;
+        inline for (0..n / 4) |k| r[k * 4 ..][0..4].* = @"llvm.x86.sse2.cvtps2dq"(fv[k * 4 ..][0..4].*);
         return r;
     }
     return @intFromFloat(rintSmall(v));
@@ -80,13 +98,14 @@ pub inline fn satF32(comptime D: type, comptime n: comptime_int, v: @Vector(n, f
     // first; fix it to 0 explicitly when 0 is not the low bound.
     var c = @min(@max(v, lo), hi);
     if (std.math.minInt(D) != 0) c = @select(f32, v == v, c, @as(@Vector(n, f32), @splat(0)));
-    // Unsigned results go through u32: LLVM (Zig 0.17, AVX2 without
+    // The clamped value converts exactly as i32. Unsigned results are then
+    // narrowed from u32 (a free bitcast): LLVM (Zig 0.17, AVX2 without
     // AVX-512) can lower i32 -> u8 to signed packs, turning 150 into 127.
+    const r = roundI32(n, c);
     if (std.math.minInt(D) == 0) {
-        const u: @Vector(n, u32) = @intFromFloat(rintSmall(c));
+        const u: @Vector(n, u32) = @bitCast(r);
         return @intCast(u);
     }
-    const r: @Vector(n, i32) = @intFromFloat(rintSmall(c));
     return @intCast(r);
 }
 
