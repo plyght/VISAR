@@ -40,7 +40,12 @@ jobs:
       - run: zig build test -Dcpu=${{ matrix.cpu }} -Duse-llvm --summary all
 
   opencv-difftest:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple Silicon: checks the NEON paths against OpenCV.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2

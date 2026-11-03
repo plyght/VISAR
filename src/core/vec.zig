@@ -7,6 +7,30 @@ const builtin = @import("builtin");
 
 pub const V16 = @Vector(16, u8);
 
+const is_arm = builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .aarch64_be;
+
+/// LLVM's NEON structured-store intrinsics (aarch64, LLVM backend only).
+const neon = struct {
+    extern fn @"llvm.aarch64.neon.st2.v16i8.p0"(V16, V16, [*]u8) void;
+    extern fn @"llvm.aarch64.neon.st3.v16i8.p0"(V16, V16, V16, [*]u8) void;
+    extern fn @"llvm.aarch64.neon.st4.v16i8.p0"(V16, V16, V16, V16, [*]u8) void;
+    inline fn st2(a: V16, b: V16, p: [*]u8) void {
+        @"llvm.aarch64.neon.st2.v16i8.p0"(a, b, p);
+    }
+    inline fn st3(a: V16, b: V16, c: V16, p: [*]u8) void {
+        @"llvm.aarch64.neon.st3.v16i8.p0"(a, b, c, p);
+    }
+    inline fn st4(a: V16, b: V16, c: V16, d: V16, p: [*]u8) void {
+        @"llvm.aarch64.neon.st4.v16i8.p0"(a, b, c, d, p);
+    }
+};
+
+fn strideMask(comptime cn: usize, comptime c: usize) [16]i32 {
+    var m: [16]i32 = undefined;
+    for (0..16) |i| m[i] = @intCast(i * cn + c);
+    return m;
+}
+
 /// Hides a loaded vector from LLVM's load narrowing, which otherwise turns
 /// a 16-byte load feeding byte shuffles into many scalar byte inserts.
 pub inline fn opaqueV(v: V16) V16 {
@@ -134,6 +158,14 @@ inline fn gather(comptime n: usize, blocks: [n]V16, comptime src: [16]usize) V16
 /// Loads 16 pixels of `cn` interleaved channels from `p` (16*cn bytes) and
 /// returns one vector per channel.
 pub inline fn load(comptime cn: usize, p: [*]const u8) [cn]V16 {
+    // AArch64 has structured loads (ld2/ld3/ld4): a plain wide load plus
+    // stride shuffles lowers to exactly one of them.
+    if (comptime is_arm and cn > 1) {
+        const v: @Vector(16 * cn, u8) = p[0 .. 16 * cn].*;
+        var out: [cn]V16 = undefined;
+        inline for (0..cn) |c| out[c] = @shuffle(u8, v, undefined, strideMask(cn, c));
+        return out;
+    }
     var blocks: [cn]V16 = undefined;
     inline for (0..cn) |b| blocks[b] = opaqueV(p[16 * b ..][0..16].*);
     if (cn == 1) return blocks;
@@ -154,6 +186,34 @@ pub inline fn load(comptime cn: usize, p: [*]const u8) [cn]V16 {
 pub inline fn store(comptime cn: usize, ch: [cn]V16, p: [*]u8) void {
     if (cn == 1) {
         p[0..16].* = ch[0];
+        return;
+    }
+    // AArch64: NEON structured stores. LLVM does not reliably match the
+    // interleaving shuffle below to st3/st4, so call the intrinsics.
+    if (comptime is_arm and builtin.zig_backend == .stage2_llvm) {
+        switch (cn) {
+            2 => return neon.st2(ch[0], ch[1], p),
+            3 => return neon.st3(ch[0], ch[1], ch[2], p),
+            4 => return neon.st4(ch[0], ch[1], ch[2], ch[3], p),
+            else => {},
+        }
+    }
+    if (comptime is_arm) {
+        // One two-operand shuffle over (first half of the channels, second
+        // half), the shape LLVM's interleaved-access pass turns into stN.
+        const half = cn / 2;
+        const lo: @Vector(16 * half, u8) = @bitCast(ch[0..half].*);
+        const hi: @Vector(16 * (cn - half), u8) = @bitCast(ch[half..cn].*);
+        const mask = comptime blk: {
+            @setEvalBranchQuota(10000);
+            var m: [16 * cn]i32 = undefined;
+            for (0..16 * cn) |t| {
+                const src = (t % cn) * 16 + t / cn;
+                m[t] = if (src < 16 * half) @intCast(src) else ~@as(i32, @intCast(src - 16 * half));
+            }
+            break :blk m;
+        };
+        p[0 .. 16 * cn].* = @shuffle(u8, lo, hi, mask);
         return;
     }
     inline for (0..cn) |b| {
