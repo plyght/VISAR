@@ -259,8 +259,6 @@ fn runPass(comptime op: Op, exec: Exec, gpa: Allocator, src: anytype, dst: @Type
         for (0..dst.height) |y| @memset(dst.row(y), ident);
         return;
     }
-    if (T == u8 and el.w == 3 and el.h == 3 and el.ax == 1 and el.ay == 1 and el.isRect())
-        return rect3(op, exec, gpa, src, dst);
     var failed: std.atomic.Value(bool) = .init(false);
     const Ctx = struct { s: Image(T), d: Image(T), el: Element, plan: Plan, gpa: Allocator, failed: *std.atomic.Value(bool) };
     exec.parallelFor(src.height, @max(16, 2 * @as(usize, el.h)), Ctx{ .s = src, .d = dst, .el = el, .plan = plan, .gpa = gpa, .failed = &failed }, struct {
@@ -269,77 +267,6 @@ fn runPass(comptime op: Op, exec: Exec, gpa: Allocator, src: anytype, dst: @Type
         }
     }.run);
     if (failed.load(.monotonic)) return error.OutOfMemory;
-}
-
-/// 3x3 rectangle on 8-bit images, the most common element: two output rows
-/// per step share the min/max of their two middle source rows, then a
-/// 3-tap horizontal pass over an L1-resident row padded with the identity.
-fn rect3(comptime op: Op, exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8)) Error!void {
-    var failed: std.atomic.Value(bool) = .init(false);
-    const Ctx = struct { s: Image(u8), d: Image(u8), gpa: Allocator, failed: *std.atomic.Value(bool) };
-    // Even grain so row pairs never straddle bands.
-    exec.parallelFor(src.height, 32, Ctx{ .s = src, .d = dst, .gpa = gpa, .failed = &failed }, struct {
-        fn run(c: Ctx, y0: usize, y1: usize) void {
-            rect3Band(op, c.s, c.d, c.gpa, y0, y1) catch c.failed.store(true, .monotonic);
-        }
-    }.run);
-    if (failed.load(.monotonic)) return error.OutOfMemory;
-}
-
-fn rect3Band(comptime op: Op, s: Image(u8), d: Image(u8), gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
-    const ident: u8 = if (op == .min) 255 else 0;
-    const cn: usize = s.channels;
-    const n = s.rowLen();
-    const N = comptime lanesM(u8);
-    const V = @Vector(N, u8);
-    const pad = cn;
-    const buf = try gpa.alloc(u8, 2 * (n + 2 * pad));
-    defer gpa.free(buf);
-    const va = buf[0 .. n + 2 * pad];
-    const vb = buf[n + 2 * pad ..];
-    @memset(va[0..pad], ident);
-    @memset(va[pad + n ..], ident);
-    @memset(vb[0..pad], ident);
-    @memset(vb[pad + n ..], ident);
-    const h = s.height;
-    var y = y0;
-    while (y < y1) {
-        const two = y + 1 < y1;
-        const b = s.row(y);
-        const a: ?[]const u8 = if (y > 0) s.row(y - 1) else null;
-        const cr: ?[]const u8 = if (y + 1 < h) s.row(y + 1) else null;
-        const dr: ?[]const u8 = if (two and y + 2 < h) s.row(y + 2) else null;
-        // Vertical: va = op(a, m), vb = op(m, d) with m = op(b, c).
-        var x: usize = 0;
-        while (x + N <= n) : (x += N) {
-            const vbv: V = b[x..][0..N].*;
-            const m: V = if (cr) |r| vop(op, vbv, @as(V, r[x..][0..N].*)) else vbv;
-            va[pad + x ..][0..N].* = if (a) |r| vop(op, m, @as(V, r[x..][0..N].*)) else m;
-            if (two) vb[pad + x ..][0..N].* = if (dr) |r| vop(op, m, @as(V, r[x..][0..N].*)) else m;
-        }
-        while (x < n) : (x += 1) {
-            const m = if (cr) |r| vop(op, b[x], r[x]) else b[x];
-            va[pad + x] = if (a) |r| vop(op, m, r[x]) else m;
-            if (two) vb[pad + x] = if (dr) |r| vop(op, m, r[x]) else m;
-        }
-        hpass3(op, va, d.row(y), cn);
-        if (two) hpass3(op, vb, d.row(y + 1), cn);
-        y += if (two) 2 else 1;
-    }
-}
-
-/// out[x] = op(v[x], v[x + cn], v[x + 2cn]) for the padded row v.
-fn hpass3(comptime op: Op, v: []const u8, out: []u8, cn: usize) void {
-    const N = comptime lanesM(u8);
-    const V = @Vector(N, u8);
-    var x: usize = 0;
-    while (x + N <= out.len) : (x += N) {
-        const l: V = v[x..][0..N].*;
-        const c: V = v[x + cn ..][0..N].*;
-        const r: V = v[x + 2 * cn ..][0..N].*;
-        out[x..][0..N].* = vop(op, vop(op, l, c), r);
-    }
-    while (x < out.len) : (x += 1) out[x] = vop(op, vop(op, v[x], v[x + cn]), v[x + 2 * cn]);
 }
 
 /// Run lengths up to this are min/max-ed tap by tap straight from the source
@@ -742,7 +669,7 @@ test "run decomposition matches the per-tap reference" {
     try std.testing.expectEqualSlices(f32, ref.slice(), src.slice());
 }
 
-test "3x3 rect fast path matches a naive min/max" {
+test "3x3 rect matches a naive min/max" {
     const gpa = std.testing.allocator;
     var buf: [9]u8 = undefined;
     const el = structuringElement(.rect, 3, 3, &buf);
