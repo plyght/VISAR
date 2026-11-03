@@ -47,6 +47,25 @@ def natural(h, w, c=3, dtype=np.uint8):
 SIZES = [(480, 640), (37, 53), (1, 1), (7, 1), (1, 9)]
 results = []
 
+# OpenCV builds with an ARM HAL (the arm64 wheels use Carotene and
+# KleidiCV) route some functions through the HAL, which rounds differently
+# from OpenCV's own code, so OpenCV gives different answers on x86 and ARM.
+# VISAR follows OpenCV's reference arithmetic everywhere. Against a HAL
+# build, only these cases may differ, and only by these bounds; every case
+# that needs the allowance is listed in the output as "HAL".
+_bi = cv2.getBuildInformation()
+HAL = next((ln.split(":", 1)[1].strip() for ln in _bi.splitlines() if "Custom HAL" in ln), "NO")
+HAS_HAL = any(k in HAL.lower() for k in ("carotene", "kleidicv"))  # IPP on x86 matches exactly
+HAL_ALLOWANCE = {  # case-name prefix: (max difference, max % of samples)
+    f"cvtColor {cv2.COLOR_BGR2HSV} u8": (1, 0.1),
+    f"cvtColor {cv2.COLOR_RGB2HSV} u8": (1, 0.1),
+    "divide u8": (1, 0.5),
+    "addWeighted u8": (1, 0.5),
+    "warpAffine linear": (1, 0.1),
+    "warpAffine nearest": (255, 0.01),  # a pixel or two picks the neighbour
+}
+hal_used = set()
+
 
 def compare(name, ours, ref, tol=0.0, pct=100.0):
     ref = np.asarray(ref)
@@ -66,13 +85,21 @@ def run(name, fn, tol=0.0, pct=100.0):
     try:
         ours, ref = fn()
         compare(name, ours, ref, tol, pct)
+        if HAS_HAL and not results[-1][3]:
+            for prefix, (htol, hpct) in HAL_ALLOWANCE.items():
+                if name.startswith(prefix):
+                    results.pop()
+                    compare(name, ours, ref, max(tol, htol), min(pct, hpct))
+                    if results[-1][3]:
+                        hal_used.add(name)
+                    break
     except vs.VisarError as e:
         results.append((name, "ERROR", str(e), False))
 
 
 def main():
     vs.set_num_threads(0)
-    print(f"VISAR {vs.version()} ({vs.lib.visar_build_info().decode()}) vs OpenCV {cv2.__version__}")
+    print(f"VISAR {vs.version()} ({vs.lib.visar_build_info().decode()}) vs OpenCV {cv2.__version__}, custom HAL: {HAL}")
     for (h, w) in SIZES:
         tag = f"{w}x{h}"
         bgr = natural(h, w, 3)
@@ -200,9 +227,12 @@ def main():
     width = max(len(r[0]) for r in results)
     failed = [r for r in results if not r[3]]
     for name, mx, frac, ok in results:
-        if not ok or os.environ.get("VERBOSE"):
-            print(f"{'PASS' if ok else 'FAIL'}  {name:<{width}}  max={mx:<8} differ={frac}")
+        tag = "FAIL" if not ok else "HAL " if name in hal_used else "PASS"
+        if tag != "PASS" or os.environ.get("VERBOSE"):
+            print(f"{tag}  {name:<{width}}  max={mx:<8} differ={frac}")
     print(f"\n{len(results) - len(failed)}/{len(results)} cases match OpenCV within tolerance")
+    if hal_used:
+        print(f"{len(hal_used)} of them differ only where OpenCV's HAL replaces its reference code")
     return 1 if failed else 0
 
 
