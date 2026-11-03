@@ -270,8 +270,10 @@ pub inline fn remap(comptime scn: usize, comptime dcn: usize, comptime map: [dcn
 /// sides. Returns the number of pixels done; the caller finishes the rest.
 pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map: [dcn]?u8, fill: u8, s: [*]const u8, d: [*]u8, n: usize) usize {
     // AArch64: ldN + stN do the whole reorder in two instructions per 16
-    // pixels, faster than byte-table lookups.
-    if (comptime is_arm) {
+    // pixels when the pixel size changes (BGR <-> BGRA). A same-size swap
+    // (BGR <-> RGB) uses the overlapping single-register tbl path below:
+    // ld3/st3 split into several micro-ops each on Apple cores.
+    if (comptime is_arm and scn != dcn) {
         const f: V16 = @splat(fill);
         var x: usize = 0;
         while (x + 16 <= n) : (x += 16) {
@@ -295,8 +297,15 @@ pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map:
     };
     const f: @Vector(1, u8) = .{fill};
     var x: usize = 0;
-    // Need 16 readable bytes at x*scn and 16 writable at x*dcn.
-    while ((x + per) * scn + 16 - per * scn <= n * scn and x * dcn + 16 <= n * dcn) : (x += per) {
+    // Need 16 readable bytes at x*scn and 16 writable at x*dcn. Four
+    // groups per iteration first (loop overhead), then one at a time.
+    while ((x + 3 * per) * scn + 16 <= n * scn and (x + 3 * per) * dcn + 16 <= n * dcn) : (x += 4 * per) {
+        inline for (0..4) |g| {
+            const v = opaqueV(s[(x + g * per) * scn ..][0..16].*);
+            d[(x + g * per) * dcn ..][0..16].* = @shuffle(u8, v, f, mask);
+        }
+    }
+    while (x * scn + 16 <= n * scn and x * dcn + 16 <= n * dcn) : (x += per) {
         const v = opaqueV(s[x * scn ..][0..16].*);
         d[x * dcn ..][0..16].* = @shuffle(u8, v, f, mask);
     }
