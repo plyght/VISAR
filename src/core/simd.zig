@@ -1,0 +1,67 @@
+//! Small explicit-SIMD helpers shared by the element-wise kernels. Vectors are
+//! sized to one 64-byte register's worth of elements; on narrower machines
+//! LLVM splits them, which still beats the scalar loops it fails to vectorise.
+
+const std = @import("std");
+
+/// Elements of `T` per vector (64 bytes' worth).
+pub fn lanes(comptime T: type) comptime_int {
+    return @max(1, 64 / @sizeOf(T));
+}
+
+pub fn Vec(comptime T: type) type {
+    return @Vector(lanes(T), T);
+}
+
+pub inline fn load(comptime V: type, s: []const @typeInfo(V).vector.child, i: usize) V {
+    const n = @typeInfo(V).vector.len;
+    return s[i..][0..n].*;
+}
+
+pub inline fn store(comptime V: type, d: []@typeInfo(V).vector.child, i: usize, v: V) void {
+    const n = @typeInfo(V).vector.len;
+    d[i..][0..n].* = v;
+}
+
+pub inline fn splat(comptime V: type, x: @typeInfo(V).vector.child) V {
+    return @splat(x);
+}
+
+/// Round half to even for f32 values already clamped to |x| < 2^22.
+pub inline fn rintSmall(v: anytype) @TypeOf(v) {
+    const m: @TypeOf(v) = @splat(12582912.0);
+    return (v + m) - m;
+}
+
+/// Converts f32 lanes to the integer type `D` with OpenCV's saturate_cast
+/// semantics (round half to even, clamp, NaN -> 0). `D` must be at most
+/// 16 bits wide so the clamped range is exactly representable.
+pub inline fn satF32(comptime D: type, comptime n: comptime_int, v: @Vector(n, f32)) @Vector(n, D) {
+    const lo: @Vector(n, f32) = @splat(@floatFromInt(std.math.minInt(D)));
+    const hi: @Vector(n, f32) = @splat(@floatFromInt(std.math.maxInt(D)));
+    // @max/@min return the non-NaN operand, so NaN clamps to the low bound
+    // first; fix it to 0 explicitly when 0 is not the low bound.
+    var c = @min(@max(v, lo), hi);
+    if (std.math.minInt(D) != 0) c = @select(f32, v == v, c, @as(@Vector(n, f32), @splat(0)));
+    const r: @Vector(n, i32) = @intFromFloat(rintSmall(c));
+    return @intCast(r);
+}
+
+/// Widens integer or float lanes to f32.
+pub inline fn toF32(comptime n: comptime_int, v: anytype) @Vector(n, f32) {
+    const C = @typeInfo(@TypeOf(v)).vector.child;
+    if (@typeInfo(C) == .float) return @floatCast(v);
+    if (@bitSizeOf(C) < 32) {
+        const w: @Vector(n, i32) = v;
+        return @floatFromInt(w);
+    }
+    return @floatFromInt(v);
+}
+
+test "satF32" {
+    const v: @Vector(8, f32) = .{ -1, 0.5, 1.5, 2.5, 254.5, 255.5, 300, std.math.nan(f32) };
+    const r = satF32(u8, 8, v);
+    try std.testing.expectEqual(@Vector(8, u8){ 0, 0, 2, 2, 254, 255, 255, 0 }, r);
+    const s = satF32(i16, 8, v * @as(@Vector(8, f32), @splat(-200)));
+    try std.testing.expectEqual(@Vector(8, i16){ 200, -100, -300, -500, -32768, -32768, -32768, 0 }, s);
+}
