@@ -539,6 +539,21 @@ fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, bor
     const NF = comptime lanes(f32);
     const sc: @Vector(NF, f32) = @splat(@floatCast(scale));
     const scs: f32 = @floatCast(scale);
+    // round(sum * scale) as ((sum * M) >> 16 + 1) >> 1, a 16-bit multiply,
+    // used only if it equals the f32 path for every possible sum.
+    const int_scale: ?u16 = if (A != u16) null else blk: {
+        const m_f = @round(scale * 131072.0);
+        if (m_f < 1 or m_f > 65535) break :blk null;
+        const m: u32 = @intFromFloat(m_f);
+        const max_sum: u32 = 255 * kw * kh;
+        var t: u32 = 0;
+        while (t <= max_sum) : (t += 1) {
+            const want = sat.cast(u8, @as(f32, @floatFromInt(t)) * scs);
+            const got: u32 = @min(255, (((t * m) >> 16) + 1) >> 1);
+            if (got != want) break :blk null;
+        }
+        break :blk @intCast(m);
+    };
     const srow = struct {
         fn f(img: Image(u8), v: isize, b: Border) [*]const u8 {
             return img.row(border_mod.map(v, img.height, b).?).ptr;
@@ -572,6 +587,17 @@ fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, bor
         }
         const out = d.row(y);
         var x: usize = 0;
+        // Integer scaling when it reproduces the f32 result for every sum.
+        if (A == u16 and int_scale != null) {
+            const M: VA = @splat(int_scale.?);
+            const one: VA = @splat(1);
+            while (x + N <= n) : (x += N) {
+                var sum: VA = col_buf[x..][0..N].*;
+                for (1..kw) |i| sum += col_buf[x + i * cn ..][0..N].*;
+                const hi: VA = @intCast((@as(@Vector(N, u32), sum) * @as(@Vector(N, u32), M)) >> @splat(16));
+                out[x..][0..N].* = @as(@Vector(N, u8), @intCast(@min((hi + one) >> @splat(1), @as(VA, @splat(255)))));
+            }
+        }
         // Sum in full-width lanes of A, then scale in f32 halves.
         if (N == 2 * NF) {
             while (x + N <= n) : (x += N) {
