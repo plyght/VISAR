@@ -128,6 +128,11 @@ pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn hasWinsize() bool {
+    // `std.posix.T` is void on targets without terminals (WASI).
+    return if (std.posix.T == void) false else @hasDecl(std.posix.T, "IOCGWINSZ");
+}
+
 /// The width of the terminal `file` is attached to, or null when it is not a
 /// terminal or cannot be asked.
 pub fn terminalColumns(io: Io, file: Io.File) ?u16 {
@@ -137,7 +142,7 @@ pub fn terminalColumns(io: Io, file: Io.File) ?u16 {
         if (status != .SUCCESS) return null;
         const cols = info.Data.dwWindowSize.X;
         return if (cols > 0) @intCast(cols) else null;
-    } else if (@hasDecl(std.posix.T, "IOCGWINSZ")) {
+    } else if (comptime hasWinsize()) {
         var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
         const result = io.operate(.{ .device_io_control = .{
             .file = file,

@@ -7,6 +7,7 @@ const Image = core.Image;
 const Exec = core.Exec;
 const sat = core.sat;
 const Allocator = std.mem.Allocator;
+const ru8 = @import("resize_u8.zig");
 
 pub const Interp = enum(u8) {
     nearest = 0,
@@ -26,6 +27,18 @@ const coef_scale = 1 << coef_bits;
 pub fn resize(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), interp: Interp) Error!void {
     if (src.channels != dst.channels) return error.SizeMismatch;
     if (src.sameSize(dst)) return dst.copyFrom(src);
+    if (@TypeOf(src).Elem == u8 and src.channels <= 4) {
+        const exact_half = src.width == 2 * dst.width and src.height == 2 * dst.height;
+        switch (interp) {
+            .linear => return if (exact_half) ru8.half(exec, src, dst) else linearU8(exec, gpa, src, dst, false),
+            .area => {
+                if (dst.width > src.width or dst.height > src.height) return linearU8(exec, gpa, src, dst, true);
+                if (exact_half) return ru8.half(exec, src, dst);
+            },
+            .cubic => return cubicU8(exec, gpa, src, dst),
+            else => {},
+        }
+    }
     switch (interp) {
         .nearest => return nearest(exec, gpa, src, dst),
         .linear => return linear(exec, gpa, src, dst, false),
@@ -97,6 +110,79 @@ fn linearCoord(d: usize, scale: f64, len: u32, area: bool) struct { i: u32, f: f
         f = 0;
     }
     return .{ .i = @intCast(sx), .f = f };
+}
+
+fn linearU8(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), area: bool) Error!void {
+    const cn: u32 = src.channels;
+    const scale_x = @as(f64, @floatFromInt(src.width)) / @as(f64, @floatFromInt(dst.width));
+    const scale_y = @as(f64, @floatFromInt(src.height)) / @as(f64, @floatFromInt(dst.height));
+    const W = Weights(u8);
+    const xt = try gpa.alloc(ru8.Tap(2), dst.width);
+    defer gpa.free(xt);
+    const yt = try gpa.alloc(ru8.Tap(2), dst.height);
+    defer gpa.free(yt);
+    for (xt, 0..) |*t, x| {
+        const c = linearCoord(x, scale_x, src.width, area);
+        t.* = .{ .o = .{ c.i * cn, @min(c.i + 1, src.width - 1) * cn }, .w = W.coef(c.f) };
+    }
+    for (yt, 0..) |*t, y| {
+        const c = linearCoord(y, scale_y, src.height, area);
+        t.* = .{ .o = .{ c.i, @min(c.i + 1, src.height - 1) }, .w = W.coef(c.f) };
+    }
+    if (!area and dst.width == 2 * src.width and dst.height == 2 * src.height and src.width >= 2) {
+        const beta = try gpa.alloc([2]i32, dst.height);
+        defer gpa.free(beta);
+        const yofs = try gpa.alloc([2]u32, dst.height);
+        defer gpa.free(yofs);
+        for (yt, beta, yofs) |t, *b, *o| {
+            b.* = t.w;
+            o.* = t.o;
+        }
+        return ru8.up2Linear(exec, gpa, src, dst, beta, yofs);
+    }
+    const gs: []ru8.Group = if (ru8.has_vbmi) try ru8.groups(gpa, xt, cn, src.rowLen()) else &.{};
+    defer if (ru8.has_vbmi) gpa.free(gs);
+    ru8.separable(2, .linear, exec, gpa, src, dst, xt, yt, gs);
+}
+
+/// OpenCV's fixed-point INTER_CUBIC for u8: f32 coordinates and
+/// coefficients rounded to 11 bits, integer horizontal pass.
+fn cubicU8(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8)) Error!void {
+    const xt = try gpa.alloc(ru8.Tap(4), dst.width);
+    defer gpa.free(xt);
+    const yt = try gpa.alloc(ru8.Tap(4), dst.height);
+    defer gpa.free(yt);
+    cubicTab(xt, src.width, dst.width, src.channels);
+    cubicTab(yt, src.height, dst.height, 1);
+    if (dst.width == 2 * src.width and dst.height == 2 * src.height and src.width >= 4) {
+        const beta = try gpa.alloc([4]i32, dst.height);
+        defer gpa.free(beta);
+        const yofs = try gpa.alloc([4]u32, dst.height);
+        defer gpa.free(yofs);
+        for (yt, beta, yofs) |t, *b, *o| {
+            b.* = t.w;
+            o.* = t.o;
+        }
+        // Interior weights: destination pixels 2 (even) and 3 (odd).
+        return ru8.up2Cubic(exec, gpa, src, dst, xt[2].w, xt[3].w, beta, yofs);
+    }
+    ru8.separable(4, .cubic, exec, gpa, src, dst, xt, yt, &.{});
+}
+
+fn cubicTab(taps: []ru8.Tap(4), ssize: u32, dsize: u32, mul: u32) void {
+    const scale = 1.0 / (@as(f64, @floatFromInt(dsize)) / @as(f64, @floatFromInt(ssize)));
+    for (taps, 0..) |*t, i| {
+        var fx: f32 = @floatCast((@as(f64, @floatFromInt(i)) + 0.5) * scale - 0.5);
+        const sx = @floor(fx);
+        fx -= sx;
+        const isx: i64 = @intFromFloat(sx);
+        const cf = cubicCoeffs(fx);
+        for (0..4) |k| {
+            t.w[k] = sat.cast(i16, cf[k] * coef_scale);
+            const p = std.math.clamp(isx - 1 + @as(i64, @intCast(k)), 0, @as(i64, ssize) - 1);
+            t.o[k] = @as(u32, @intCast(p)) * mul;
+        }
+    }
 }
 
 fn linear(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), area: bool) Error!void {
@@ -424,5 +510,28 @@ test "resize identity-ish" {
         defer dst.deinit(gpa);
         try resize(.serial, gpa, src, dst, m);
         for (dst.slice()) |v| try std.testing.expectEqual(@as(u8, 100), v);
+    }
+}
+
+test "u8 fast paths match the generic fixed-point kernels" {
+    const gpa = std.testing.allocator;
+    inline for (.{ 1, 3, 4 }) |cn| {
+        var src = try Image(u8).init(gpa, 150, 64, cn);
+        defer src.deinit(gpa);
+        var seed: u32 = 12345;
+        for (src.slice()) |*v| {
+            seed = seed *% 1103515245 +% 12345;
+            v.* = @truncate(seed >> 16);
+        }
+        // Halving, exact 2x, and a generic ratio (VBMI groups when present).
+        for ([_][2]u32{ .{ 75, 32 }, .{ 300, 128 }, .{ 113, 47 }, .{ 120, 90 } }) |sz| {
+            var a = try Image(u8).init(gpa, sz[0], sz[1], cn);
+            defer a.deinit(gpa);
+            var b = try Image(u8).init(gpa, sz[0], sz[1], cn);
+            defer b.deinit(gpa);
+            try resize(.serial, gpa, src, a, .linear);
+            try linear(.serial, gpa, src, b, false);
+            try std.testing.expectEqualSlices(u8, b.slice(), a.slice());
+        }
     }
 }
