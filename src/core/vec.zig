@@ -269,6 +269,19 @@ pub inline fn remap(comptime scn: usize, comptime dcn: usize, comptime map: [dcn
 /// step uses, so the loop stops while a full 16 bytes still fit on both
 /// sides. Returns the number of pixels done; the caller finishes the rest.
 pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map: [dcn]?u8, fill: u8, s: [*]const u8, d: [*]u8, n: usize) usize {
+    // AArch64: ldN + stN do the whole reorder in two instructions per 16
+    // pixels, faster than byte-table lookups.
+    if (comptime is_arm) {
+        const f: V16 = @splat(fill);
+        var x: usize = 0;
+        while (x + 16 <= n) : (x += 16) {
+            const ch = load(scn, s + x * scn);
+            var out: [dcn]V16 = undefined;
+            inline for (0..dcn) |c| out[c] = if (map[c]) |sc| ch[sc] else f;
+            store(dcn, out, d + x * dcn);
+        }
+        return x;
+    }
     const widest: usize = if (scn > dcn) scn else dcn;
     const per: usize = 16 / widest;
     const mask = comptime blk: {

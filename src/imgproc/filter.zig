@@ -120,8 +120,12 @@ fn separable(comptime P: type, exec: Exec, gpa: Allocator, src: Image(P.S), dst:
     if (err) |e| return e;
 }
 
+/// Lanes per step: at least 32 bytes of `T`, so 128-bit SIMD (NEON, SSE)
+/// works on two registers at a time, which keeps wide out-of-order cores
+/// such as Apple's busy and lets NEON use its paired widening instructions.
 fn lanes(comptime T: type) comptime_int {
-    return @max(4, std.simd.suggestVectorLength(T) orelse 4);
+    const native = @max(4, std.simd.suggestVectorLength(T) orelse 4);
+    return if (native * @sizeOf(T) < 32) native * 2 else native;
 }
 
 /// Converts a vector of S to a vector of A (int widening, int->float, ...).
