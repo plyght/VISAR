@@ -81,10 +81,26 @@ const Job = struct {
     chunks: usize,
 };
 
+/// Single-threaded targets get a stub, so no thread or futex code is compiled.
+const Workers = if (threads_supported) ThreadWorkers else struct {
+    mutex: struct {
+        fn lockUncancelable(_: *@This(), _: Io) void {}
+        fn unlock(_: *@This(), _: Io) void {}
+    } = .{},
+    io: Io = undefined,
+    fn spawn(_: Allocator, _: Io, _: usize) !*@This() {
+        return error.Unsupported;
+    }
+    fn shutdown(_: *@This()) void {}
+    fn dispatch(_: *@This(), _: Job) void {
+        unreachable;
+    }
+};
+
 /// Resident worker threads. A job is published by bumping `generation`;
 /// every thread (workers and the caller) claims chunks through `next` until
 /// the job is exhausted, and the caller returns when `remaining` reaches zero.
-const Workers = struct {
+const ThreadWorkers = struct {
     gpa: Allocator,
     io: Io,
     threads: []std.Thread,
@@ -98,8 +114,8 @@ const Workers = struct {
 
     const spin_iterations = 2000;
 
-    fn spawn(gpa: Allocator, io: Io, count: usize) !*Workers {
-        const self = try gpa.create(Workers);
+    fn spawn(gpa: Allocator, io: Io, count: usize) !*ThreadWorkers {
+        const self = try gpa.create(ThreadWorkers);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .threads = &.{} };
         const threads = try gpa.alloc(std.Thread, count);
@@ -122,7 +138,7 @@ const Workers = struct {
         return self;
     }
 
-    fn shutdown(self: *Workers) void {
+    fn shutdown(self: *ThreadWorkers) void {
         self.stop.store(true, .release);
         _ = self.generation.fetchAdd(1, .release);
         self.io.futexWake(u32, &self.generation.raw, std.math.maxInt(u32));
@@ -131,7 +147,7 @@ const Workers = struct {
         self.gpa.destroy(self);
     }
 
-    fn dispatch(self: *Workers, job: Job) void {
+    fn dispatch(self: *ThreadWorkers, job: Job) void {
         self.job = job;
         self.next.store(0, .monotonic);
         self.remaining.store(@intCast(self.threads.len), .monotonic);
@@ -149,7 +165,7 @@ const Workers = struct {
         }
     }
 
-    fn work(self: *Workers) void {
+    fn work(self: *ThreadWorkers) void {
         const job = self.job;
         const per = (job.n + job.chunks - 1) / job.chunks;
         while (true) {
@@ -161,7 +177,7 @@ const Workers = struct {
         }
     }
 
-    fn workerMain(self: *Workers, first_generation: u32) void {
+    fn workerMain(self: *ThreadWorkers, first_generation: u32) void {
         var seen = first_generation;
         while (true) {
             var spins: usize = 0;

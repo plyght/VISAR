@@ -7,6 +7,7 @@ pub const png = @import("png.zig");
 pub const qoi = @import("qoi.zig");
 pub const pnm = @import("pnm.zig");
 pub const bmp = @import("bmp.zig");
+pub const gif = @import("gif.zig");
 
 pub const Mode = common.Mode;
 pub const Order = common.Order;
@@ -22,6 +23,7 @@ pub const Format = enum {
     qoi,
     pnm,
     bmp,
+    gif,
 
     fn module(comptime f: Format) type {
         return switch (f) {
@@ -30,6 +32,7 @@ pub const Format = enum {
             .qoi => qoi,
             .pnm => pnm,
             .bmp => bmp,
+            .gif => gif,
         };
     }
 };
@@ -54,6 +57,7 @@ pub fn formatFromExtension(ext_in: []const u8) ?Format {
         .{ "png", Format.png }, .{ "jpg", Format.jpeg }, .{ "jpeg", Format.jpeg }, .{ "jpe", Format.jpeg },
         .{ "qoi", Format.qoi }, .{ "pgm", Format.pnm },  .{ "ppm", Format.pnm },   .{ "pnm", Format.pnm },
         .{ "pbm", Format.pnm }, .{ "pam", Format.pnm },  .{ "bmp", Format.bmp },   .{ "dib", Format.bmp },
+        .{ "gif", Format.gif },
     };
     inline for (table) |t| if (std.mem.eql(u8, e, t[0])) return t[1];
     return null;

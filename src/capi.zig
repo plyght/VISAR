@@ -11,7 +11,7 @@ const codecs = visar.codecs;
 const Image = core.Image;
 const Depth = core.Depth;
 
-const gpa = std.heap.smp_allocator;
+const gpa = if (builtin.cpu.arch.isWasm()) std.heap.wasm_allocator else std.heap.smp_allocator;
 
 pub const CImage = extern struct {
     width: u32,
@@ -49,7 +49,7 @@ fn fail(err: anyerror) c_int {
         error.InvalidSize, error.OutOfBounds, error.InvalidKernel, error.InvalidArgument => .invalid_argument,
         else => .internal,
     };
-    return @intFromEnum(st);
+    return @backingInt(st);
 }
 
 fn run(result: anyerror!void) c_int {
@@ -100,7 +100,7 @@ export fn visar_last_error() [*:0]const u8 {
 
 fn typed(comptime T: type, c: *const CImage) !Image(T) {
     if (c.data == null) return error.InvalidArgument;
-    if (c.depth != @intFromEnum(Depth.of(T))) return error.Unsupported;
+    if (c.depth != @backingInt(Depth.of(T))) return error.Unsupported;
     if (c.channels == 0 or c.channels > core.image.max_channels) return error.InvalidArgument;
     if (c.stride % @sizeOf(T) != 0) return error.InvalidArgument;
     const stride = c.stride / @sizeOf(T);
@@ -319,7 +319,7 @@ export fn visar_imdecode(bytes: [*]const u8, len: usize, mode: c_int, bgr: c_int
                 t.deinit(gpa);
                 t.* = c;
             }
-            out.* = .{ .width = t.width, .height = t.height, .channels = t.channels, .depth = @intFromEnum(Depth.of(T)), .stride = t.stride * @sizeOf(T), .data = @ptrCast(t.owned.?.ptr) };
+            out.* = .{ .width = t.width, .height = t.height, .channels = t.channels, .depth = @backingInt(Depth.of(T)), .stride = t.stride * @sizeOf(T), .data = @ptrCast(t.owned.?.ptr) };
         },
     }
     return 0;

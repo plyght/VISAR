@@ -25,7 +25,8 @@ pub fn build(b: *std.Build) void {
     });
     const shared = b.addLibrary(.{ .name = "visar", .linkage = .dynamic, .root_module = capi });
     const static = b.addLibrary(.{ .name = "visar", .linkage = .static, .root_module = capi });
-    b.installArtifact(shared);
+    // Dynamic libraries do not exist on wasm; the static library does.
+    if (!target.result.cpu.arch.isWasm()) b.installArtifact(shared);
     b.installArtifact(static);
     b.installFile("include/visar.h", "include/visar.h");
 
@@ -42,6 +43,18 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
     b.step("run", "Run the visar CLI").dependOn(&run_cmd.step);
+
+    // Demos: `zig build demo-track -Doptimize=ReleaseFast -- --out track.gif`
+    const demo_track = b.addExecutable(.{ .name = "visar-demo-track", .root_module = b.createModule(.{
+        .root_source_file = b.path("demos/track.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "visar", .module = visar }},
+    }) });
+    b.installArtifact(demo_track);
+    const run_track = b.addRunArtifact(demo_track);
+    run_track.addPassthruArgs();
+    b.step("demo-track", "Render the live tracking demo to a GIF").dependOn(&run_track.step);
 
     // Unit tests.
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring") orelse &.{};

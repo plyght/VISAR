@@ -10,6 +10,8 @@ pub const threshold_mod = @import("threshold.zig");
 pub const morph = @import("morph.zig");
 pub const geometry = @import("geometry.zig");
 pub const hist = @import("hist.zig");
+pub const components = @import("components.zig");
+pub const draw = @import("draw.zig");
 
 pub const Border = border.Border;
 
@@ -48,6 +50,8 @@ pub const rotationMatrix2D = geometry.rotationMatrix2D;
 pub const calcHist = hist.calcHist;
 pub const equalizeHist = hist.equalizeHist;
 pub const integral = hist.integral;
+
+pub const connectedComponentsWithStats = components.connectedComponentsWithStats;
 
 test {
     std.testing.refAllDecls(@This());

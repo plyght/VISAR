@@ -8,6 +8,7 @@ pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
 pub const core = @import("core/core.zig");
 pub const imgproc = @import("imgproc/imgproc.zig");
 pub const codecs = @import("codecs/codecs.zig");
+pub const video = @import("video/video.zig");
 
 pub const Image = core.Image;
 pub const AnyImage = core.AnyImage;
@@ -20,4 +21,5 @@ test {
     _ = core;
     _ = imgproc;
     _ = codecs;
+    _ = video;
 }
