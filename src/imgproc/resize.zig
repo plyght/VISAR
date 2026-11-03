@@ -140,8 +140,8 @@ fn linearU8(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), area: bo
         }
         return ru8.up2Linear(exec, gpa, src, dst, beta, yofs);
     }
-    const gs: []ru8.Group = if (ru8.has_vbmi) try ru8.groups(gpa, xt, cn, src.rowLen()) else &.{};
-    defer if (ru8.has_vbmi) gpa.free(gs);
+    const gs: []ru8.Group = if (ru8.fast_permute) try ru8.groups(gpa, xt, cn, src.rowLen()) else &.{};
+    defer if (ru8.fast_permute) gpa.free(gs);
     ru8.separable(2, .linear, exec, gpa, src, dst, xt, yt, gs);
 }
 

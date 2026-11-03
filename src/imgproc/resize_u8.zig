@@ -16,6 +16,21 @@ const builtin = @import("builtin");
 /// AVX-512 VBMI byte permutes drive the bilinear horizontal pass.
 pub const has_vbmi = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi);
 
+/// AArch64 (LLVM backend): NEON tbl over four registers is the same 64-byte
+/// table lookup, 16 bytes at a time.
+const arm_tbl = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .aarch64;
+
+/// Targets with a fast 64-byte byte permute for the group path.
+pub const fast_permute = has_vbmi or arm_tbl;
+
+const neon = struct {
+    const V = @Vector(16, u8);
+    extern fn @"llvm.aarch64.neon.tbl4.v16i8"(V, V, V, V, V) V;
+    inline fn tbl4(t: [4]V, idx: V) V {
+        return @"llvm.aarch64.neon.tbl4.v16i8"(t[0], t[1], t[2], t[3], idx);
+    }
+};
+
 /// Inline AVX-512 assembly needs the LLVM backend (the self-hosted x86
 /// backend used for Debug builds lacks the vector register constraint).
 /// The `v` register class (zmm) also needs AVX-512 on the target.
@@ -58,6 +73,14 @@ pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allo
 }
 
 inline fn permb(tab: @Vector(64, u8), idx: @Vector(64, u8)) @Vector(64, u8) {
+    if (comptime arm_tbl) {
+        const ta: [64]u8 = tab;
+        const ia: [64]u8 = idx;
+        const t: [4]neon.V = .{ ta[0..16].*, ta[16..32].*, ta[32..48].*, ta[48..64].* };
+        var r: [64]u8 = undefined;
+        inline for (0..4) |q| r[q * 16 ..][0..16].* = neon.tbl4(t, ia[q * 16 ..][0..16].*);
+        return r;
+    }
     if (comptime !use_asm) {
         const t: [64]u8 = tab;
         const i: [64]u8 = idx;
@@ -74,10 +97,20 @@ inline fn permb(tab: @Vector(64, u8), idx: @Vector(64, u8)) @Vector(64, u8) {
 
 inline fn maddwd(a: @Vector(32, i16), b: @Vector(32, i16)) @Vector(16, i32) {
     if (comptime !use_asm) {
-        const p: [32]i32 = @as(@Vector(32, i32), a) * @as(@Vector(32, i32), b);
-        var r: [16]i32 = undefined;
-        for (&r, 0..) |*o, k| o.* = p[2 * k] + p[2 * k + 1];
-        return r;
+        // Widening multiply, then add even and odd products (NEON:
+        // smull/smull2 + uzp + add).
+        const p = @as(@Vector(32, i32), a) * @as(@Vector(32, i32), b);
+        const ev = comptime blk: {
+            var m: [16]i32 = undefined;
+            for (0..16) |k| m[k] = 2 * k;
+            break :blk m;
+        };
+        const od = comptime blk: {
+            var m: [16]i32 = undefined;
+            for (0..16) |k| m[k] = 2 * k + 1;
+            break :blk m;
+        };
+        return @shuffle(i32, p, undefined, ev) + @shuffle(i32, p, undefined, od);
     }
     return asm ("vpmaddwd %[b], %[a], %[ret]"
         : [ret] "=v" (-> @Vector(16, i32)),
@@ -220,7 +253,7 @@ fn rows(comptime K: usize, comptime kind: Kind, comptime cn: usize, c: anytype, 
 }
 
 fn hrow(comptime K: usize, comptime cn: usize, comptime E: type, s: []const u8, out: []E, xt: []const Tap(K), gs: []const Group) void {
-    if (E == i16 and has_vbmi and gs.len > 0) {
+    if (E == i16 and fast_permute and gs.len > 0) {
         for (gs, 0..) |g, gi| {
             if (g.ok) hrowGroup(cn, s, out[gi * 4 * cn ..], g) else hrowPixels(K, cn, E, s, out, xt, gi * 4, gi * 4 + 4);
         }
@@ -276,7 +309,7 @@ fn vlinear(r0: []const i16, r1: []const i16, b: [2]i32, d: []u8) void {
         const m1 = mulhi(c, b1);
         const t = (m0 + m1 + @as(V, @splat(2))) >> @splat(2);
         const cl = @max(@min(t, @as(V, @splat(255))), @as(V, @splat(0)));
-        d[x..][0..N].* = @as(@Vector(N, u8), @intCast(cl));
+        d[x..][0..N].* = simd.narrow(u8, cl);
     }
     while (x < d.len) : (x += 1) {
         const t = ((@as(i32, r0[x]) * b[0]) >> 16) + ((@as(i32, r1[x]) * b[1]) >> 16);
