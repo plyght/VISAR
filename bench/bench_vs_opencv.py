@@ -104,6 +104,8 @@ def main():
     ap.add_argument("--size", default="1920x1080")
     ap.add_argument("--md", help="write a Markdown table here")
     ap.add_argument("--filter", default="")
+    ap.add_argument("--warn-below", type=float, default=0.0,
+                    help="emit a GitHub Actions warning for cases slower than this speedup")
     args = ap.parse_args()
     w, h = map(int, args.size.split("x"))
     threads = args.threads or os.cpu_count()
@@ -125,6 +127,13 @@ def main():
     med = statistics.median(sp) if sp else 0
     worst = min(sp) if sp else 0
     print(f"\nmedian speedup {med:.2f}x, worst {worst:.2f}x over {len(rows)} cases")
+    if args.warn_below > 0:
+        for name, v, o in rows:
+            if o / v < args.warn_below:
+                # Shows on the workflow run page, so a regression is visible
+                # without reading the logs.
+                print(f"::warning title=Slow vs OpenCV ({threads}T, {vs.lib.visar_build_info().decode()})::"
+                      f"{name}: {o / v:.2f}x ({v * 1e3:.3f} ms vs {o * 1e3:.3f} ms)")
     if args.md:
         with open(args.md, "w") as fh:
             fh.write(f"VISAR {vs.version()} vs OpenCV {cv2.__version__}, {w}x{h}, {threads} thread(s), "

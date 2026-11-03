@@ -41,10 +41,10 @@ jobs:
         run: zig build demo-track -Doptimize=ReleaseFast -- --out track.gif > track.md
 
       - name: Benchmark vs OpenCV (1 thread)
-        run: zig build bench -Doptimize=ReleaseFast -- --threads 1 --md bench-1t.md
+        run: zig build bench -Doptimize=ReleaseFast -- --threads 1 --md bench-1t.md --warn-below 0.6
 
       - name: Benchmark vs OpenCV (all cores)
-        run: zig build bench -Doptimize=ReleaseFast -- --threads 0 --md bench-mt.md
+        run: zig build bench -Doptimize=ReleaseFast -- --threads 0 --md bench-mt.md --warn-below 0.6
 
       - name: Job summary
         run: |
@@ -104,9 +104,9 @@ jobs:
           ./zig-out/bin/visar demo track --size 1280x720 --frames 300 -o track-mac.gif -f --json > track-mac.json || true
           ./zig-out/bin/visar demo track --size 1280x720 --frames 300 -o track-mac.gif -f
       - name: Benchmark vs OpenCV (1 thread)
-        run: zig build bench -Doptimize=ReleaseFast -- --threads 1 --md bench-mac-1t.md
+        run: zig build bench -Doptimize=ReleaseFast -- --threads 1 --md bench-mac-1t.md --warn-below 0.6
       - name: Benchmark vs OpenCV (all cores)
-        run: zig build bench -Doptimize=ReleaseFast -- --threads 0 --md bench-mac-mt.md
+        run: zig build bench -Doptimize=ReleaseFast -- --threads 0 --md bench-mac-mt.md --warn-below 0.6
       - name: Job summary
         run: |
           {
