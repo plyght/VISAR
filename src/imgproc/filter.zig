@@ -74,8 +74,9 @@ const FinishShift = struct {
     inline fn apply(comptime D: type, comptime N: usize, v: anytype, scale: f64) @Vector(N, D) {
         const E = @typeInfo(@TypeOf(v)).vector.child;
         const s: std.math.Log2Int(E) = @intFromFloat(scale);
-        const one: E = 1;
-        const r = if (s == 0) v else (v +| @as(@Vector(N, E), @splat(one << (s - 1)))) >> @splat(s);
+        // Rounding constant 2^(s-1), or 0 when s = 0: no per-vector select.
+        const half: E = @truncate((@as(u64, 1) << s) >> 1);
+        const r = (v +| @as(@Vector(N, E), @splat(half))) >> @splat(s);
         return @intCast(@min(r, @as(@Vector(N, E), @splat(255))));
     }
 };
