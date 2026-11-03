@@ -515,7 +515,7 @@ test "resize identity-ish" {
 
 test "u8 fast paths match the generic fixed-point kernels" {
     const gpa = std.testing.allocator;
-    inline for (.{ 1, 3, 4 }) |cn| {
+    inline for (.{ 1, 2, 3, 4 }) |cn| {
         var src = try Image(u8).init(gpa, 150, 64, cn);
         defer src.deinit(gpa);
         var seed: u32 = 12345;
@@ -524,7 +524,9 @@ test "u8 fast paths match the generic fixed-point kernels" {
             v.* = @truncate(seed >> 16);
         }
         // Halving, exact 2x, and a generic ratio (VBMI groups when present).
-        for ([_][2]u32{ .{ 75, 32 }, .{ 300, 128 }, .{ 113, 47 }, .{ 120, 90 } }) |sz| {
+        // Generic ratios cover every group size, strong downscales (smaller
+        // groups, window overflows) and upscales.
+        for ([_][2]u32{ .{ 75, 32 }, .{ 300, 128 }, .{ 113, 47 }, .{ 120, 90 }, .{ 112, 48 }, .{ 37, 20 }, .{ 20, 9 }, .{ 9, 5 }, .{ 199, 70 }, .{ 151, 64 }, .{ 1, 1 }, .{ 2, 64 } }) |sz| {
             var a = try Image(u8).init(gpa, sz[0], sz[1], cn);
             defer a.deinit(gpa);
             var b = try Image(u8).init(gpa, sz[0], sz[1], cn);

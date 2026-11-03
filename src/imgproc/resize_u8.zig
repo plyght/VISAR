@@ -22,6 +22,7 @@ const arm_tbl = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .aar
 
 /// Targets with a fast 64-byte byte permute for the group path.
 pub const fast_permute = has_vbmi or arm_tbl;
+const planar = arm_tbl;
 
 const neon = struct {
     const V = @Vector(16, u8);
@@ -39,33 +40,60 @@ const use_asm = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .x86
 const avx512bw = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw);
 const avx512f = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f);
 
-/// Four destination pixels of a bilinear row: a 64-byte source window at
-/// `base`, the byte index of each (pixel, channel-lane, tap) pair, and the
-/// matching 16-bit weights. `ok` is false when the window does not fit.
+/// `n` destination pixels of a bilinear row (up to 16 samples): a 64-byte
+/// source window at `base`, the byte index of each (sample, tap) pair, and
+/// the matching 16-bit weights. Samples are packed, so all 16 output lanes
+/// are used for 1, 2 and 4 channels (15 for 3). `ok` is false when the
+/// window does not fit.
+///
+/// Layout: x86 (vpermb + vpmaddwd) interleaves the taps, index in the even
+/// byte of each 16-bit lane; on NEON (`planar`) the first 16 indices and
+/// weights are tap 0, the next 16 tap 1, so two tbl lookups and a
+/// widening multiply-accumulate do the whole group.
 pub const Group = struct {
     idx: [64]u8 align(64),
     w: [32]i16 align(64),
     base: u32,
+    n: u8,
     ok: bool,
 };
 
-/// Builds the groups for a bilinear row of `rowlen` source samples.
+/// Builds the groups for a bilinear row of `rowlen` source samples. Uses
+/// as many pixels per group as fit 16 samples, fewer when strong
+/// downscaling would make most windows overflow.
 pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allocator.Error![]Group {
-    const g = try gpa.alloc(Group, xt.len / 4);
+    var n: usize = 16 / cn;
+    while (n > 1) : (n -= 1) {
+        // Fits when the span of n pixels (plus the right tap) is in 64 bytes.
+        var bad: usize = 0;
+        var gi: usize = 0;
+        while ((gi + 1) * n <= xt.len) : (gi += 1) {
+            const span = xt[gi * n + n - 1].o[1] + cn - xt[gi * n].o[0];
+            if (span > 64) bad += 1;
+        }
+        if (bad * 16 <= gi) break; // at most 1 in 16 groups on the slow path
+    }
+    const g = try gpa.alloc(Group, xt.len / n);
     for (g, 0..) |*gr, gi| {
-        const base = xt[gi * 4].o[0];
+        const base = xt[gi * n].o[0];
         gr.base = base;
+        gr.n = @intCast(n);
         gr.ok = base + 64 <= rowlen;
         gr.idx = @splat(0);
         gr.w = @splat(0);
-        for (0..4) |p| {
-            const t = xt[gi * 4 + p];
-            for (0..4) |l| for (0..2) |tap| {
-                const pair = (p * 4 + l) * 2 + tap;
-                if (l >= cn) continue;
+        for (0..n) |p| {
+            const t = xt[gi * n + p];
+            for (0..cn) |l| for (0..2) |tap| {
+                const sample = p * cn + l;
                 const off = t.o[tap] + l - base;
-                if (off >= 64) gr.ok = false else gr.idx[2 * pair] = @intCast(off);
-                gr.w[pair] = @intCast(t.w[tap]);
+                if (planar) {
+                    if (off >= 64) gr.ok = false else gr.idx[tap * 16 + sample] = @intCast(off);
+                    gr.w[tap * 16 + sample] = @intCast(t.w[tap]);
+                } else {
+                    const pair = sample * 2 + tap;
+                    if (off >= 64) gr.ok = false else gr.idx[2 * pair] = @intCast(off);
+                    gr.w[pair] = @intCast(t.w[tap]);
+                }
             };
         }
     }
@@ -119,21 +147,26 @@ inline fn maddwd(a: @Vector(32, i16), b: @Vector(32, i16)) @Vector(16, i32) {
     );
 }
 
-/// Bilinear horizontal pass for one group of 4 destination pixels.
-inline fn hrowGroup(comptime cn: usize, s: []const u8, out: []i16, g: Group) void {
-    const lane_mask = comptime blk: {
-        var m: [4 * cn]i32 = undefined;
-        for (0..4) |p| for (0..cn) |l| {
-            m[p * cn + l] = @intCast(p * 4 + l);
-        };
-        break :blk m;
-    };
+/// Bilinear horizontal pass for one group: 16 samples (some unused) are
+/// written, so `out` needs room past the group's own samples.
+inline fn hrowGroup(s: []const u8, out: []i16, g: Group) void {
+    if (comptime planar) {
+        const w = s[g.base..][0..64];
+        const t: [4]neon.V = .{ w[0..16].*, w[16..32].*, w[32..48].*, w[48..64].* };
+        const I = @Vector(16, i32);
+        const s0: @Vector(16, i16) = @intCast(neon.tbl4(t, g.idx[0..16].*));
+        const s1: @Vector(16, i16) = @intCast(neon.tbl4(t, g.idx[16..32].*));
+        const w0: @Vector(16, i16) = g.w[0..16].*;
+        const w1: @Vector(16, i16) = g.w[16..32].*;
+        const acc = @as(I, s0) * @as(I, w0) + @as(I, s1) * @as(I, w1);
+        out[0..16].* = @as(@Vector(16, i16), @truncate(acc >> @splat(4)));
+        return;
+    }
     const win: @Vector(64, u8) = s[g.base..][0..64].*;
     const bytes = permb(win, g.idx);
     const a: @Vector(32, i16) = @bitCast(@as(@Vector(32, u16), @bitCast(bytes)) & @as(@Vector(32, u16), @splat(0xff)));
     const acc = maddwd(a, g.w) >> @splat(4);
-    const r: @Vector(16, i16) = @truncate(acc);
-    out[0 .. 4 * cn].* = @shuffle(i16, r, undefined, lane_mask);
+    out[0..16].* = @as(@Vector(16, i16), @truncate(acc));
 }
 
 const coef_bits = 11;
@@ -210,7 +243,7 @@ pub fn separable(comptime K: usize, comptime kind: Kind, exec: Exec, gpa: Alloca
 
 fn rows(comptime K: usize, comptime kind: Kind, comptime cn: usize, c: anytype, y0: usize, y1: usize) void {
     const n = c.d.rowLen();
-    const stride = n + 4; // room for the 4-lane store of the last pixel
+    const stride = n + 16; // room for the 16-lane store of the last group
     // Bilinear rows keep acc >> 4 (all the vertical step uses) as i16.
     const E = if (kind == .linear) i16 else i32;
     const buf = c.gpa.alloc(E, K * stride) catch @panic("out of memory");
@@ -254,10 +287,11 @@ fn rows(comptime K: usize, comptime kind: Kind, comptime cn: usize, c: anytype, 
 
 fn hrow(comptime K: usize, comptime cn: usize, comptime E: type, s: []const u8, out: []E, xt: []const Tap(K), gs: []const Group) void {
     if (E == i16 and fast_permute and gs.len > 0) {
+        const gn: usize = gs[0].n;
         for (gs, 0..) |g, gi| {
-            if (g.ok) hrowGroup(cn, s, out[gi * 4 * cn ..], g) else hrowPixels(K, cn, E, s, out, xt, gi * 4, gi * 4 + 4);
+            if (g.ok) hrowGroup(s, out[gi * gn * cn ..], g) else hrowPixels(K, cn, E, s, out, xt, gi * gn, gi * gn + gn);
         }
-        return hrowPixels(K, cn, E, s, out, xt, gs.len * 4, xt.len);
+        return hrowPixels(K, cn, E, s, out, xt, gs.len * gn, xt.len);
     }
     hrowPixels(K, cn, E, s, out, xt, 0, xt.len);
 }
