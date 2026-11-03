@@ -80,6 +80,18 @@ const FinishShift = struct {
     }
 };
 
+/// FinishShift with the shift known at compile time: on NEON the round,
+/// shift, clamp and narrow become one uqrshrn.
+fn FinishShiftC(comptime s: u5) type {
+    return struct {
+        inline fn apply(comptime D: type, comptime N: usize, v: anytype, _: f64) @Vector(N, D) {
+            const E = @typeInfo(@TypeOf(v)).vector.child;
+            const r = (v +| @as(@Vector(N, E), @splat(1 << (s - 1)))) >> @splat(s);
+            return @intCast(@min(r, @as(@Vector(N, E), @splat(255))));
+        }
+    };
+}
+
 /// Divides out the largest power of two common to all taps (in place;
 /// callers pass a copy).
 fn reduce(k: []u16) struct { shift: u5, sum: u32 } {
@@ -437,12 +449,12 @@ pub fn gaussianBlur(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src),
             const k3 = [_]u16{ 1, 2, 1 };
             const k5 = [_]u16{ 1, 4, 6, 4, 1 };
             if (kw == kh and std.mem.eql(u16, kx[0..kw], ky[0..kh])) {
-                if (kw == 3 and std.mem.eql(u16, kx[0..3], &k3)) {
-                    const P = SpecK(u8, u16, u16, u8, u16, FinishShift, &k3, &k3);
+                if (kw == 3 and shift == 4 and std.mem.eql(u16, kx[0..3], &k3)) {
+                    const P = SpecK(u8, u16, u16, u8, u16, FinishShiftC(4), &k3, &k3);
                     return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, @floatFromInt(shift));
                 }
-                if (kw == 5 and std.mem.eql(u16, kx[0..5], &k5)) {
-                    const P = SpecK(u8, u16, u16, u8, u16, FinishShift, &k5, &k5);
+                if (kw == 5 and shift == 8 and std.mem.eql(u16, kx[0..5], &k5)) {
+                    const P = SpecK(u8, u16, u16, u8, u16, FinishShiftC(8), &k5, &k5);
                     return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, @floatFromInt(shift));
                 }
             }
