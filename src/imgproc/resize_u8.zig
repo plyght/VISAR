@@ -20,9 +20,22 @@ pub const has_vbmi = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHa
 /// table lookup, 16 bytes at a time.
 const arm_tbl = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .aarch64;
 
+/// x86 with AVX2 but no VBMI (LLVM backend): the 64-byte lookup is four
+/// in-lane vpshufb, one per 16-byte chunk, with per-chunk indices that are
+/// 0x80 (zero) outside the chunk.
+const avx2_shuf = !has_vbmi and builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+
 /// Targets with a fast 64-byte byte permute for the group path.
-pub const fast_permute = has_vbmi or arm_tbl;
+pub const fast_permute = has_vbmi or arm_tbl or avx2_shuf;
 const planar = arm_tbl;
+const idx_len = if (avx2_shuf) 128 else 64;
+
+const avx2 = struct {
+    const B = @Vector(32, u8);
+    extern fn @"llvm.x86.avx2.pshuf.b"(B, B) B;
+    extern fn @"llvm.x86.avx2.pmadd.wd"(@Vector(16, i16), @Vector(16, i16)) @Vector(8, i32);
+};
 
 const neon = struct {
     const V = @Vector(16, u8);
@@ -51,7 +64,7 @@ const avx512f = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(bui
 /// weights are tap 0, the next 16 tap 1, so two tbl lookups and a
 /// widening multiply-accumulate do the whole group.
 pub const Group = struct {
-    idx: [64]u8 align(64),
+    idx: [idx_len]u8 align(64),
     w: [32]i16 align(64),
     base: u32,
     n: u8,
@@ -79,7 +92,7 @@ pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allo
         gr.base = base;
         gr.n = @intCast(n);
         gr.ok = base + 64 <= rowlen;
-        gr.idx = @splat(0);
+        gr.idx = @splat(if (avx2_shuf) 0x80 else 0);
         gr.w = @splat(0);
         for (0..n) |p| {
             const t = xt[gi * n + p];
@@ -89,6 +102,12 @@ pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allo
                 if (planar) {
                     if (off >= 64) gr.ok = false else gr.idx[tap * 16 + sample] = @intCast(off);
                     gr.w[tap * 16 + sample] = @intCast(t.w[tap]);
+                } else if (avx2_shuf) {
+                    // Byte `pair * 2` of each chunk's 32 indices, so the
+                    // result is the interleaved pairs as 32 bytes.
+                    const pair = sample * 2 + tap;
+                    if (off >= 64) gr.ok = false else gr.idx[(off / 16) * 32 + pair] = @intCast(off % 16);
+                    gr.w[pair] = @intCast(t.w[tap]);
                 } else {
                     const pair = sample * 2 + tap;
                     if (off >= 64) gr.ok = false else gr.idx[2 * pair] = @intCast(off);
@@ -162,12 +181,45 @@ inline fn hrowGroup(s: []const u8, out: []i16, g: Group) void {
         out[0..16].* = @as(@Vector(16, i16), @truncate(acc >> @splat(4)));
         return;
     }
+    if (comptime avx2_shuf) {
+        const w = s[g.base..][0..64];
+        var bytes: avx2.B = @splat(0);
+        inline for (0..4) |k| {
+            const c: @Vector(16, u8) = w[k * 16 ..][0..16].*;
+            const both = @shuffle(u8, c, undefined, dup16);
+            bytes |= avx2.@"llvm.x86.avx2.pshuf.b"(both, g.idx[k * 32 ..][0..32].*);
+        }
+        const a: @Vector(32, i16) = @intCast(bytes);
+        const wv: @Vector(32, i16) = g.w;
+        const lo = avx2.@"llvm.x86.avx2.pmadd.wd"(@shuffle(i16, a, undefined, lo16), @shuffle(i16, wv, undefined, lo16));
+        const hi = avx2.@"llvm.x86.avx2.pmadd.wd"(@shuffle(i16, a, undefined, hi16), @shuffle(i16, wv, undefined, hi16));
+        const acc = @shuffle(i32, lo, hi, [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, -1, -2, -3, -4, -5, -6, -7, -8 }) >> @splat(4);
+        out[0..16].* = @as(@Vector(16, i16), @truncate(acc));
+        return;
+    }
     const win: @Vector(64, u8) = s[g.base..][0..64].*;
-    const bytes = permb(win, g.idx);
+    const bytes = permb(win, g.idx[0..64].*);
     const a: @Vector(32, i16) = @bitCast(@as(@Vector(32, u16), @bitCast(bytes)) & @as(@Vector(32, u16), @splat(0xff)));
     const acc = maddwd(a, g.w) >> @splat(4);
     out[0..16].* = @as(@Vector(16, i16), @truncate(acc));
 }
+
+const lo16 = blk: {
+    var m: [16]i32 = undefined;
+    for (0..16) |k| m[k] = k;
+    break :blk m;
+};
+const hi16 = blk: {
+    var m: [16]i32 = undefined;
+    for (0..16) |k| m[k] = 16 + k;
+    break :blk m;
+};
+
+const dup16 = blk: {
+    var m: [32]i32 = undefined;
+    for (0..32) |k| m[k] = k % 16;
+    break :blk m;
+};
 
 const coef_bits = 11;
 const coef_scale = 1 << coef_bits;
