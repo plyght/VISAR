@@ -109,12 +109,78 @@ def gftt():
     run("goodFeaturesToTrack ties", lambda: pair(img, 0, 0.01, 3))
 
 
+
+def optical_flow():
+    # Status must match exactly; tracked positions (where both found the
+    # point) within 0.01 px. OpenCV sums the window products in f32 in an
+    # order set by its SIMD path, VISAR exactly in integers; the two differ
+    # in the last bits of the 2x2 system, which moves a point by ~1e-4 px
+    # and, rarely, changes the iteration at which it meets the epsilon test.
+    # Points whose iteration does not converge (OpenCV's own answer moves by
+    # more than 0.01 px when allowed 100 iterations instead of the
+    # criteria's count) wander chaotically, so 1e-6 differences grow without
+    # bound; they are excluded from the position comparison (status must
+    # still match). On these images that only happens for the 33x40 frame
+    # shifted by 17 px, more than the 21x21 window can follow on its single
+    # pyramid level.
+    def lk(a, b, pts, **kw):
+        crit = kw.pop("criteria", (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 30, 0.01))
+        win = kw.pop("win", (21, 21))
+        lvl = kw.pop("level", 3)
+        flags = kw.pop("flags", 0)
+        init = kw.pop("init", None)
+        ref_next, ref_st, ref_err = cv2.calcOpticalFlowPyrLK(
+            a, b, pts.reshape(-1, 1, 2), None if init is None else init.reshape(-1, 1, 2).copy(), winSize=win,
+            maxLevel=lvl, criteria=crit, flags=flags)
+        ours = vs.calc_optical_flow_pyr_lk(a, b, pts, init, win, lvl, crit, flags)
+        return ours, (ref_next.reshape(-1, 2), ref_st.ravel(), ref_err.ravel())
+
+    def check(name, a, b, pts, err_tol=0.01, **kw):
+        crit = kw.get("criteria", (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 30, 0.01))
+        long_kw = dict(kw, criteria=(crit[0] | cv2.TERM_CRITERIA_COUNT, 100, crit[2]))
+        (on, ost, oerr), (rn, rst, rerr) = lk(a, b, pts, **kw)
+        rn_long = lk(a, b, pts, **long_kw)[1][0]
+        settled = np.abs(rn_long - rn).max(axis=1) <= 0.01 if crit[1] >= 30 else np.ones(len(rn), bool)
+        run(f"LK status {name}", lambda: (ost, rst))
+        both = (ost == 1) & (rst == 1) & settled
+        run(f"LK points {name}", lambda: (on[both], rn[both]), 0.01)
+        run(f"LK err {name}", lambda: (oerr[both], rerr[both]), err_tol)
+
+    for (h, w) in [(480, 640), (720, 1280), (97, 131), (40, 33)]:
+        tag = f"{w}x{h}"
+        for cn in (1, 3):
+            a = cv2.GaussianBlur(natural(h, w, cn), (3, 3), 0)
+            g = a if cn == 1 else cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+            pts = cv2.goodFeaturesToTrack(g, 400, 0.01, 7)
+            pts = np.zeros((0, 2), np.float32) if pts is None else pts.reshape(-1, 2)
+            # Add points on and beyond the borders, and sub-pixel ones.
+            extra = np.array([[0, 0], [w - 1, h - 1], [w - 0.5, 3.25], [-5, 10], [w + 30, h / 2], [w / 2 + 0.3, h / 3 - 0.7],
+                              [-25, -25], [5.5, h - 2.25]], np.float32)
+            pts = np.concatenate([pts, extra]).astype(np.float32)
+            for (dx, dy) in [(2.3, -1.7), (10.0, 6.0), (-17.4, 3.1), (0.0, 0.0)]:
+                m = np.float32([[1, 0, dx], [0, 1, dy]])
+                b = cv2.warpAffine(a, m, (w, h), borderMode=cv2.BORDER_REFLECT101)
+                check(f"c{cn} shift({dx},{dy}) {tag}", a, b, pts)
+            m = cv2.getRotationMatrix2D((w / 2, h / 2), 3, 1.02)
+            b = cv2.warpAffine(a, m, (w, h), borderMode=cv2.BORDER_REFLECT101)
+            check(f"c{cn} rotate {tag}", a, b, pts)
+            if cn == 1:
+                b = cv2.warpAffine(a, np.float32([[1, 0, 4.6], [0, 1, -2.2]]), (w, h), borderMode=cv2.BORDER_REFLECT101)
+                check(f"win15x9 level2 {tag}", a, b, pts, win=(15, 9), level=2)
+                check(f"level0 {tag}", a, b, pts, level=0)
+                check(f"count5 {tag}", a, b, pts, criteria=(cv2.TERM_CRITERIA_COUNT, 5, 0))
+                check(f"eps0.1 {tag}", a, b, pts, criteria=(cv2.TERM_CRITERIA_EPS, 0, 0.1))
+                check(f"initial flow {tag}", a, b, pts, flags=cv2.OPTFLOW_USE_INITIAL_FLOW, init=pts + np.float32([4, -2]))
+                check(f"min eigenvalues {tag}", a, b, pts, err_tol=1e-6, flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS)
+
+
 def main():
     vs.set_num_threads(0)
     print(f"VISAR {vs.version()} ({vs.lib.visar_build_info().decode()}) vs OpenCV {cv2.__version__}")
     pyramids()
     corners()
     gftt()
+    optical_flow()
     width = max(len(r[0]) for r in results)
     failed = [r for r in results if not r[3]]
     for name, mx, frac, ok in results:

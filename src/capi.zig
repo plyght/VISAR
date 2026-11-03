@@ -339,6 +339,32 @@ export fn visar_equalize_hist(src: *const CImage, dst: *const CImage) c_int {
     return run(ip.equalizeHist(exec(), s, d));
 }
 
+// ----------------------------------------------------------------- video
+
+/// calcOpticalFlowPyrLK on 8-bit images. Points are `n` (x, y) float
+/// pairs. `criteria_type`, `flags` use OpenCV's values (COUNT = 1, EPS = 2;
+/// OPTFLOW_USE_INITIAL_FLOW = 4, OPTFLOW_LK_GET_MIN_EIGENVALS = 8). `err`
+/// may be null.
+export fn visar_calc_optical_flow_pyr_lk(prev: *const CImage, next: *const CImage, prev_pts: [*]const f32, next_pts: [*]f32, status: [*]u8, err: ?[*]f32, n: usize, win_w: c_int, win_h: c_int, max_level: c_int, criteria_type: c_int, max_count: c_int, epsilon: f64, flags: c_int, min_eig_threshold: f64) c_int {
+    if (win_w <= 2 or win_h <= 2 or max_level < 0) return fail(error.InvalidArgument);
+    const a = typed(u8, prev) catch |e| return fail(e);
+    const b = typed(u8, next) catch |e| return fail(e);
+    const o: visar.video.LKOptions = .{
+        .win_width = @intCast(win_w),
+        .win_height = @intCast(win_h),
+        .max_level = @intCast(max_level),
+        .max_count = if (criteria_type & 1 != 0) @intCast(std.math.clamp(max_count, 0, 100)) else 30,
+        .epsilon = if (criteria_type & 2 != 0) epsilon else 0.01,
+        .use_initial_flow = flags & 4 != 0,
+        .get_min_eigenvals = flags & 8 != 0,
+        .min_eig_threshold = @floatCast(min_eig_threshold),
+    };
+    const P = visar.video.optflow.Point2f;
+    const pp: [*]const P = @ptrCast(@alignCast(prev_pts));
+    const np: [*]P = @ptrCast(@alignCast(next_pts));
+    return run(visar.video.calcOpticalFlowPyrLK(exec(), gpa, a, b, pp[0..n], np[0..n], status[0..n], if (err) |e| e[0..n] else null, o));
+}
+
 // ------------------------------------------------------------------ core
 
 /// op: 0 add, 1 subtract, 2 absdiff, 3 multiply, 4 divide, 5 min, 6 max,

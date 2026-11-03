@@ -71,6 +71,12 @@ int visar_equalize_hist(const visar_image *src, const visar_image *dst);
 /* labels: VISAR_32S image; stats: max rows of left, top, width, height, area; centroids: max rows of cx, cy */
 int visar_connected_components(const visar_image *src, const visar_image *labels, int connectivity, int32_t *stats, double *centroids, size_t max, size_t *count);
 
+/* video: pyramidal Lucas-Kanade on VISAR_8U images; points are n (x, y) float pairs; err may be NULL.
+   criteria_type: 1 COUNT | 2 EPS; flags: 4 USE_INITIAL_FLOW | 8 LK_GET_MIN_EIGENVALS */
+int visar_calc_optical_flow_pyr_lk(const visar_image *prev, const visar_image *next, const float *prev_pts, float *next_pts,
+                                   uint8_t *status, float *err, size_t n, int win_w, int win_h, int max_level,
+                                   int criteria_type, int max_count, double epsilon, int flags, double min_eig_threshold);
+
 /* core: op 0 add, 1 subtract, 2 absdiff, 3 multiply, 4 divide, 5 min, 6 max, 7 and, 8 or, 9 xor */
 int visar_arith(int op, const visar_image *a, const visar_image *b, const visar_image *dst);
 int visar_add_weighted(const visar_image *a, double alpha, const visar_image *b, double beta, double gamma, const visar_image *dst);

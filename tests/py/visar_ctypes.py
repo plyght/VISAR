@@ -158,10 +158,29 @@ def good_features_to_track(a, max_corners, quality_level, min_distance, mask=Non
     count = ctypes.c_size_t(0)
     m = ctypes.byref(desc(mask)) if mask is not None else None
     _check(lib.visar_good_features_to_track(ctypes.byref(desc(a)), out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                                            cap, ctypes.byref(count), max_corners, ctypes.c_double(quality_level),
+                                            ctypes.c_size_t(cap), ctypes.byref(count), max_corners, ctypes.c_double(quality_level),
                                             ctypes.c_double(min_distance), m, block_size, gradient_size,
                                             int(use_harris), ctypes.c_double(k)))
     return out[:min(count.value, cap)].copy()
+
+
+def calc_optical_flow_pyr_lk(prev, nxt, prev_pts, next_pts=None, win_size=(21, 21), max_level=3,
+                             criteria=(3, 30, 0.01), flags=0, min_eig_threshold=1e-4):
+    """Like cv2.calcOpticalFlowPyrLK: returns (next_pts, status, err) as (n, 2), (n,), (n,) arrays."""
+    pp = np.ascontiguousarray(np.asarray(prev_pts, np.float32).reshape(-1, 2))
+    n = len(pp)
+    if next_pts is None:
+        npts = pp.copy()
+    else:
+        npts = np.ascontiguousarray(np.asarray(next_pts, np.float32).reshape(-1, 2)).copy()
+    st = np.zeros(n, np.uint8)
+    err = np.zeros(n, np.float32)
+    fp = ctypes.POINTER(ctypes.c_float)
+    _check(lib.visar_calc_optical_flow_pyr_lk(
+        ctypes.byref(desc(prev)), ctypes.byref(desc(nxt)), pp.ctypes.data_as(fp), npts.ctypes.data_as(fp),
+        st.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), err.ctypes.data_as(fp), ctypes.c_size_t(n), win_size[0], win_size[1],
+        max_level, criteria[0], criteria[1], ctypes.c_double(criteria[2]), flags, ctypes.c_double(min_eig_threshold)))
+    return npts, st, err
 
 
 def threshold(a, thresh, maxval, kind, dst=None):
