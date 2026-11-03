@@ -40,6 +40,16 @@ const avx2 = struct {
 const neon = struct {
     const V = @Vector(16, u8);
     extern fn @"llvm.aarch64.neon.tbl4.v16i8"(V, V, V, V, V) V;
+    extern fn @"llvm.aarch64.neon.tbl2.v16i8"(V, V, V) V;
+    extern fn @"llvm.aarch64.neon.tbl1.v16i8"(V, V) V;
+    inline fn tbl(comptime k: usize, t: [k]V, idx: V) V {
+        return switch (k) {
+            1 => @"llvm.aarch64.neon.tbl1.v16i8"(t[0], idx),
+            2 => @"llvm.aarch64.neon.tbl2.v16i8"(t[0], t[1], idx),
+            4 => @"llvm.aarch64.neon.tbl4.v16i8"(t[0], t[1], t[2], t[3], idx),
+            else => unreachable,
+        };
+    }
     inline fn tbl4(t: [4]V, idx: V) V {
         return @"llvm.aarch64.neon.tbl4.v16i8"(t[0], t[1], t[2], t[3], idx);
     }
@@ -68,6 +78,9 @@ pub const Group = struct {
     w: [32]i16 align(64),
     base: u32,
     n: u8,
+    /// Bytes of the window actually used (16, 32 or 64; the same for all
+    /// groups of a row): fewer table registers when the pixels are close.
+    win: u8,
     ok: bool,
 };
 
@@ -86,12 +99,24 @@ pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allo
         }
         if (bad * 16 <= gi) break; // at most 1 in 16 groups on the slow path
     }
+    // The smallest window that holds every group that fits at all (vpermb
+    // always takes 64 bytes).
+    var win: usize = 16;
+    if (planar or avx2_shuf) {
+        var gi: usize = 0;
+        while ((gi + 1) * n <= xt.len) : (gi += 1) {
+            const span = xt[gi * n + n - 1].o[1] + cn - xt[gi * n].o[0];
+            const need: usize = if (span <= 16) 16 else if (span <= 32) 32 else 64;
+            if (span <= 64) win = @max(win, need);
+        }
+    } else win = 64;
     const g = try gpa.alloc(Group, xt.len / n);
     for (g, 0..) |*gr, gi| {
         const base = xt[gi * n].o[0];
         gr.base = base;
         gr.n = @intCast(n);
-        gr.ok = base + 64 <= rowlen;
+        gr.win = @intCast(win);
+        gr.ok = base + win <= rowlen;
         gr.idx = @splat(if (avx2_shuf) 0x80 else 0);
         gr.w = @splat(0);
         for (0..n) |p| {
@@ -100,13 +125,13 @@ pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allo
                 const sample = p * cn + l;
                 const off = t.o[tap] + l - base;
                 if (planar) {
-                    if (off >= 64) gr.ok = false else gr.idx[tap * 16 + sample] = @intCast(off);
+                    if (off >= win) gr.ok = false else gr.idx[tap * 16 + sample] = @intCast(off);
                     gr.w[tap * 16 + sample] = @intCast(t.w[tap]);
                 } else if (avx2_shuf) {
                     // Byte `pair * 2` of each chunk's 32 indices, so the
                     // result is the interleaved pairs as 32 bytes.
                     const pair = sample * 2 + tap;
-                    if (off >= 64) gr.ok = false else gr.idx[(off / 16) * 32 + pair] = @intCast(off % 16);
+                    if (off >= win) gr.ok = false else gr.idx[(off / 16) * 32 + pair] = @intCast(off % 16);
                     gr.w[pair] = @intCast(t.w[tap]);
                 } else {
                     const pair = sample * 2 + tap;
@@ -168,13 +193,14 @@ inline fn maddwd(a: @Vector(32, i16), b: @Vector(32, i16)) @Vector(16, i32) {
 
 /// Bilinear horizontal pass for one group: 16 samples (some unused) are
 /// written, so `out` needs room past the group's own samples.
-inline fn hrowGroup(s: []const u8, out: []i16, g: Group) void {
+inline fn hrowGroup(comptime W: usize, s: []const u8, out: []i16, g: Group) void {
     if (comptime planar) {
-        const w = s[g.base..][0..64];
-        const t: [4]neon.V = .{ w[0..16].*, w[16..32].*, w[32..48].*, w[48..64].* };
+        const w = s[g.base..][0..W];
+        var t: [W / 16]neon.V = undefined;
+        inline for (0..W / 16) |k| t[k] = w[k * 16 ..][0..16].*;
         const I = @Vector(16, i32);
-        const s0: @Vector(16, i16) = @intCast(neon.tbl4(t, g.idx[0..16].*));
-        const s1: @Vector(16, i16) = @intCast(neon.tbl4(t, g.idx[16..32].*));
+        const s0: @Vector(16, i16) = @intCast(neon.tbl(W / 16, t, g.idx[0..16].*));
+        const s1: @Vector(16, i16) = @intCast(neon.tbl(W / 16, t, g.idx[16..32].*));
         const w0: @Vector(16, i16) = g.w[0..16].*;
         const w1: @Vector(16, i16) = g.w[16..32].*;
         const acc = @as(I, s0) * @as(I, w0) + @as(I, s1) * @as(I, w1);
@@ -182,9 +208,9 @@ inline fn hrowGroup(s: []const u8, out: []i16, g: Group) void {
         return;
     }
     if (comptime avx2_shuf) {
-        const w = s[g.base..][0..64];
+        const w = s[g.base..][0..W];
         var bytes: avx2.B = @splat(0);
-        inline for (0..4) |k| {
+        inline for (0..W / 16) |k| {
             const c: @Vector(16, u8) = w[k * 16 ..][0..16].*;
             const both = @shuffle(u8, c, undefined, dup16);
             bytes |= avx2.@"llvm.x86.avx2.pshuf.b"(both, g.idx[k * 32 ..][0..32].*);
@@ -340,8 +366,11 @@ fn rows(comptime K: usize, comptime kind: Kind, comptime cn: usize, c: anytype, 
 fn hrow(comptime K: usize, comptime cn: usize, comptime E: type, s: []const u8, out: []E, xt: []const Tap(K), gs: []const Group) void {
     if (E == i16 and fast_permute and gs.len > 0) {
         const gn: usize = gs[0].n;
-        for (gs, 0..) |g, gi| {
-            if (g.ok) hrowGroup(s, out[gi * gn * cn ..], g) else hrowPixels(K, cn, E, s, out, xt, gi * gn, gi * gn + gn);
+        switch (gs[0].win) {
+            inline 16, 32, 64 => |W| for (gs, 0..) |g, gi| {
+                if (g.ok) hrowGroup(W, s, out[gi * gn * cn ..], g) else hrowPixels(K, cn, E, s, out, xt, gi * gn, gi * gn + gn);
+            },
+            else => unreachable,
         }
         return hrowPixels(K, cn, E, s, out, xt, gs.len * gn, xt.len);
     }
