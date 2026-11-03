@@ -13,6 +13,7 @@ pub const hist = @import("hist.zig");
 pub const components = @import("components.zig");
 pub const draw = @import("draw.zig");
 pub const pyramid = @import("pyramid.zig");
+pub const corner = @import("corner.zig");
 
 pub const Border = border.Border;
 
@@ -56,6 +57,11 @@ pub const pyrDown = pyramid.pyrDown;
 pub const pyrUp = pyramid.pyrUp;
 pub const buildPyramid = pyramid.buildPyramid;
 pub const Pyramid = pyramid.Pyramid;
+
+pub const Point2f = corner.Point2f;
+pub const cornerMinEigenVal = corner.cornerMinEigenVal;
+pub const cornerHarris = corner.cornerHarris;
+pub const goodFeaturesToTrack = corner.goodFeaturesToTrack;
 
 pub const connectedComponentsWithStats = components.connectedComponentsWithStats;
 

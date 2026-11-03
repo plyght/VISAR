@@ -136,6 +136,34 @@ def pyr_up(a, border=4, dst=None):
     return dst
 
 
+def corner_min_eigen_val(a, block_size, ksize=3, border=4, dst=None):
+    dst = np.empty(a.shape[:2], np.float32) if dst is None else dst
+    _check(lib.visar_corner_min_eigen_val(ctypes.byref(desc(a)), ctypes.byref(desc(dst)), block_size, ksize, border))
+    return dst
+
+
+def corner_harris(a, block_size, ksize, k, border=4, dst=None):
+    dst = np.empty(a.shape[:2], np.float32) if dst is None else dst
+    _check(lib.visar_corner_harris(ctypes.byref(desc(a)), ctypes.byref(desc(dst)), block_size, ksize,
+                                   ctypes.c_double(k), border))
+    return dst
+
+
+def good_features_to_track(a, max_corners, quality_level, min_distance, mask=None, block_size=3, gradient_size=3,
+                           use_harris=False, k=0.04, cap=None):
+    """Corners as an (n, 2) float32 array, like cv2.goodFeaturesToTrack(...).reshape(-1, 2)."""
+    if cap is None:
+        cap = max_corners if max_corners > 0 else a.shape[0] * a.shape[1]
+    out = np.empty((max(cap, 1), 2), np.float32)
+    count = ctypes.c_size_t(0)
+    m = ctypes.byref(desc(mask)) if mask is not None else None
+    _check(lib.visar_good_features_to_track(ctypes.byref(desc(a)), out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                            cap, ctypes.byref(count), max_corners, ctypes.c_double(quality_level),
+                                            ctypes.c_double(min_distance), m, block_size, gradient_size,
+                                            int(use_harris), ctypes.c_double(k)))
+    return out[:min(count.value, cap)].copy()
+
+
 def threshold(a, thresh, maxval, kind, dst=None):
     dst = np.empty_like(a) if dst is None else dst
     used = ctypes.c_double(0)

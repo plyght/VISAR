@@ -218,6 +218,64 @@ export fn visar_pyr_up(src: *const CImage, dst: *const CImage, b: c_int) c_int {
     }.f));
 }
 
+/// cornerMinEigenVal: u8 or f32 one-channel `src`, f32 `dst`; ksize 1, 3,
+/// 5, 7 or -1 (Scharr).
+export fn visar_corner_min_eigen_val(src: *const CImage, dst: *const CImage, block_size: c_int, ksize: c_int, b: c_int) c_int {
+    return cornerCall(src, dst, block_size, ksize, b, null);
+}
+
+/// cornerHarris: as visar_corner_min_eigen_val, with the Harris constant k.
+export fn visar_corner_harris(src: *const CImage, dst: *const CImage, block_size: c_int, ksize: c_int, k: f64, b: c_int) c_int {
+    return cornerCall(src, dst, block_size, ksize, b, k);
+}
+
+fn cornerCall(src: *const CImage, dst: *const CImage, block_size: c_int, ksize: c_int, b: c_int, k: ?f64) c_int {
+    const bd = border(b) catch |e| return fail(e);
+    if (block_size <= 0) return fail(error.InvalidArgument);
+    const d = typed(f32, dst) catch |e| return fail(e);
+    const o: ip.corner.CornerOptions = .{ .block_size = @intCast(block_size), .ksize = ksize, .border = bd };
+    return run(switch (src.depth) {
+        inline 0, 5 => |dep| blk: {
+            const T = if (dep == 0) u8 else f32;
+            const s = typed(T, src) catch |e| return fail(e);
+            break :blk if (k) |kk| ip.cornerHarris(exec(), gpa, s, d, o, kk) else ip.cornerMinEigenVal(exec(), gpa, s, d, o);
+        },
+        else => error.Unsupported,
+    });
+}
+
+/// goodFeaturesToTrack. Writes up to `cap` corners as (x, y) float pairs to
+/// `corners`, strongest first, and the number found to `count` (which may
+/// exceed `cap`). `mask` may be null (else a u8 image of the same size).
+export fn visar_good_features_to_track(src: *const CImage, corners: ?[*]f32, cap: usize, count: *usize, max_corners: c_int, quality_level: f64, min_distance: f64, mask: ?*const CImage, block_size: c_int, gradient_size: c_int, use_harris: c_int, k: f64) c_int {
+    if (max_corners < 0 or block_size <= 0) return fail(error.InvalidArgument);
+    var o: ip.corner.GfttOptions = .{
+        .max_corners = @intCast(max_corners),
+        .quality_level = quality_level,
+        .min_distance = min_distance,
+        .block_size = @intCast(block_size),
+        .gradient_size = gradient_size,
+        .use_harris = use_harris != 0,
+        .k = k,
+    };
+    if (mask) |m| o.mask = typed(u8, m) catch |e| return fail(e);
+    const pts = switch (src.depth) {
+        inline 0, 5 => |dep| blk: {
+            const T = if (dep == 0) u8 else f32;
+            const s = typed(T, src) catch |e| return fail(e);
+            break :blk ip.goodFeaturesToTrack(exec(), gpa, s, o) catch |e| return fail(e);
+        },
+        else => return fail(error.Unsupported),
+    };
+    defer gpa.free(pts);
+    count.* = pts.len;
+    if (corners) |c| for (pts[0..@min(cap, pts.len)], 0..) |p, i| {
+        c[2 * i] = p.x;
+        c[2 * i + 1] = p.y;
+    };
+    return 0;
+}
+
 /// `type` uses OpenCV's encoding: 0-4 plus THRESH_OTSU (8) or THRESH_TRIANGLE (16).
 export fn visar_threshold(src: *const CImage, dst: *const CImage, thresh: f64, maxval: f64, kind: c_int, used: ?*f64) c_int {
     const k = std.enums.fromInt(ip.ThresholdType, kind & 7) orelse return fail(error.Unsupported);

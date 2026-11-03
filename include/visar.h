@@ -55,6 +55,13 @@ int visar_sobel(const visar_image *src, const visar_image *dst, int dx, int dy, 
 /* pyramids: dst is ((w+1)/2, (h+1)/2) for pyr_down, (2w, 2h) for pyr_up (border must be 4, BORDER_DEFAULT) */
 int visar_pyr_down(const visar_image *src, const visar_image *dst, int border);
 int visar_pyr_up(const visar_image *src, const visar_image *dst, int border);
+/* corners: src VISAR_8U or VISAR_32F with one channel, dst VISAR_32F; ksize 1, 3, 5, 7 or -1 (Scharr) */
+int visar_corner_min_eigen_val(const visar_image *src, const visar_image *dst, int block_size, int ksize, int border);
+int visar_corner_harris(const visar_image *src, const visar_image *dst, int block_size, int ksize, double k, int border);
+/* writes up to cap (x, y) pairs to corners and the number found to *count; mask may be NULL */
+int visar_good_features_to_track(const visar_image *src, float *corners, size_t cap, size_t *count, int max_corners,
+                                 double quality_level, double min_distance, const visar_image *mask, int block_size,
+                                 int gradient_size, int use_harris, double k);
 int visar_threshold(const visar_image *src, const visar_image *dst, double thresh, double maxval, int type, double *used);
 int visar_morphology(const visar_image *src, const visar_image *dst, int op, int shape, int kw, int kh, int iterations);
 int visar_flip(const visar_image *src, const visar_image *dst, int code);
