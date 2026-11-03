@@ -14,6 +14,7 @@ pub const components = @import("components.zig");
 pub const draw = @import("draw.zig");
 pub const contours = @import("contours.zig");
 pub const polygon = @import("polygon.zig");
+pub const shape = @import("shape.zig");
 
 pub const Border = border.Border;
 
@@ -65,6 +66,28 @@ pub const drawContours = polygon.drawContours;
 pub const fillPoly = polygon.fillPoly;
 pub const fillConvexPoly = polygon.fillConvexPoly;
 pub const polylines = polygon.polylines;
+
+pub const Point2f = shape.Point2f;
+pub const Rect = shape.Rect;
+pub const RotatedRect = shape.RotatedRect;
+pub const Moments = shape.Moments;
+pub const contourMoments = shape.contourMoments;
+pub const imageMoments = shape.imageMoments;
+pub const huMoments = shape.huMoments;
+pub const matchShapes = shape.matchShapes;
+pub const contourArea = shape.contourArea;
+pub const arcLength = shape.arcLength;
+pub const boundingRect = shape.boundingRect;
+pub const maskBoundingRect = shape.maskBoundingRect;
+pub const convexHull = shape.convexHull;
+pub const convexityDefects = shape.convexityDefects;
+pub const isContourConvex = shape.isContourConvex;
+pub const minAreaRect = shape.minAreaRect;
+pub const boxPoints = shape.boxPoints;
+pub const minEnclosingCircle = shape.minEnclosingCircle;
+pub const approxPolyDP = shape.approxPolyDP;
+pub const pointPolygonTest = shape.pointPolygonTest;
+pub const fitEllipse = shape.fitEllipse;
 
 test {
     std.testing.refAllDecls(@This());

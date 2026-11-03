@@ -124,6 +124,139 @@ def masks():
     return out
 
 
+def rel(ours, ref):
+    """Scales both sides by the reference magnitude so `tol` is relative."""
+    ours = np.asarray(ours, np.float64).ravel()
+    ref = np.asarray(ref, np.float64).ravel()
+    if ours.shape != ref.shape:
+        return ours, ref
+    s = np.maximum(np.abs(ref), 1.0)
+    return ours / s, ref / s
+
+
+def point_sets():
+    """Contours from the masks plus random and degenerate point sets."""
+    sets = []
+    for nm, m in masks():
+        if not nm.startswith(("blobs0", "nested squares", "borders", "field", "lines", "noise d0.4 64x64", "pixels")):
+            continue
+        for meth, an in ((cv2.CHAIN_APPROX_NONE, "none"), (cv2.CHAIN_APPROX_SIMPLE, "simple")):
+            cs, _ = cv2.findContours(m, cv2.RETR_LIST, meth)
+            step = max(1, len(cs) // 25)
+            for i in range(0, len(cs), step):
+                sets.append((f"{nm} {an} #{i}", cs[i]))
+    for k in range(40):
+        n = int(rng.integers(1, 60))
+        sets.append((f"random int #{k}", rng.integers(-500, 500, (n, 1, 2)).astype(np.int32)))
+        sets.append((f"random float #{k}", (rng.random((n, 1, 2)) * 200 - 50).astype(np.float32)))
+    for k in range(10):
+        t = np.sort(rng.random(int(rng.integers(5, 40)))) * 2 * np.pi
+        e = np.stack([60 + 40 * np.cos(t), 50 + 20 * np.sin(t)], -1).reshape(-1, 1, 2)
+        sets.append((f"ellipse float #{k}", e.astype(np.float32)))
+        sets.append((f"ellipse int #{k}", np.round(e).astype(np.int32)))
+    sets.append(("one point", np.array([[[3, 4]]], np.int32)))
+    sets.append(("two points", np.array([[[3, 4]], [[10, -2]]], np.int32)))
+    sets.append(("vertical", np.array([[[3, 4]], [[3, 9]]], np.int32)))
+    sets.append(("collinear", np.array([[[i, 2 * i]] for i in range(10)], np.int32)))
+    sets.append(("duplicates", np.array([[[1, 1]], [[1, 1]], [[5, 1]], [[5, 1]], [[5, 6]], [[1, 1]]], np.int32)))
+    sets.append(("square", np.array([[[0, 0]], [[0, 10]], [[10, 10]], [[10, 0]]], np.int32)))
+    sets.append(("square float", np.array([[[0.5, 0]], [[0, 10]], [[10, 10.25]], [[10, 0]]], np.float32)))
+    return sets
+
+
+def shape_tests():
+    sets = point_sets()
+    for nm, p in sets:
+        run(f"moments {nm}", lambda: rel([*vs.moments(p).values()], [*cv2.moments(p).values()]), 1e-9)
+        run(f"HuMoments {nm}", lambda: rel(vs.hu_moments(cv2.moments(p)), cv2.HuMoments(cv2.moments(p))), 1e-12)
+        run(f"contourArea {nm}", lambda: (np.array([vs.contour_area(p), vs.contour_area(p, True)]),
+                                          np.array([cv2.contourArea(p), cv2.contourArea(p, True)])))
+        run(f"arcLength {nm}", lambda: (np.array([vs.arc_length(p, True), vs.arc_length(p, False)]),
+                                        np.array([cv2.arcLength(p, True), cv2.arcLength(p, False)])))
+        run(f"boundingRect {nm}", lambda: (np.array(vs.bounding_rect(p)), np.array(cv2.boundingRect(p))))
+        run(f"isContourConvex {nm}", lambda: (np.array([vs.is_contour_convex(p)]), np.array([cv2.isContourConvex(p)])))
+        for cw in (False, True):
+            run(f"convexHull points cw{int(cw)} {nm}", lambda: (vs.convex_hull(p, cw), cv2.convexHull(p, clockwise=cw)))
+            run(f"convexHull indices cw{int(cw)} {nm}",
+                lambda: (vs.convex_hull(p, cw, False), cv2.convexHull(p, clockwise=cw, returnPoints=False)))
+        if p.dtype == np.int32 and len(p) > 3:
+            def cd():
+                h = cv2.convexHull(p, returnPoints=False)
+                try:
+                    ref = cv2.convexityDefects(p, h)
+                except cv2.error:
+                    ref = "error"
+                try:
+                    ours = vs.convexity_defects(p, h)
+                except vs.VisarError:
+                    ours = "error"
+                if isinstance(ref, str) or isinstance(ours, str):
+                    return np.array([isinstance(ours, str)]), np.array([isinstance(ref, str)])
+                if ref is None or ours is None:
+                    return np.array([ours is None]), np.array([ref is None])
+                return ours, ref
+            run(f"convexityDefects {nm}", cd)
+        def mar():
+            (c, s, a) = vs.min_area_rect(p)
+            (rc, rs, ra) = cv2.minAreaRect(p)
+            return np.array([*c, *s, a]), np.array([*rc, *rs, ra])
+        run(f"minAreaRect {nm}", mar)
+        run(f"boxPoints {nm}", lambda: (vs.box_points(cv2.minAreaRect(p)), cv2.boxPoints(cv2.minAreaRect(p))))
+        def mec():
+            (c, r) = vs.min_enclosing_circle(p)
+            (rc, rr) = cv2.minEnclosingCircle(p)
+            return np.array([*c, r]), np.array([*rc, rr])
+        run(f"minEnclosingCircle {nm}", mec)
+        for eps in (0.5, 1.0, 3.0, 10.0):
+            for closed in (True, False):
+                run(f"approxPolyDP eps{eps} closed{int(closed)} {nm}",
+                    lambda: (vs.approx_poly_dp(p, eps, closed), cv2.approxPolyDP(p, eps, closed)))
+        q = p.reshape(-1, 2).astype(np.float64)
+        lo, hi = q.min(0) - 3, q.max(0) + 3
+        tests = [tuple(x) for x in p.reshape(-1, 2)[:5].astype(np.float32)]
+        tests += [(float(rng.uniform(lo[0], hi[0])), float(rng.uniform(lo[1], hi[1]))) for _ in range(8)]
+        tests += [(float(round(rng.uniform(lo[0], hi[0]))), float(round(rng.uniform(lo[1], hi[1])))) for _ in range(8)]
+        for md in (False, True):
+            run(f"pointPolygonTest md{int(md)} {nm}",
+                lambda: (np.array([vs.point_polygon_test(p, t, md) for t in tests]),
+                         np.array([cv2.pointPolygonTest(p, t, md) for t in tests])), 1e-12)
+    for k in range(30):
+        a = sets[int(rng.integers(0, len(sets)))][1]
+        b = sets[int(rng.integers(0, len(sets)))][1]
+        for meth in (1, 2, 3):
+            run(f"matchShapes I{meth} #{k}", lambda: rel([vs.match_shapes(a, b, meth)], [cv2.matchShapes(a, b, meth, 0)]), 1e-9)
+    # Raster moments.
+    for nm, m in masks():
+        if not nm.startswith(("blobs", "field", "noise d0.4", "ones", "pixels", "view")):
+            continue
+        # Non-binary 8-bit moments go through IPP on x86 OpenCV builds,
+        # which sums in a different order (relative error ~1e-9).
+        for binary in (False, True):
+            run(f"moments raster u8 bin{int(binary)} {nm}",
+                lambda: rel([*vs.moments(m, binary).values()], [*cv2.moments(m, binary).values()]), 1e-8)
+        run(f"boundingRect raster {nm}", lambda: (np.array(vs.bounding_rect(m)), np.array(cv2.boundingRect(m))))
+    img = rng.integers(0, 256, (123, 77)).astype(np.uint8)
+    for dt in (np.uint16, np.int16, np.float32):
+        a = (img.astype(np.float32) * (1.7 if dt == np.float32 else 1) - (100 if dt == np.int16 else 0)).astype(dt)
+        if dt == np.uint16:
+            a = a * 250
+        for binary in (False, True):
+            run(f"moments raster {np.dtype(dt).name} bin{int(binary)}",
+                lambda: rel([*vs.moments(a, binary).values()], [*cv2.moments(a, binary).values()]), 1e-9)
+    # fitEllipse: only well-posed sets. On degenerate ones (lines, L shapes,
+    # duplicates, few-pixel blobs) the fit is ill-conditioned and OpenCV's
+    # Jacobi SVD and VISAR's QR least squares legitimately diverge (OpenCV
+    # also jitters such sets with its global RNG).
+    for nm, p in sets:
+        if len(p) < 6 or not nm.startswith(("ellipse", "random", "blobs0", "nested", "field")) or len(p) < 20 and nm[0] in "bnf":
+            continue
+        def fe():
+            (c, s, a) = vs.fit_ellipse(p)
+            (rc, rs, ra) = cv2.fitEllipse(p)
+            return rel([*c, *s, a], [*rc, *rs, ra])
+        run(f"fitEllipse {nm}", fe, 1e-4)
+
+
 def draw_tests():
     """drawContours / fillPoly / polylines against OpenCV, pixel for pixel."""
     srcs = [m for nm, m in masks() if nm.startswith(("blobs", "nested", "borders", "field", "lines", "noise d0.4 64x64"))]
@@ -194,6 +327,7 @@ def main():
         run(f"findContours offset {nm}", fo)
 
     draw_tests()
+    shape_tests()
 
     width = max(len(r[0]) for r in results)
     failed = [r for r in results if not r[3]]

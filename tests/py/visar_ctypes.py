@@ -307,3 +307,155 @@ def polylines(img, polys, closed, color, thickness=1, line_type=8):
     _check(lib.visar_polylines(ctypes.byref(desc(img)), _iptr(pts), _sptr(starts), len(polys), int(closed),
                                _color(color), thickness, line_type))
     return img
+
+
+# ---------------------------------------------------------------- shape
+
+MOMENT_KEYS = ["m00", "m10", "m01", "m20", "m11", "m02", "m30", "m21", "m12", "m03",
+               "mu20", "mu11", "mu02", "mu30", "mu21", "mu12", "mu03",
+               "nu20", "nu11", "nu02", "nu30", "nu21", "nu12", "nu03"]
+
+
+class Moments(ctypes.Structure):
+    _fields_ = [(k, ctypes.c_double) for k in MOMENT_KEYS]
+
+    def as_dict(self):
+        return {k: getattr(self, k) for k in MOMENT_KEYS}
+
+
+class RotatedRect(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_float), ("cy", ctypes.c_float), ("w", ctypes.c_float),
+                ("h", ctypes.c_float), ("angle", ctypes.c_float)]
+
+
+def _pts(p):
+    """(pointer, count, depth) for a point set given as an int32 or float32 array of N (x, y) pairs."""
+    a = np.asarray(p)
+    if a.dtype not in (np.int32, np.float32):
+        raise ValueError("points must be int32 or float32")
+    a = np.ascontiguousarray(a.reshape(-1, 2))
+    return a, ctypes.c_void_p(a.ctypes.data if len(a) else None), len(a), 4 if a.dtype == np.int32 else 5
+
+
+def moments(a, binary=False):
+    """cv2.moments: a point set (int32/float32 N x 2) or a single-channel image."""
+    m = Moments()
+    a = np.asarray(a)
+    if a.dtype in (np.int32, np.float32) and ((a.ndim == 3 and a.shape[1:] == (1, 2)) or (a.ndim == 2 and a.shape[1] == 2)):
+        keep, ptr, n, d = _pts(a)
+        _check(lib.visar_contour_moments(ptr, ctypes.c_size_t(n), d, ctypes.byref(m)))
+    else:
+        _check(lib.visar_moments(ctypes.byref(desc(a)), int(binary), ctypes.byref(m)))
+    return m.as_dict()
+
+
+def hu_moments(md):
+    m = Moments(*[md[k] for k in MOMENT_KEYS])
+    hu = (ctypes.c_double * 7)()
+    lib.visar_hu_moments(ctypes.byref(m), hu)
+    return np.array(hu[:]).reshape(7, 1)
+
+
+def _scalar(fn, p, *args, ctype=ctypes.c_double):
+    keep, ptr, n, d = _pts(p)
+    out = ctype()
+    _check(fn(ptr, ctypes.c_size_t(n), d, *args, ctypes.byref(out)))
+    return out.value
+
+
+def contour_area(p, oriented=False):
+    return _scalar(lib.visar_contour_area, p, int(oriented))
+
+
+def arc_length(p, closed):
+    return _scalar(lib.visar_arc_length, p, int(closed))
+
+
+def is_contour_convex(p):
+    return bool(_scalar(lib.visar_is_contour_convex, p, ctype=ctypes.c_int))
+
+
+def point_polygon_test(p, pt, measure_dist):
+    return _scalar(lib.visar_point_polygon_test, p, ctypes.c_float(pt[0]), ctypes.c_float(pt[1]), int(measure_dist))
+
+
+def bounding_rect(a):
+    r = (ctypes.c_int32 * 4)()
+    a = np.asarray(a)
+    if a.dtype == np.uint8:
+        _check(lib.visar_mask_bounding_rect(ctypes.byref(desc(a)), r))
+    else:
+        keep, ptr, n, d = _pts(a)
+        _check(lib.visar_bounding_rect(ptr, ctypes.c_size_t(n), d, r))
+    return tuple(r[:])
+
+
+def convex_hull(p, clockwise=False, return_points=True):
+    keep, ptr, n, d = _pts(p)
+    idx = np.empty(max(n, 1), np.int32)
+    cnt = ctypes.c_size_t(0)
+    _check(lib.visar_convex_hull(ptr, ctypes.c_size_t(n), d, int(clockwise), int(return_points),
+                                 idx.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), ctypes.byref(cnt)))
+    idx = idx[:cnt.value]
+    if return_points:
+        return keep[idx].reshape(-1, 1, 2)
+    return idx.reshape(-1, 1)
+
+
+def convexity_defects(p, hull):
+    keep, ptr, n, d = _pts(p)
+    h = np.ascontiguousarray(np.asarray(hull, np.int32).ravel())
+    out = np.empty((max(len(h), 1), 4), np.int32)
+    cnt = ctypes.c_size_t(0)
+    _check(lib.visar_convexity_defects(ptr, ctypes.c_size_t(n), h.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                                       ctypes.c_size_t(len(h)), out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                                       ctypes.byref(cnt)))
+    if cnt.value == 0:
+        return None
+    return out[:cnt.value].copy()
+
+
+def min_area_rect(p):
+    keep, ptr, n, d = _pts(p)
+    r = RotatedRect()
+    _check(lib.visar_min_area_rect(ptr, ctypes.c_size_t(n), d, ctypes.byref(r)))
+    return (r.cx, r.cy), (r.w, r.h), r.angle
+
+
+def box_points(box):
+    (cx, cy), (w, h), a = box
+    r = RotatedRect(cx, cy, w, h, a)
+    out = (ctypes.c_float * 8)()
+    lib.visar_box_points(ctypes.byref(r), out)
+    return np.array(out[:], np.float32).reshape(4, 2)
+
+
+def min_enclosing_circle(p):
+    keep, ptr, n, d = _pts(p)
+    out = (ctypes.c_float * 3)()
+    _check(lib.visar_min_enclosing_circle(ptr, ctypes.c_size_t(n), d, out))
+    return (out[0], out[1]), out[2]
+
+
+def approx_poly_dp(p, epsilon, closed):
+    keep, ptr, n, d = _pts(p)
+    out = np.empty((max(n, 1), 2), keep.dtype)
+    cnt = ctypes.c_size_t(0)
+    _check(lib.visar_approx_poly_dp(ptr, ctypes.c_size_t(n), d, ctypes.c_double(epsilon), int(closed),
+                                    ctypes.c_void_p(out.ctypes.data), ctypes.byref(cnt)))
+    return out[:cnt.value].reshape(-1, 1, 2)
+
+
+def match_shapes(a, b, method):
+    ka, pa, na, da = _pts(a)
+    kb, pb, nb, db = _pts(b)
+    out = ctypes.c_double()
+    _check(lib.visar_match_shapes(pa, ctypes.c_size_t(na), da, pb, ctypes.c_size_t(nb), db, method, ctypes.byref(out)))
+    return out.value
+
+
+def fit_ellipse(p):
+    keep, ptr, n, d = _pts(p)
+    r = RotatedRect()
+    _check(lib.visar_fit_ellipse(ptr, ctypes.c_size_t(n), d, ctypes.byref(r)))
+    return (r.cx, r.cy), (r.w, r.h), r.angle
