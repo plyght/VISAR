@@ -304,14 +304,8 @@ pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map:
     };
     const f: @Vector(1, u8) = .{fill};
     var x: usize = 0;
-    // Need 16 readable bytes at x*scn and 16 writable at x*dcn. Four
-    // groups per iteration first (loop overhead), then one at a time.
-    while ((x + 3 * per) * scn + 16 <= n * scn and (x + 3 * per) * dcn + 16 <= n * dcn) : (x += 4 * per) {
-        inline for (0..4) |g| {
-            const v = opaqueV(s[(x + g * per) * scn ..][0..16].*);
-            d[(x + g * per) * dcn ..][0..16].* = @shuffle(u8, v, f, mask);
-        }
-    }
+    // Need 16 readable bytes at x*scn and 16 writable at x*dcn. (Unrolling
+    // this by hand makes LLVM scalarise the stores into byte extracts.)
     while (x * scn + 16 <= n * scn and x * dcn + 16 <= n * dcn) : (x += per) {
         const v = opaqueV(s[x * scn ..][0..16].*);
         d[x * dcn ..][0..16].* = @shuffle(u8, v, f, mask);
