@@ -85,3 +85,47 @@ jobs:
           git add -A
           git commit -q -m "Demo assets for ${GITHUB_SHA::7}"
           git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" demo-assets
+
+  # Apple Silicon numbers (the closest CI gets to an M-series MacBook).
+  apple-silicon:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install numpy opencv-python-headless==5.0.0.*
+      - name: Tracking demo (synthetic scene)
+        run: |
+          zig build -Doptimize=ReleaseFast
+          ./zig-out/bin/visar demo track --size 1280x720 --frames 300 -o track-mac.gif -f --json > track-mac.json || true
+          ./zig-out/bin/visar demo track --size 1280x720 --frames 300 -o track-mac.gif -f
+      - name: Benchmark vs OpenCV (1 thread)
+        run: zig build bench -Doptimize=ReleaseFast -- --threads 1 --md bench-mac-1t.md
+      - name: Benchmark vs OpenCV (all cores)
+        run: zig build bench -Doptimize=ReleaseFast -- --threads 0 --md bench-mac-mt.md
+      - name: Job summary
+        run: |
+          {
+            echo "## VISAR on Apple Silicon ($(sysctl -n machdep.cpu.brand_string))"
+            echo
+            echo '```json'
+            cat track-mac.json
+            echo '```'
+            echo
+            echo "### Speed vs OpenCV, 1 thread"
+            cat bench-mac-1t.md
+            echo
+            echo "### Speed vs OpenCV, all cores"
+            cat bench-mac-mt.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visar-apple-silicon
+          path: |
+            track-mac.json
+            bench-mac-1t.md
+            bench-mac-mt.md

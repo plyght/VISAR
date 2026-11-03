@@ -110,9 +110,18 @@ const ThreadWorkers = struct {
     remaining: std.atomic.Value(u32) = .init(0),
     next: std.atomic.Value(usize) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
+    /// Workers currently asleep on `generation`, and whether the caller is
+    /// asleep on `remaining`: wakes are skipped (no syscall) when nobody
+    /// sleeps.
+    sleepers: std.atomic.Value(u32) = .init(0),
+    caller_asleep: std.atomic.Value(bool) = .init(false),
     job: Job = undefined,
 
-    const spin_iterations = 2000;
+    /// How long an idle thread spins before sleeping. Long enough to cover
+    /// the gaps between kernel calls inside one frame (waking a sleeping
+    /// thread costs 50-150 us on some systems), short enough not to burn a
+    /// core between frames of a live video loop.
+    const spin_ns: i96 = 250 * std.time.ns_per_us;
 
     fn spawn(gpa: Allocator, io: Io, count: usize) !*ThreadWorkers {
         const self = try gpa.create(ThreadWorkers);
@@ -151,17 +160,17 @@ const ThreadWorkers = struct {
         self.job = job;
         self.next.store(0, .monotonic);
         self.remaining.store(@intCast(self.threads.len), .monotonic);
-        _ = self.generation.fetchAdd(1, .release);
-        self.io.futexWake(u32, &self.generation.raw, std.math.maxInt(u32));
+        _ = self.generation.fetchAdd(1, .seq_cst);
+        if (self.sleepers.load(.seq_cst) > 0) self.io.futexWake(u32, &self.generation.raw, std.math.maxInt(u32));
         self.work();
-        var spins: usize = 0;
+        var spin = Spin{ .io = self.io };
         while (true) {
             const r = self.remaining.load(.acquire);
             if (r == 0) break;
-            if (spins < spin_iterations) {
-                spins += 1;
-                std.atomic.spinLoopHint();
-            } else self.io.futexWaitUncancelable(u32, &self.remaining.raw, r);
+            if (spin.keepSpinning()) continue;
+            self.caller_asleep.store(true, .seq_cst);
+            if (self.remaining.load(.seq_cst) == r) self.io.futexWaitUncancelable(u32, &self.remaining.raw, r);
+            self.caller_asleep.store(false, .seq_cst);
         }
     }
 
@@ -180,24 +189,47 @@ const ThreadWorkers = struct {
     fn workerMain(self: *ThreadWorkers, first_generation: u32) void {
         var seen = first_generation;
         while (true) {
-            var spins: usize = 0;
+            var spin = Spin{ .io = self.io };
             while (true) {
                 const g = self.generation.load(.acquire);
                 if (g != seen) {
                     seen = g;
                     break;
                 }
-                if (spins < spin_iterations) {
-                    spins += 1;
-                    std.atomic.spinLoopHint();
-                } else self.io.futexWaitUncancelable(u32, &self.generation.raw, g);
+                if (spin.keepSpinning()) continue;
+                _ = self.sleepers.fetchAdd(1, .seq_cst);
+                if (self.generation.load(.seq_cst) == g) self.io.futexWaitUncancelable(u32, &self.generation.raw, g);
+                _ = self.sleepers.fetchSub(1, .seq_cst);
             }
             if (self.stop.load(.acquire)) return;
             self.work();
-            if (self.remaining.fetchSub(1, .acq_rel) == 1)
+            if (self.remaining.fetchSub(1, .seq_cst) == 1 and self.caller_asleep.load(.seq_cst))
                 self.io.futexWake(u32, &self.remaining.raw, 1);
         }
     }
+
+    /// Time-bounded spinning: checks the clock every 64 pause hints.
+    const Spin = struct {
+        io: Io,
+        n: u32 = 0,
+        deadline: ?i96 = null,
+
+        fn keepSpinning(sp: *Spin) bool {
+            sp.n +%= 1;
+            if (sp.n & 63 != 0) {
+                std.atomic.spinLoopHint();
+                return true;
+            }
+            const now = Io.Clock.awake.now(sp.io).nanoseconds;
+            const dl = sp.deadline orelse blk: {
+                sp.deadline = now + spin_ns;
+                break :blk now + spin_ns;
+            };
+            if (now >= dl) return false;
+            std.atomic.spinLoopHint();
+            return true;
+        }
+    };
 };
 
 test "parallelFor covers the range exactly once" {
