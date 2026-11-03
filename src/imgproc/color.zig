@@ -6,6 +6,7 @@ const core = @import("../core/core.zig");
 const Image = core.Image;
 const Exec = core.Exec;
 const sat = core.sat;
+const vec = core.vec;
 
 pub const Error = core.Error || error{Unsupported};
 
@@ -162,7 +163,7 @@ inline fn convertRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d
                 d[x * 3 + 2 - inf.db] = rgb[0];
             } else @compileError("HSV needs u8 or f32");
         },
-        .ycrcb => for (0..width) |x| {
+        .ycrcb => for (ycrcbU8(T, inf, s, d, width)..width) |x| {
             const p = s + x * 3;
             const o = d + x * 3;
             if (T == u8) {
@@ -207,31 +208,47 @@ inline fn convertRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d
     }
 }
 
+/// 16 pixels at a time for u8; returns how many pixels it handled.
+inline fn ycrcbU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [*]T, width: usize) usize {
+    if (T != u8) return 0;
+    const I = @Vector(16, i32);
+    const half: I = @splat(1 << (shift - 1));
+    const delta: I = @splat(128 << shift);
+    var x: usize = 0;
+    while (x + 16 <= width) : (x += 16) {
+        const ch = vec.load(3, s + x * 3);
+        const b: I = ch[inf.sb];
+        const g: I = ch[1];
+        const r: I = ch[2 - inf.sb];
+        const y_ = (b * @as(I, @splat(B2Y)) + g * @as(I, @splat(G2Y)) + r * @as(I, @splat(R2Y)) + half) >> @splat(shift);
+        const cr = ((r - y_) * @as(I, @splat(11682)) + delta + half) >> @splat(shift);
+        const cb = ((b - y_) * @as(I, @splat(9241)) + delta + half) >> @splat(shift);
+        const lo: I = @splat(0);
+        const hi: I = @splat(255);
+        vec.store(3, .{
+            @intCast(@min(@max(y_, lo), hi)),
+            @intCast(@min(@max(cr, lo), hi)),
+            @intCast(@min(@max(cb, lo), hi)),
+        }, d + x * 3);
+    }
+    return x;
+}
+
 /// Channel reorder / alpha add or drop. SIMD for u8 via shuffles.
 inline fn reorderRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [*]T, width: usize) void {
     const swap = inf.sb != inf.db;
     const alpha: T = if (@typeInfo(T) == .float) 1.0 else std.math.maxInt(T);
     var x: usize = 0;
-    const N = 16;
     if (T == u8) {
-        // Build one shuffle that maps N source pixels to N destination pixels.
-        const mask = comptime blk: {
-            var m: [N * inf.dcn]i32 = undefined;
-            for (0..N) |i| for (0..inf.dcn) |c| {
-                m[i * inf.dcn + c] = if (c < 3)
-                    @intCast(i * inf.scn + (if (swap and c != 1) 2 - c else c))
-                else if (inf.scn == 4) @intCast(i * inf.scn + 3) else -1;
-            };
-            break :blk m;
-        };
-        const fill: @Vector(1, u8) = @splat(alpha);
-        while (x + N <= width) : (x += N) {
-            const v: @Vector(N * inf.scn, u8) = s[x * inf.scn ..][0 .. N * inf.scn].*;
-            const out: @Vector(N * inf.dcn, u8) = if (inf.dcn == 4 and inf.scn == 3)
-                @shuffle(u8, v, fill, mask)
-            else
-                @shuffle(u8, v, undefined, mask);
-            d[x * inf.dcn ..][0 .. N * inf.dcn].* = out;
+        const ones: vec.V16 = @splat(255);
+        while (x + 16 <= width) : (x += 16) {
+            const ch = vec.load(inf.scn, s + x * inf.scn);
+            var out: [inf.dcn]vec.V16 = undefined;
+            out[0] = if (swap) ch[2] else ch[0];
+            out[1] = ch[1];
+            out[2] = if (swap) ch[0] else ch[2];
+            if (inf.dcn == 4) out[3] = if (inf.scn == 4) ch[3] else ones;
+            vec.store(inf.dcn, out, d + x * inf.dcn);
         }
     }
     while (x < width) : (x += 1) {
@@ -255,24 +272,29 @@ inline fn grayRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
     const ri = 2 - inf.sb;
     var x: usize = 0;
     if (T == u8 or T == u16) {
-        const N = 16;
-        const W = u32;
-        const sel = struct {
-            fn mask(comptime c: usize) [N]i32 {
-                var m: [N]i32 = undefined;
-                for (0..N) |i| m[i] = @intCast(i * inf.scn + c);
-                return m;
+        const U = @Vector(16, u32);
+        if (T == u8) {
+            while (x + 16 <= width) : (x += 16) {
+                const ch = vec.load(inf.scn, s + x * inf.scn);
+                const b: U = ch[bi];
+                const g: U = ch[1];
+                const r: U = ch[ri];
+                const y_ = (b * @as(U, @splat(B2G)) + g * @as(U, @splat(G2G)) + r * @as(U, @splat(R2G)) + @as(U, @splat(1 << (gray_shift - 1)))) >> @splat(gray_shift);
+                d[x..][0..16].* = @as(vec.V16, @intCast(y_));
             }
-        };
-        const half: @Vector(N, W) = @splat(1 << (gray_shift - 1));
-        while (x + N <= width) : (x += N) {
-            const v: @Vector(N * inf.scn, T) = s[x * inf.scn ..][0 .. N * inf.scn].*;
-            const b: @Vector(N, W) = @shuffle(T, v, undefined, sel.mask(bi));
-            const g: @Vector(N, W) = @shuffle(T, v, undefined, sel.mask(1));
-            const r: @Vector(N, W) = @shuffle(T, v, undefined, sel.mask(ri));
-            const y_ = (b * @as(@Vector(N, W), @splat(B2G)) + g * @as(@Vector(N, W), @splat(G2G)) + r * @as(@Vector(N, W), @splat(R2G)) + half) >> @splat(gray_shift);
-            const out: @Vector(N, T) = @intCast(y_);
-            d[x..][0..N].* = out;
+        } else {
+            while (x + 16 <= width) : (x += 16) {
+                var b: U = undefined;
+                var g: U = undefined;
+                var r: U = undefined;
+                inline for (0..16) |i| {
+                    b[i] = s[(x + i) * inf.scn + bi];
+                    g[i] = s[(x + i) * inf.scn + 1];
+                    r[i] = s[(x + i) * inf.scn + ri];
+                }
+                const y_ = (b * @as(U, @splat(B2G)) + g * @as(U, @splat(G2G)) + r * @as(U, @splat(R2G)) + @as(U, @splat(1 << (gray_shift - 1)))) >> @splat(gray_shift);
+                d[x..][0..16].* = @as(@Vector(16, u16), @intCast(y_));
+            }
         }
         while (x < width) : (x += 1) {
             const p = s + x * inf.scn;

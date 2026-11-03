@@ -8,6 +8,12 @@ import os
 import sys
 
 import cv2
+
+# `--lib PATH` (passed by `zig build difftest/bench`) selects the library.
+if "--lib" in sys.argv:
+    _i = sys.argv.index("--lib")
+    os.environ["VISAR_LIB"] = sys.argv[_i + 1]
+    del sys.argv[_i:_i + 2]
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -146,8 +152,8 @@ def main():
         for code in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE]:
             run(f"rotate {code} {tag}", lambda: (vs.rotate(bgr, code), cv2.rotate(bgr, code)))
         m = cv2.getRotationMatrix2D((w / 2, h / 2), 30, 0.9)
-        run(f"warpAffine nearest {tag}", lambda: (vs.warp_affine(bgr, m, (w, h), 0), cv2.warpAffine(bgr, m, (w, h), flags=cv2.INTER_NEAREST)), 255, 1.0)
-        run(f"warpAffine linear {tag}", lambda: (vs.warp_affine(bgr, m, (w, h), 1), cv2.warpAffine(bgr, m, (w, h), flags=cv2.INTER_LINEAR)), 255, 1.0)
+        run(f"warpAffine nearest {tag}", lambda: (vs.warp_affine(bgr, m, (w, h), 0), cv2.warpAffine(bgr, m, (w, h), flags=cv2.INTER_NEAREST)))
+        run(f"warpAffine linear {tag}", lambda: (vs.warp_affine(bgr, m, (w, h), 1), cv2.warpAffine(bgr, m, (w, h), flags=cv2.INTER_LINEAR)))
 
         # --- histogram
         run(f"equalizeHist {tag}", lambda: (vs.equalize_hist(gray), cv2.equalizeHist(gray)))

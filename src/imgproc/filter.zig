@@ -15,16 +15,58 @@ pub const Error = core.Error || Allocator.Error || error{InvalidKernel};
 
 /// Describes one separable filter: sample types, kernel type, accumulator
 /// types and how a vertical sum becomes an output sample.
-fn Spec(comptime S_: type, comptime H_: type, comptime V_: type, comptime D_: type, comptime K_: type, comptime finish_: fn (V_, f64) D_) type {
+fn Spec(comptime S_: type, comptime H_: type, comptime V_: type, comptime D_: type, comptime K_: type, comptime F: type) type {
     return struct {
         const S = S_;
         const H = H_;
         const V = V_;
         const D = D_;
         const K = K_;
-        const finish = finish_;
+        fn finish(v: V, scale: f64) D {
+            const r: [1]D = F.apply(D, 1, @as(@Vector(1, V), @splat(v)), scale);
+            return r[0];
+        }
+        inline fn finishV(comptime N: usize, v: @Vector(N, V), scale: f64) @Vector(N, D) {
+            return F.apply(D, N, v, scale);
+        }
     };
 }
+
+/// Saturating vector conversion with OpenCV rounding (half to even).
+inline fn satV(comptime D: type, comptime N: usize, v: anytype) @Vector(N, D) {
+    const S = @typeInfo(@TypeOf(v)).vector.child;
+    if (S == D) return v;
+    if (@typeInfo(D) == .float) return cvtV(D, N, v);
+    const lo = std.math.minInt(D);
+    const hi = std.math.maxInt(D);
+    if (@typeInfo(S) == .float) {
+        const r = sat.rint(v);
+        const c = @min(@max(r, @as(@Vector(N, S), @splat(@floatFromInt(lo)))), @as(@Vector(N, S), @splat(@floatFromInt(hi))));
+        return @intFromFloat(c);
+    }
+    const W = if (@bitSizeOf(S) > @bitSizeOf(D)) S else i64;
+    const w: @Vector(N, W) = v;
+    return @intCast(@min(@max(w, @as(@Vector(N, W), @splat(lo))), @as(@Vector(N, W), @splat(hi))));
+}
+
+/// Finish kinds: plain saturating cast, scaled (f32 multiply), u8 fixed point.
+const FinishCast = struct {
+    inline fn apply(comptime D: type, comptime N: usize, v: anytype, _: f64) @Vector(N, D) {
+        return satV(D, N, v);
+    }
+};
+const FinishScaled = struct {
+    inline fn apply(comptime D: type, comptime N: usize, v: anytype, scale: f64) @Vector(N, D) {
+        const f: @Vector(N, f32) = cvtV(f32, N, v);
+        return satV(D, N, f * @as(@Vector(N, f32), @splat(@floatCast(scale))));
+    }
+};
+const FinishU8Fixed = struct {
+    inline fn apply(comptime D: type, comptime N: usize, v: anytype, _: f64) @Vector(N, D) {
+        const r = (v +| @as(@Vector(N, u32), @splat(1 << 15))) >> @splat(16);
+        return @intCast(@min(r, @as(@Vector(N, u32), @splat(255))));
+    }
+};
 
 /// Runs `kx` horizontally then `ky` vertically. `scale` is passed to the
 /// spec's finish function.
@@ -118,13 +160,87 @@ fn chunk(comptime P: type, s: Image(P.S), d: Image(P.D), kx: []const P.K, ky: []
     }
 }
 
+fn lanes(comptime T: type) comptime_int {
+    return @max(4, std.simd.suggestVectorLength(T) orelse 4);
+}
+
+/// Converts a vector of S to a vector of A (int widening, int->float, ...).
+inline fn cvtV(comptime A: type, comptime N: usize, v: anytype) @Vector(N, A) {
+    const S = @typeInfo(@TypeOf(v)).vector.child;
+    if (S == A) return v;
+    if (@typeInfo(A) == .float) {
+        return if (@typeInfo(S) == .float) @floatCast(v) else @floatFromInt(v);
+    }
+    return @intCast(v);
+}
+
+inline fn kconst(comptime A: type, k: anytype) A {
+    return if (@typeInfo(A) == .float) floatOf(A, k) else @intCast(k);
+}
+
+inline fn accV(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    const A = @typeInfo(@TypeOf(a)).vector.child;
+    return if (@typeInfo(A) == .int and @typeInfo(A).int.signedness == .unsigned) a +| b else a + b;
+}
+
+const Symmetry = enum { none, even, odd };
+
+fn symmetry(k: anytype) Symmetry {
+    const n = k.len;
+    var even = true;
+    var odd = true;
+    for (0..n / 2) |i| {
+        const a = k[i];
+        const b = k[n - 1 - i];
+        if (a != b) even = false;
+        if (@typeInfo(@TypeOf(a)) == .int and @typeInfo(@TypeOf(a)).int.signedness == .unsigned) {
+            odd = false;
+        } else if (a != -b) odd = false;
+    }
+    if (n % 2 == 1 and k[n / 2] != 0) odd = false;
+    return if (even) .even else if (odd) .odd else .none;
+}
+
 inline fn hpass(comptime P: type, pad: []const P.S, out: []P.H, k: []const P.K, cn: usize) void {
+    switch (symmetry(k)) {
+        inline else => |sym| hpassSym(P, sym, pad, out, k, cn),
+    }
+}
+
+/// Horizontal taps. Symmetric kernels fold mirrored taps first
+/// (k*(a+b) or k*(b-a)), halving the multiplies; with the kernel sums
+/// VISAR uses these never overflow, so results equal the unfolded sum.
+inline fn hpassSym(comptime P: type, comptime sym: Symmetry, pad: []const P.S, out: []P.H, k: []const P.K, cn: usize) void {
     const n = out.len;
-    for (out, 0..) |*o, x| o.* = mul(P.H, k[0], pad[x]);
-    for (k[1..], 1..) |kv, i| {
-        const off = i * cn;
-        const src = pad[off..][0..n];
-        for (out, src) |*o, v| o.* = acc(P.H, o.*, mul(P.H, kv, v));
+    const N = comptime lanes(P.H);
+    const VH = @Vector(N, P.H);
+    const r = k.len / 2;
+    var x: usize = 0;
+    while (x + N <= n) : (x += N) {
+        var a: VH = undefined;
+        if (sym == .none) {
+            const v0: @Vector(N, P.S) = pad[x..][0..N].*;
+            a = cvtV(P.H, N, v0) * @as(VH, @splat(kconst(P.H, k[0])));
+            for (k[1..], 1..) |kv, i| {
+                const v: @Vector(N, P.S) = pad[x + i * cn ..][0..N].*;
+                a = accV(a, cvtV(P.H, N, v) * @as(VH, @splat(kconst(P.H, kv))));
+            }
+        } else {
+            const c: @Vector(N, P.S) = pad[x + r * cn ..][0..N].*;
+            a = if (sym == .even) cvtV(P.H, N, c) * @as(VH, @splat(kconst(P.H, k[r]))) else @splat(0);
+            for (0..r) |i| {
+                const lv: @Vector(N, P.S) = pad[x + i * cn ..][0..N].*;
+                const rv: @Vector(N, P.S) = pad[x + (k.len - 1 - i) * cn ..][0..N].*;
+                const pair = if (sym == .even) cvtV(P.H, N, lv) + cvtV(P.H, N, rv) else cvtV(P.H, N, rv) - cvtV(P.H, N, lv);
+                a = accV(a, pair * @as(VH, @splat(kconst(P.H, if (sym == .even) k[i] else k[k.len - 1 - i]))));
+            }
+        }
+        out[x..][0..N].* = a;
+    }
+    while (x < n) : (x += 1) {
+        var a: P.H = mul(P.H, k[0], pad[x]);
+        for (k[1..], 1..) |kv, i| a = acc(P.H, a, mul(P.H, kv, pad[x + i * cn]));
+        out[x] = a;
     }
 }
 
@@ -135,11 +251,44 @@ inline fn acc(comptime A: type, a: A, b: A) A {
 }
 
 inline fn vpass(comptime P: type, rows: []const []const P.H, k: []const P.K, sums: []P.V, out: []P.D, scale: f64) void {
-    for (sums, rows[0]) |*a, v| a.* = mul(P.V, k[0], v);
-    for (rows[1..], k[1..]) |r, kv| {
-        for (sums, r) |*a, v| a.* = acc(P.V, a.*, mul(P.V, kv, v));
+    _ = sums;
+    switch (symmetry(k)) {
+        inline else => |sym| vpassSym(P, sym, rows, k, out, scale),
     }
-    for (out, sums) |*o, a| o.* = P.finish(a, scale);
+}
+
+inline fn vpassSym(comptime P: type, comptime sym: Symmetry, rows: []const []const P.H, k: []const P.K, out: []P.D, scale: f64) void {
+    const n = out.len;
+    const N = comptime lanes(P.V);
+    const VV = @Vector(N, P.V);
+    const r = k.len / 2;
+    var x: usize = 0;
+    while (x + N <= n) : (x += N) {
+        var a: VV = undefined;
+        if (sym == .none) {
+            const r0: @Vector(N, P.H) = rows[0][x..][0..N].*;
+            a = cvtV(P.V, N, r0) * @as(VV, @splat(kconst(P.V, k[0])));
+            for (rows[1..], k[1..]) |row, kv| {
+                const v: @Vector(N, P.H) = row[x..][0..N].*;
+                a = accV(a, cvtV(P.V, N, v) * @as(VV, @splat(kconst(P.V, kv))));
+            }
+        } else {
+            const c: @Vector(N, P.H) = rows[r][x..][0..N].*;
+            a = if (sym == .even) cvtV(P.V, N, c) * @as(VV, @splat(kconst(P.V, k[r]))) else @splat(0);
+            for (0..r) |i| {
+                const t: @Vector(N, P.H) = rows[i][x..][0..N].*;
+                const b: @Vector(N, P.H) = rows[k.len - 1 - i][x..][0..N].*;
+                const pair = if (sym == .even) accV(cvtV(P.V, N, t), cvtV(P.V, N, b)) else cvtV(P.V, N, b) - cvtV(P.V, N, t);
+                a = accV(a, pair * @as(VV, @splat(kconst(P.V, if (sym == .even) k[i] else k[k.len - 1 - i]))));
+            }
+        }
+        out[x..][0..N].* = P.finishV(N, a, scale);
+    }
+    while (x < n) : (x += 1) {
+        var a: P.V = mul(P.V, k[0], rows[0][x]);
+        for (rows[1..], k[1..]) |row, kv| a = acc(P.V, a, mul(P.V, kv, row[x]));
+        out[x] = P.finish(a, scale);
+    }
 }
 
 inline fn mul(comptime A: type, k: anytype, v: anytype) A {
@@ -225,26 +374,6 @@ fn gaussianKernelFixed(out: []u16, sigma: f64) void {
     for (out, k) |*o, v| o.* = @intCast(std.math.clamp(@as(i64, @intFromFloat(sat.rint(v * 256.0))), 0, 65535));
 }
 
-fn finishU8Fixed(v: u32, _: f64) u8 {
-    return @intCast(@min(255, (v +| (1 << 15)) >> 16));
-}
-
-fn finishCast(comptime D: type, comptime V: type) fn (V, f64) D {
-    return struct {
-        fn f(v: V, _: f64) D {
-            return sat.cast(D, v);
-        }
-    }.f;
-}
-
-fn finishScaled(comptime D: type, comptime V: type) fn (V, f64) D {
-    return struct {
-        fn f(v: V, scale: f64) D {
-            return sat.cast(D, floatOf(f64, v) * scale);
-        }
-    }.f;
-}
-
 pub const GaussianOptions = struct {
     /// Kernel width/height; 0 = derive from sigma.
     kw: u32 = 0,
@@ -267,7 +396,7 @@ pub fn gaussianBlur(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src),
         var ky: [127]u16 = undefined;
         gaussianKernelFixed(kx[0..kw], o.sigma_x);
         gaussianKernelFixed(ky[0..kh], sy_in);
-        const P = Spec(u8, u16, u32, u8, u16, finishU8Fixed);
+        const P = Spec(u8, u16, u32, u8, u16, FinishU8Fixed);
         return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, 1);
     } else {
         var kxd: [127]f64 = undefined;
@@ -278,7 +407,7 @@ pub fn gaussianBlur(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src),
         var ky: [127]f32 = undefined;
         for (kx[0..kw], kxd[0..kw]) |*a, b| a.* = @floatCast(b);
         for (ky[0..kh], kyd[0..kh]) |*a, b| a.* = @floatCast(b);
-        const P = Spec(T, f32, f32, T, f32, finishCast(T, f32));
+        const P = Spec(T, f32, f32, T, f32, FinishCast);
         return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, 1);
     }
 }
@@ -297,15 +426,116 @@ pub fn boxFilter(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), o:
     const T = @TypeOf(src).Elem;
     if (o.kw == 0 or o.kh == 0 or o.kw > 255 or o.kh > 255) return error.InvalidKernel;
     if (o.kw % 2 == 0 or o.kh % 2 == 0) return error.InvalidKernel; // anchor-centred only
-    const ones = [_]u8{1} ** 255;
+    const ones: [255]u8 = @splat(1);
     const scale: f64 = if (o.normalize) 1.0 / @as(f64, @floatFromInt(o.kw * o.kh)) else 1.0;
     if (@typeInfo(T) == .float) {
-        const fones = [_]f32{1} ** 255;
-        const P = Spec(T, f32, f32, T, f32, finishScaled(T, f32));
+        const fones: [255]f32 = @splat(1);
+        const P = Spec(T, f32, f32, T, f32, FinishScaled);
         return separable(P, exec, gpa, src, dst, fones[0..o.kw], fones[0..o.kh], o.border, 0, scale);
     }
-    const P = Spec(T, u32, u32, T, u8, finishScaled(T, u32));
+    if (T == u8 and o.border != .constant) return boxU8(exec, gpa, src, dst, o.kw, o.kh, o.border, scale);
+    const P = Spec(T, u32, u32, T, u8, FinishScaled);
     return separable(P, exec, gpa, src, dst, ones[0..o.kw], ones[0..o.kh], o.border, 0, scale);
+}
+
+/// 8-bit box filter: horizontal sums in u16, then a running column sum in
+/// u32 (add the entering row, subtract the leaving one), so the vertical
+/// cost does not grow with the kernel height.
+fn boxU8(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), kw: u32, kh: u32, border: Border, scale: f64) Error!void {
+    if (!src.sameShape(dst)) return error.SizeMismatch;
+    const Ctx = struct { s: Image(u8), d: Image(u8), kw: u32, kh: u32, border: Border, scale: f64, gpa: Allocator, err: *?Allocator.Error };
+    var err: ?Allocator.Error = null;
+    const grain = @max(16, (1 << 17) / @max(1, src.rowLen()));
+    exec.parallelFor(src.height, grain, Ctx{ .s = src, .d = dst, .kw = kw, .kh = kh, .border = border, .scale = scale, .gpa = gpa, .err = &err }, struct {
+        fn run(c: Ctx, y0: usize, y1: usize) void {
+            boxChunk(c.s, c.d, c.kw, c.kh, c.border, c.scale, c.gpa, y0, y1) catch |e| {
+                c.err.* = e;
+            };
+        }
+    }.run);
+    if (err) |e| return e;
+}
+
+fn boxChunk(s: Image(u8), d: Image(u8), kw: u32, kh: u32, border: Border, scale: f64, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
+    const cn: usize = s.channels;
+    const n = s.rowLen();
+    const rx: usize = kw / 2;
+    const ry: usize = kh / 2;
+    const pad = try gpa.alloc(u8, n + 2 * rx * cn);
+    defer gpa.free(pad);
+    const ring = try gpa.alloc(u16, @as(usize, kh) * n);
+    defer gpa.free(ring);
+    const col = try gpa.alloc(u32, n);
+    defer gpa.free(col);
+    const N = comptime lanes(u32);
+    const V32 = @Vector(N, u32);
+
+    const Row = struct {
+        /// Copies source row v (with border) into the padded buffer.
+        fn load(img: Image(u8), v: isize, b: Border, p: []u8, r: usize, ch: usize) void {
+            const sr = img.row(border_mod.map(v, img.height, b).?);
+            @memcpy(p[r * ch ..][0..sr.len], sr);
+            for (0..r) |i| {
+                const lx = border_mod.map(@as(isize, @intCast(i)) - @as(isize, @intCast(r)), img.width, b).?;
+                const rxx = border_mod.map(@intCast(img.width + i), img.width, b).?;
+                @memcpy(p[i * ch ..][0..ch], sr[lx * ch ..][0..ch]);
+                @memcpy(p[(r + img.width + i) * ch ..][0..ch], sr[rxx * ch ..][0..ch]);
+            }
+        }
+        inline fn hsumV(p: []const u8, x: usize, w: usize, ch: usize) V32 {
+            var a: @Vector(N, u16) = @as(@Vector(N, u8), p[x..][0..N].*);
+            for (1..w) |i| a += @as(@Vector(N, u8), p[x + i * ch ..][0..N].*);
+            return a;
+        }
+        inline fn hsum(p: []const u8, x: usize, w: usize, ch: usize) u16 {
+            var a: u16 = p[x];
+            for (1..w) |i| a += p[x + i * ch];
+            return a;
+        }
+    };
+
+    const v0: isize = @as(isize, @intCast(y0)) - @as(isize, @intCast(ry));
+    const khi: isize = @intCast(kh);
+    // Prime: col = sum of rows y0-ry .. y0+ry-1 (kh-1 rows).
+    @memset(col, 0);
+    for (0..kh - 1) |j| {
+        const v = v0 + @as(isize, @intCast(j));
+        Row.load(s, v, border, pad, rx, cn);
+        const slot: usize = @intCast(@mod(v - v0, khi));
+        const row = ring[slot * n ..][0..n];
+        for (0..n) |x| {
+            row[x] = Row.hsum(pad, x, kw, cn);
+            col[x] += row[x];
+        }
+    }
+    const sc: @Vector(N, f32) = @splat(@floatCast(scale));
+    const scs: f32 = @floatCast(scale);
+    for (y0..y1) |y| {
+        // One pass: horizontal sum of the entering row, emit, slide.
+        const vin: isize = @as(isize, @intCast(y + ry));
+        const vout: isize = @as(isize, @intCast(y)) - @as(isize, @intCast(ry));
+        Row.load(s, vin, border, pad, rx, cn);
+        const rin = ring[@as(usize, @intCast(@mod(vin - v0, khi))) * n ..][0..n];
+        const rout = ring[@as(usize, @intCast(@mod(vout - v0, khi))) * n ..][0..n];
+        const out = d.row(y);
+        var x: usize = 0;
+        while (x + N <= n) : (x += N) {
+            const h = Row.hsumV(pad, x, kw, cn);
+            const c = @as(V32, col[x..][0..N].*) + h;
+            out[x..][0..N].* = satV(u8, N, cvtV(f32, N, c) * sc);
+            // When kh == 1 the entering and leaving rows are the same row.
+            const old: V32 = if (kh == 1) h else @as(@Vector(N, u16), rout[x..][0..N].*);
+            col[x..][0..N].* = c - old;
+            rin[x..][0..N].* = @as(@Vector(N, u16), @intCast(h));
+        }
+        while (x < n) : (x += 1) {
+            const h = Row.hsum(pad, x, kw, cn);
+            const c = col[x] + h;
+            out[x] = sat.cast(u8, @as(f32, @floatFromInt(c)) * scs);
+            col[x] = c - (if (kh == 1) h else rout[x]);
+            rin[x] = h;
+        }
+    }
 }
 
 /// blur(): normalised box filter.
@@ -383,14 +613,28 @@ pub fn sobel(exec: Exec, gpa: Allocator, src: anytype, dst: anytype, o: SobelOpt
         var fy: [31]f32 = undefined;
         for (fx[0..kxs.len], kxs) |*a, b| a.* = @floatFromInt(b);
         for (fy[0..kys.len], kys) |*a, b| a.* = @floatFromInt(b);
-        const P = Spec(S, f32, f32, D, f32, finishScaled(D, f32));
+        const P = Spec(S, f32, f32, D, f32, FinishScaled);
         return separable(P, exec, gpa, src, dst, fx[0..kxs.len], fy[0..kys.len], o.border, 0, o.scale);
     }
+    var bound: i64 = 255;
+    var sx_: i64 = 0;
+    var sy_: i64 = 0;
+    for (kxs) |v| sx_ += @abs(v);
+    for (kys) |v| sy_ += @abs(v);
+    bound *= sx_ * sy_;
+    if (S == u8 and D == i16 and o.scale == 1 and bound <= std.math.maxInt(i16)) {
+        var kx16: [31]i16 = undefined;
+        var ky16: [31]i16 = undefined;
+        for (kx16[0..kxs.len], kxs) |*a, b| a.* = @intCast(b);
+        for (ky16[0..kys.len], kys) |*a, b| a.* = @intCast(b);
+        const P = Spec(S, i16, i16, D, i16, FinishCast);
+        return separable(P, exec, gpa, src, dst, kx16[0..kxs.len], ky16[0..kys.len], o.border, 0, 1);
+    }
     if (o.scale == 1) {
-        const P = Spec(S, i32, i32, D, i32, finishCast(D, i32));
+        const P = Spec(S, i32, i32, D, i32, FinishCast);
         return separable(P, exec, gpa, src, dst, kxs, kys, o.border, 0, 1);
     }
-    const P = Spec(S, i32, i32, D, i32, finishScaled(D, i32));
+    const P = Spec(S, i32, i32, D, i32, FinishScaled);
     return separable(P, exec, gpa, src, dst, kxs, kys, o.border, 0, o.scale);
 }
 
@@ -398,7 +642,7 @@ pub fn sobel(exec: Exec, gpa: Allocator, src: anytype, dst: anytype, o: SobelOpt
 pub fn sepFilter2D(exec: Exec, gpa: Allocator, src: anytype, dst: anytype, kx: []const f32, ky: []const f32, border: Border) Error!void {
     const S = @TypeOf(src).Elem;
     const D = @TypeOf(dst).Elem;
-    const P = Spec(S, f32, f32, D, f32, finishCast(D, f32));
+    const P = Spec(S, f32, f32, D, f32, FinishCast);
     return separable(P, exec, gpa, src, dst, kx, ky, border, 0, 1);
 }
 

@@ -8,10 +8,17 @@
 //! files decode to `.u16` images in native endianness; lower depths decode to
 //! `.u8` (sub-byte gray is scaled to 0-255, as libpng's expand does).
 //!
+//! Inflate is a built-in table-driven decoder that streams the IDAT payloads
+//! in place (no concatenation) through a small sliding window, so the
+//! filtered image never exists in memory as a whole. The zlib Adler-32 is
+//! not verified (chunk CRCs already cover the data).
+//!
 //! Encoding writes 8- or 16-bit images with 1 (gray), 2 (gray+alpha),
 //! 3 (RGB) or 4 (RGBA) channels, choosing a filter per row with libpng's
-//! minimum-sum-of-absolute-differences heuristic and deflating with
-//! `std.compress.flate`.
+//! minimum-sum-of-absolute-differences heuristic. `compression` selects:
+//! 0 = stored blocks (filter None), 1 = run-length + dynamic Huffman
+//! (zlib's Z_RLE, OpenCV's default; fast and, on photographic data, as small
+//! as level 9), 2-9 = `std.compress.flate` LZ77 at that level.
 
 const std = @import("std");
 const common = @import("common.zig");
@@ -1117,7 +1124,7 @@ inline fn subByte(src: []const u8, i: usize, d: u3) u8 {
 /// Encodes an 8- or 16-bit image with 1-4 channels as PNG. `opts.order`
 /// gives the channel order of 3/4-channel input (BGR input is swapped while
 /// writing; the image is not modified). `opts.compression` 0-9 selects the
-/// zlib level (0 = stored, no filtering). Caller frees the result.
+/// deflate strategy (see the file comment). Caller frees the result.
 pub fn encode(gpa: std.mem.Allocator, img: AnyImage, opts: common.EncodeOptions) EncodeError![]u8 {
     return switch (img) {
         .u8 => |im| encodeTyped(u8, gpa, im, opts),
@@ -1180,13 +1187,25 @@ fn encodeTyped(comptime T: type, gpa: std.mem.Allocator, img: Image(T), opts: co
             st.write(cur[pad..][0..rb]) catch return error.OutOfMemory;
         }
         st.finish() catch return error.OutOfMemory;
+    } else if (level == 1) {
+        var rd = try RleDeflate.init(gpa, w);
+        defer rd.deinit(gpa);
+        rd.begin() catch return error.OutOfMemory;
+        for (0..img.height) |y| {
+            loadRow(T, img.row(y), cur[pad..][0..rb], ch, swap);
+            const ft = chooseFilter(cur, prev, cand, stride, pad, rb, bpp);
+            const data = if (ft == 0) cur[pad..][0..rb] else cand[(ft - 1) * stride ..][0..rb];
+            rd.write(&.{ft}) catch return error.OutOfMemory;
+            rd.write(data) catch return error.OutOfMemory;
+            std.mem.swap([]u8, &prev, &cur);
+        }
+        rd.finish() catch return error.OutOfMemory;
     } else {
         const window = try gpa.alloc(u8, flate.max_window_len);
         defer gpa.free(window);
         const comp = try gpa.create(flate.Compress);
         defer gpa.destroy(comp);
         const lv: flate.Compress.Options = switch (level) {
-            1 => .level_1,
             2 => .level_2,
             3 => .level_3,
             4 => .level_4,
@@ -1324,6 +1343,370 @@ fn chooseFilter(cur: []u8, prev: []u8, cand: []u8, stride: usize, pad: usize, rb
         }
     }
     return best;
+}
+
+// ---------------------------------------------------------------------------
+// Fast deflate: run-length matches (distance 1) + per-block dynamic Huffman
+// codes, the scheme of zlib's Z_RLE strategy (OpenCV's PNG default). On
+// filtered image data it compresses about as well as level-6 LZ77 at a
+// fraction of the cost.
+
+const rle_block = 1 << 16; // input bytes per deflate block
+
+const RleDeflate = struct {
+    w: *std.Io.Writer,
+    adler: std.hash.Adler32 = .{},
+    buf: []u8,
+    n: usize = 0,
+    prev: ?u8 = null,
+    acc: u64 = 0,
+    nacc: u6 = 0,
+    /// Literal/length tokens of the current block: < 256 literal,
+    /// 0x8000 | len for a distance-1 match.
+    tokens: []u16,
+
+    fn init(gpa: std.mem.Allocator, w: *std.Io.Writer) !RleDeflate {
+        const buf = try gpa.alloc(u8, rle_block);
+        errdefer gpa.free(buf);
+        const tokens = try gpa.alloc(u16, rle_block);
+        return .{ .w = w, .buf = buf, .tokens = tokens };
+    }
+
+    fn deinit(d: *RleDeflate, gpa: std.mem.Allocator) void {
+        gpa.free(d.buf);
+        gpa.free(d.tokens);
+    }
+
+    fn begin(d: *RleDeflate) !void {
+        try d.w.writeAll(&.{ 0x78, 0x01 });
+    }
+
+    fn write(d: *RleDeflate, data: []const u8) !void {
+        d.adler.update(data);
+        var rest = data;
+        while (rest.len > 0) {
+            const k = @min(rest.len, d.buf.len - d.n);
+            @memcpy(d.buf[d.n..][0..k], rest[0..k]);
+            d.n += k;
+            rest = rest[k..];
+            if (d.n == d.buf.len) try d.block(false);
+        }
+    }
+
+    fn finish(d: *RleDeflate) !void {
+        try d.block(true);
+        // Byte-align, then the Adler-32 trailer.
+        if (d.nacc > 0) {
+            try d.ensure(8);
+            d.flushBits(true);
+        }
+        try d.w.writeInt(u32, d.adler.adler, .big);
+    }
+
+    fn ensure(d: *RleDeflate, n: usize) !void {
+        _ = try d.w.writableSliceGreedy(n);
+    }
+
+    /// Appends `count` (<= 32) bits; the caller has ensured capacity.
+    inline fn put(d: *RleDeflate, bits: u32, count: u6) void {
+        d.acc |= @as(u64, bits) << d.nacc;
+        d.nacc += count;
+        if (d.nacc >= 32) {
+            std.mem.writeInt(u32, d.w.buffer[d.w.end..][0..4], @truncate(d.acc), .little);
+            d.w.end += 4;
+            d.acc >>= 32;
+            d.nacc -= 32;
+        }
+    }
+
+    fn flushBits(d: *RleDeflate, all: bool) void {
+        while (d.nacc >= 8 or (all and d.nacc > 0)) {
+            d.w.buffer[d.w.end] = @truncate(d.acc);
+            d.w.end += 1;
+            d.acc >>= 8;
+            d.nacc -|= 8;
+        }
+    }
+
+    fn block(d: *RleDeflate, final: bool) !void {
+        const data = d.buf[0..d.n];
+        var lfreq: [286]u32 = @splat(0);
+        var dfreq: [30]u32 = @splat(0);
+        var nt: usize = 0;
+        var i: usize = 0;
+        var prev = d.prev;
+        while (i < data.len) {
+            const b = data[i];
+            if (prev != null and prev.? == b) {
+                var r: usize = 1;
+                const max = @min(258, data.len - i);
+                while (r < max and data[i + r] == b) r += 1;
+                if (r >= 3) {
+                    d.tokens[nt] = 0x8000 | @as(u16, @intCast(r));
+                    nt += 1;
+                    lfreq[257 + lenCode(r)] += 1;
+                    dfreq[0] += 1;
+                    i += r;
+                    continue;
+                }
+            }
+            d.tokens[nt] = b;
+            nt += 1;
+            lfreq[b] += 1;
+            prev = b;
+            i += 1;
+        }
+        if (data.len > 0) d.prev = data[data.len - 1];
+        d.n = 0;
+        lfreq[256] = 1;
+        // Keep both trees complete (>= 2 codes) so every inflater accepts them.
+        if (std.mem.count(u32, &lfreq, &.{0}) >= lfreq.len - 1) lfreq[if (lfreq[0] == 0) 0 else 1] += 1;
+        dfreq[1] = @max(dfreq[1], 1);
+        dfreq[0] = @max(dfreq[0], 1);
+
+        var llen: [286]u4 = undefined;
+        var dlen: [30]u4 = undefined;
+        huffmanLengths(&lfreq, &llen, 15);
+        huffmanLengths(&dfreq, &dlen, 15);
+        var lcode: [286]u16 = undefined;
+        var dcode: [30]u16 = undefined;
+        canonicalCodes(&llen, &lcode);
+        canonicalCodes(&dlen, &dcode);
+
+        // Header: code lengths run-length coded with symbols 16/17/18.
+        var hlit: usize = 286;
+        while (hlit > 257 and llen[hlit - 1] == 0) hlit -= 1;
+        var hdist: usize = 30;
+        while (hdist > 1 and dlen[hdist - 1] == 0) hdist -= 1;
+        var all: [316]u4 = undefined;
+        @memcpy(all[0..hlit], llen[0..hlit]);
+        @memcpy(all[hlit..][0..hdist], dlen[0..hdist]);
+        const lens = all[0 .. hlit + hdist];
+        var cl_syms: [316]u8 = undefined;
+        var cl_extra: [316]u8 = undefined;
+        var ncl: usize = 0;
+        var cfreq: [19]u32 = @splat(0);
+        var j: usize = 0;
+        while (j < lens.len) {
+            const v = lens[j];
+            var r: usize = 1;
+            while (j + r < lens.len and lens[j + r] == v) r += 1;
+            j += r;
+            if (v == 0) {
+                while (r >= 11) {
+                    const k = @min(r, 138);
+                    cl_syms[ncl] = 18;
+                    cl_extra[ncl] = @intCast(k - 11);
+                    ncl += 1;
+                    r -= k;
+                }
+                if (r >= 3) {
+                    cl_syms[ncl] = 17;
+                    cl_extra[ncl] = @intCast(r - 3);
+                    ncl += 1;
+                    r = 0;
+                }
+            } else {
+                cl_syms[ncl] = v;
+                ncl += 1;
+                r -= 1;
+                while (r >= 3) {
+                    const k = @min(r, 6);
+                    cl_syms[ncl] = 16;
+                    cl_extra[ncl] = @intCast(k - 3);
+                    ncl += 1;
+                    r -= k;
+                }
+            }
+            while (r > 0) : (r -= 1) {
+                cl_syms[ncl] = v;
+                ncl += 1;
+            }
+        }
+        for (cl_syms[0..ncl]) |c| cfreq[c] += 1;
+        if (std.mem.count(u32, &cfreq, &.{0}) >= cfreq.len - 1) cfreq[if (cfreq[0] == 0) 0 else 1] += 1;
+        var clen: [19]u4 = undefined;
+        huffmanLengths(&cfreq, &clen, 7);
+        var ccode: [19]u16 = undefined;
+        canonicalCodes(&clen, &ccode);
+        const order = [19]u8{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+        var hclen: usize = 19;
+        while (hclen > 4 and clen[order[hclen - 1]] == 0) hclen -= 1;
+
+        // Worst case: header plus 2 bytes per literal / 5 per match.
+        try d.ensure(1024 + nt * 5);
+        d.put(@as(u32, @intFromBool(final)) | (2 << 1), 3);
+        d.put(@intCast(hlit - 257), 5);
+        d.put(@intCast(hdist - 1), 5);
+        d.put(@intCast(hclen - 4), 4);
+        for (order[0..hclen]) |o| d.put(clen[o], 3);
+        for (cl_syms[0..ncl], cl_extra[0..ncl]) |c, e| {
+            d.put(ccode[c], clen[c]);
+            switch (c) {
+                16 => d.put(e, 2),
+                17 => d.put(e, 3),
+                18 => d.put(e, 7),
+                else => {},
+            }
+        }
+        const d0: u32 = dcode[0];
+        const d0n: u6 = dlen[0];
+        for (d.tokens[0..nt]) |t| {
+            if (t < 0x100) {
+                d.put(lcode[t], llen[t]);
+            } else {
+                const len: usize = t & 0x7fff;
+                const lc = lenCode(len);
+                const sym = 257 + lc;
+                d.put(lcode[sym], llen[sym]);
+                const xb: u6 = @intCast(len_extra[lc]);
+                if (xb > 0) d.put(@intCast(len - len_base[lc]), xb);
+                d.put(d0, d0n);
+            }
+        }
+        d.put(lcode[256], llen[256]);
+        d.flushBits(false);
+    }
+};
+
+/// Length (3..258) to length-code index 0..28.
+fn lenCode(len: usize) usize {
+    const table = comptime blk: {
+        var t: [259]u8 = undefined;
+        for (0..29) |c| {
+            const hi = if (c == 28) 258 else if (c == 27) 257 else len_base[c + 1] - 1;
+            for (len_base[c]..hi + 1) |l| t[l] = c;
+        }
+        t[258] = 28;
+        break :blk t;
+    };
+    return table[len];
+}
+
+/// Length-limited Huffman code lengths for `freq` (zero frequency -> length
+/// 0): Moffat-Katajainen minimum-redundancy lengths, then clamped to
+/// `limit` with the Kraft sum repaired (as miniz does).
+fn huffmanLengths(freq: []const u32, out: []u4, limit: u5) void {
+    var syms: [288]u16 = undefined;
+    var a: [288]u32 = undefined;
+    var n: usize = 0;
+    for (freq, 0..) |f, s| if (f > 0) {
+        syms[n] = @intCast(s);
+        n += 1;
+    };
+    @memset(out, 0);
+    if (n == 0) return;
+    const Ctx = struct {
+        f: []const u32,
+        fn lt(c: @This(), x: u16, y: u16) bool {
+            return c.f[x] < c.f[y] or (c.f[x] == c.f[y] and x < y);
+        }
+    };
+    std.sort.pdq(u16, syms[0..n], Ctx{ .f = freq }, Ctx.lt);
+    if (n == 1) {
+        out[syms[0]] = 1;
+        return;
+    }
+    for (0..n) |i| a[i] = freq[syms[i]];
+    // In-place minimum-redundancy code lengths (Moffat & Katajainen 1995).
+    {
+        var root: usize = 0;
+        var leaf: usize = 2;
+        a[0] += a[1];
+        for (1..n - 1) |next| {
+            if (leaf >= n or a[root] < a[leaf]) {
+                a[next] = a[root];
+                a[root] = @intCast(next);
+                root += 1;
+            } else {
+                a[next] = a[leaf];
+                leaf += 1;
+            }
+            if (leaf >= n or (root < next and a[root] < a[leaf])) {
+                a[next] += a[root];
+                a[root] = @intCast(next);
+                root += 1;
+            } else {
+                a[next] += a[leaf];
+                leaf += 1;
+            }
+        }
+        a[n - 2] = 0;
+        var next: usize = n - 2;
+        while (next > 0) {
+            next -= 1;
+            a[next] = a[a[next]] + 1;
+        }
+        var avbl: usize = 1;
+        var used: usize = 0;
+        var dpth: u32 = 0;
+        var r: isize = @intCast(n - 2);
+        var nx: isize = @intCast(n - 1);
+        while (avbl > 0) {
+            while (r >= 0 and a[@intCast(r)] == dpth) {
+                used += 1;
+                r -= 1;
+            }
+            while (avbl > used) {
+                a[@intCast(nx)] = dpth;
+                nx -= 1;
+                avbl -= 1;
+            }
+            avbl = 2 * used;
+            dpth += 1;
+            used = 0;
+        }
+    }
+    // a[i] is now the length of syms[i] (non-increasing). Count, clamp, fix.
+    var count: [33]u32 = @splat(0);
+    for (a[0..n]) |l| count[@min(l, 32)] += 1;
+    for (limit + 1..33) |l| {
+        count[limit] += count[l];
+        count[l] = 0;
+    }
+    var total: u64 = 0;
+    for (1..limit + 1) |l| total += @as(u64, count[l]) << @intCast(limit - l);
+    const one: u64 = @as(u64, 1) << limit;
+    while (total > one) {
+        count[limit] -= 1;
+        var l: usize = limit - 1;
+        while (l > 0) : (l -= 1) if (count[l] > 0) {
+            count[l] -= 1;
+            count[l + 1] += 2;
+            break;
+        };
+        total -= 1;
+    }
+    // Least frequent symbols get the longest codes.
+    var i: usize = 0;
+    var l: usize = limit;
+    while (l > 0) : (l -= 1) {
+        for (0..count[l]) |_| {
+            out[syms[i]] = @intCast(l);
+            i += 1;
+        }
+    }
+}
+
+/// Canonical codes, bit-reversed for LSB-first output.
+fn canonicalCodes(lens: []const u4, codes: []u16) void {
+    var count: [16]u16 = @splat(0);
+    for (lens) |l| count[l] += 1;
+    count[0] = 0;
+    var next: [16]u16 = undefined;
+    var c: u16 = 0;
+    for (1..16) |b| {
+        c = (c + count[b - 1]) << 1;
+        next[b] = c;
+    }
+    for (lens, 0..) |l, s| {
+        if (l == 0) {
+            codes[s] = 0;
+            continue;
+        }
+        codes[s] = @bitReverse(next[l]) >> @intCast(16 - @as(u5, l));
+        next[l] += 1;
+    }
 }
 
 /// Writes a zlib stream of stored (uncompressed) deflate blocks.
@@ -1660,5 +2043,54 @@ test "png inflate matches std.compress.flate output" {
                 }
             }
         }
+    }
+}
+
+test "png rle deflate output is valid zlib (checked with std inflate)" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(5);
+    const rnd = prng.random();
+    for ([_]usize{ 0, 1, 2, 3, 1000, 200_000 }) |n| {
+        const data = try gpa.alloc(u8, n);
+        defer gpa.free(data);
+        // Fibonacci-skewed byte frequencies force the 15-bit length limit;
+        // runs exercise the length codes.
+        var i: usize = 0;
+        while (i < n) {
+            var sym: u8 = 0;
+            var r = rnd.int(u32);
+            while (r & 1 == 1 and sym < 40) : (r >>= 1) sym += 1;
+            const run = if (rnd.uintLessThan(u8, 8) == 0) rnd.uintLessThan(usize, 600) + 1 else 1;
+            const k = @min(run, n - i);
+            @memset(data[i..][0..k], sym *% 7);
+            i += k;
+        }
+        var z: std.Io.Writer.Allocating = .init(gpa);
+        defer z.deinit();
+        var rd = try RleDeflate.init(gpa, &z.writer);
+        defer rd.deinit(gpa);
+        try rd.begin();
+        // Uneven writes cross block boundaries.
+        var off: usize = 0;
+        while (off < n) {
+            const k = @min(n - off, rnd.uintLessThan(usize, 90_000) + 1);
+            try rd.write(data[off..][0..k]);
+            off += k;
+        }
+        try rd.finish();
+
+        var in: std.Io.Reader = .fixed(z.written());
+        var dec: flate.Decompress = .init(&in, .zlib, &.{});
+        var back: std.Io.Writer.Allocating = .init(gpa);
+        defer back.deinit();
+        _ = try dec.reader.streamRemaining(&back.writer);
+        try testing.expectEqualSlices(u8, data, back.written());
+        const adler = std.hash.Adler32.hash(data);
+        try testing.expectEqual(adler, std.mem.readInt(u32, z.written()[z.written().len - 4 ..][0..4], .big));
+
+        const out = try gpa.alloc(u8, n);
+        defer gpa.free(out);
+        try inflate(z.written(), out);
+        try testing.expectEqualSlices(u8, data, out);
     }
 }

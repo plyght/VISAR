@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     b.step("run", "Run the visar CLI").dependOn(&run_cmd.step);
 
     // Unit tests.
@@ -53,14 +53,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(capi_tests).step);
 
     // Differential tests against OpenCV (needs python3 with numpy and cv2).
-    const difftest = b.addSystemCommand(&.{ "python3", "tests/py/test_vs_opencv.py" });
-    difftest.setEnvironmentVariable("VISAR_LIB", b.getInstallPath(.lib, "libvisar.so"));
-    difftest.step.dependOn(b.getInstallStep());
+    const difftest = b.addSystemCommand(&.{ "python3", "tests/py/test_vs_opencv.py", "--lib" });
+    difftest.addArtifactArg(shared);
     b.step("difftest", "Compare against OpenCV (python3 + cv2)").dependOn(&difftest.step);
 
-    const bench = b.addSystemCommand(&.{ "python3", "bench/bench_vs_opencv.py" });
-    bench.setEnvironmentVariable("VISAR_LIB", b.getInstallPath(.lib, "libvisar.so"));
-    bench.step.dependOn(b.getInstallStep());
-    if (b.args) |args| bench.addArgs(args);
+    const bench = b.addSystemCommand(&.{ "python3", "bench/bench_vs_opencv.py", "--lib" });
+    bench.addArtifactArg(shared);
+    bench.addPassthruArgs();
     b.step("bench", "Benchmark against OpenCV (use -Doptimize=ReleaseFast)").dependOn(&bench.step);
 }

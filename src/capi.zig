@@ -123,14 +123,19 @@ fn dispatch(c: *const CImage, ctx: anytype, comptime f: anytype) anyerror!void {
 
 // --------------------------------------------------------------- imgproc
 
-const color_codes = [_]?ip.ColorCode{
-    // Indexed by OpenCV's COLOR_* value.
-    .bgr2bgra, .bgra2bgr, .bgr2rgba, .rgba2bgr, .bgr2rgb, .bgra2rgba, .bgr2gray, .rgb2gray, .gray2bgr, .gray2bgra, .bgra2gray, .rgba2gray, // 0..11
-} ++ [_]?ip.ColorCode{null} ** 24 ++ [_]?ip.ColorCode{
-    .bgr2ycrcb, .rgb2ycrcb, .ycrcb2bgr, .ycrcb2rgb, // 36..39
-    .bgr2hsv, .rgb2hsv, // 40, 41
-} ++ [_]?ip.ColorCode{null} ** 12 ++ [_]?ip.ColorCode{
-    .hsv2bgr, .hsv2rgb, // 54, 55
+/// Indexed by OpenCV's COLOR_* value.
+const color_codes: [56]?ip.ColorCode = blk: {
+    var t: [56]?ip.ColorCode = @splat(null);
+    for ([_]ip.ColorCode{ .bgr2bgra, .bgra2bgr, .bgr2rgba, .rgba2bgr, .bgr2rgb, .bgra2rgba, .bgr2gray, .rgb2gray, .gray2bgr, .gray2bgra, .bgra2gray, .rgba2gray }, 0..) |c, i| t[i] = c;
+    t[36] = .bgr2ycrcb;
+    t[37] = .rgb2ycrcb;
+    t[38] = .ycrcb2bgr;
+    t[39] = .ycrcb2rgb;
+    t[40] = .bgr2hsv;
+    t[41] = .rgb2hsv;
+    t[54] = .hsv2bgr;
+    t[55] = .hsv2rgb;
+    break :blk t;
 };
 
 export fn visar_cvt_color(src: *const CImage, dst: *const CImage, code: c_int) c_int {

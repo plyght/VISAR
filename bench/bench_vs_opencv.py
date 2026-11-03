@@ -12,6 +12,12 @@ import sys
 import time
 
 import cv2
+
+# `--lib PATH` (passed by `zig build difftest/bench`) selects the library.
+if "--lib" in sys.argv:
+    _i = sys.argv.index("--lib")
+    os.environ["VISAR_LIB"] = sys.argv[_i + 1]
+    del sys.argv[_i:_i + 2]
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "py"))

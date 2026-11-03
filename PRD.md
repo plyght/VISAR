@@ -5,9 +5,9 @@ A complete, dependency-free replacement for OpenCV, written in Zig, that is fast
 
 | | |
 | --- | --- |
-| Status | Draft v0.1 |
+| Status | Draft v0.2 |
 | Owner | plyght |
-| Last updated | 2026-11-02 |
+| Last updated | 2026-11-03 |
 | Scope | Everything OpenCV + opencv_contrib does, plus imaging-pipeline, sensing, and training capabilities OpenCV does not have |
 
 ---
@@ -535,7 +535,7 @@ Milestones are ordered by dependency, not by date. Each one has exit criteria. W
 | Zig is pre-1.0. Language and std churn | Breakage, maintenance load | Pin a Zig version per VISAR release. CI against Zig master. The C ABI shields users. Keep std surface usage narrow |
 | GPU codegen from Zig is immature (SPIR-V/PTX/AMDGCN backends, no MSL/WGSL/DXIL targets) | GPU story delayed | Start with a restricted kernel subset and grow it. Build the SPIR-V → MSL/WGSL translators early. Upstream Zig fixes. Keep a fallback of committed precompiled SPIR-V (as in ditch) while the in-tree path matures |
 | Matching specialist libraries (libjpeg-turbo, dav1d, cuDNN-level conv, TensorRT) in pure Zig | Perf targets missed in some domains | Specialist-relative targets (§10.1) instead of blanket ones. Autotuning. Hand-specialized kernels allowed where measured |
-| Patent-encumbered codecs and algorithms (H.264, HEVC; check SURF status) | Distribution risk for some users | Compile-time flags per codec. Royalty-free codecs (AV1, VP9, JPEG XL) on by default. Encumbered ones documented. Final decision is an open question |
+| Patent-encumbered codecs and algorithms (H.264, HEVC; check SURF status) | Distribution risk for some users | Compile-time flags per codec. Royalty-free codecs (AV1, VP9, JPEG XL) on by default. Encumbered ones on by default and removable with `-Dencumbered-codecs=false` (§18) |
 | Video and image decoders are attack surface | Security incidents | Memory-safe Zig, safety checks on, continuous fuzzing, limits, security process (§10.4) |
 | NPU vendor stacks are proprietary and fragmented | Uneven NPU coverage | Plugin interface. GPU/CPU fallback per op. Start with the most open stacks |
 | Compatibility shim expectations ("it should behave exactly like OpenCV") | User frustration | Documented deviations. Shim conformance tests public. Quirk flags where needed |
@@ -556,7 +556,7 @@ Milestones are ordered by dependency, not by date. Each one has exit criteria. W
 
 ## 17. Reusing work from ditch
 
-`plyght/ditch` (same author, Zig 0.16) already proves out several pieces VISAR needs:
+`plyght/ditch` (same author, written in Zig) already proves out several pieces VISAR needs:
 
 - **Runtime-loaded Vulkan backend** with committed, checksummed SPIR-V and GLSL sources (`src/vulkan/`). This is the bootstrap path for VISAR's Vulkan backend before Zig → SPIR-V kernels mature.
 - **Metal backend** (`src/metal/`). VISAR should replace the SDK-dependent Objective-C shim with direct `objc_msgSend` calls to meet §6.
@@ -570,16 +570,18 @@ ditch has no autograd or training loop, so `visar.nn.train` (M6) is new work.
 
 ---
 
-## 18. Open questions
+## 18. Resolved decisions
 
-1. **License for VISAR.** Not decided yet. Needed before external contributions.
-2. **Encumbered codecs and algorithms:** ship H.264/HEVC encoders and decoders on by default, off by default, or as a separate package?
-3. **Shim fidelity:** which OpenCV quirks are worth reproducing (e.g. rounding in `resize` `INTER_LINEAR` for u8, `cvtColor` fixed-point paths)? Proposal: bit-exact mode for the top 50 most-used functions, contract mode elsewhere.
-4. **Governance:** BDFL, core team, or foundation? RFC process for API changes?
-5. **Native model format:** design it now, or adopt safetensors plus a graph sidecar?
-6. **Python package name** availability (`visar` on PyPI and npm), and whether the shim is `visar.cv2` or a separate `visar-cv2` distribution.
-7. **Minimum Zig version policy:** track the latest Zig release only, or support the last N?
-8. **Model zoo weights:** which pretrained weights can be redistributed or fetched, and under what terms per model?
+These were the open questions in the first draft. Each is now decided; any of them can be revisited through an RFC.
+
+1. **License:** AGPL-3.0-or-later, the same as ditch. The `LICENSE` file is in the repository root.
+2. **Patent-encumbered codecs and algorithms:** H.264, HEVC and HEIC are built by default, because users expect `imread`/`VideoCapture` to just work. Distributors who need a royalty-free build pass `-Dencumbered-codecs=false`, which removes them at compile time. Royalty-free codecs (AV1, VP8/9, JPEG XL, AVIF) are always on. SURF ships behind `-Dnonfree` (off by default) until its patent status is confirmed.
+3. **Shim fidelity:** bit-exact with OpenCV wherever practical, not just for a top-50 list. The differential suite (`zig build difftest`) is the registry. A case with a non-zero tolerance is a documented deviation and carries a comment explaining it. Platform-dependent OpenCV behaviour, where OpenCV's own SIMD and scalar paths disagree, is matched to OpenCV's SIMD path.
+4. **Governance:** plyght is BDFL, with module maintainers as modules mature. API changes to the C ABI, and new modules, go through short RFCs in `docs/rfcs/`.
+5. **Native model format:** a `.visar` model is a safetensors file. Its `__metadata__` carries the graph (JSON) plus quantization parameters, so it is a single file that can be memory-mapped and that existing safetensors tools can open. ONNX, GGUF and TFLite are import formats.
+6. **Package names:** `visar` is taken on PyPI, so the Python distribution is `visar-cv`; the import name is still `import visar`. The npm package is `visar`. The OpenCV shim lives inside the main package as `visar.cv2`.
+7. **Zig version policy:** each VISAR release pins one Zig release (currently 0.17.0, in `build.zig.zon`). CI also builds against Zig master as a non-blocking job, so migrations are known ahead of time.
+8. **Model zoo weights:** weights are never bundled. They are fetched at run time from their upstream sources, with checksums. The default zoo index lists only models whose weights' licenses allow the use; others are opt-in and their license is shown before download.
 
 ---
 
@@ -594,7 +596,7 @@ ditch has no autograd or training loop, so `visar.nn.train` (M6) is new work.
 | Acceleration | CPU SIMD and threads, Vulkan, Metal, CUDA, NPUs, WebGPU, and more |
 | Platforms | Desktop and server, mobile, WASM, bare-metal MCU |
 | Perf bar | ≥ 1.5× OpenCV median, no op worse than 0.95× |
-| License | Not decided |
+| License | AGPL-3.0-or-later, same as ditch |
 | Team and timeline | Not a constraint. The roadmap is dependency-ordered, not date-based |
 | DNN | Own ONNX runtime plus training |
 | Sensing scope | All: depth and point clouds, RAW/ISP, IMU fusion, exotic imaging |

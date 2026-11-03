@@ -37,7 +37,8 @@ pub const EncodeOptions = struct {
     /// 0-100 for lossy formats (JPEG); ignored elsewhere.
     quality: u8 = 95,
     /// 0-9 for PNG (zlib level); ignored elsewhere.
-    compression: u8 = 6,
+    /// 1 (OpenCV's default) is a fast run-length deflate.
+    compression: u8 = 1,
 };
 
 pub const DecodeError = error{
