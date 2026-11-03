@@ -15,6 +15,8 @@ pub const draw = @import("draw.zig");
 pub const contours = @import("contours.zig");
 pub const polygon = @import("polygon.zig");
 pub const shape = @import("shape.zig");
+pub const pyramid = @import("pyramid.zig");
+pub const corner = @import("corner.zig");
 
 pub const Border = border.Border;
 
@@ -54,6 +56,16 @@ pub const calcHist = hist.calcHist;
 pub const equalizeHist = hist.equalizeHist;
 pub const integral = hist.integral;
 
+pub const pyrDown = pyramid.pyrDown;
+pub const pyrUp = pyramid.pyrUp;
+pub const buildPyramid = pyramid.buildPyramid;
+pub const Pyramid = pyramid.Pyramid;
+
+pub const Point2f = corner.Point2f;
+pub const cornerMinEigenVal = corner.cornerMinEigenVal;
+pub const cornerHarris = corner.cornerHarris;
+pub const goodFeaturesToTrack = corner.goodFeaturesToTrack;
+
 pub const connectedComponentsWithStats = components.connectedComponentsWithStats;
 
 pub const Point = contours.Point;
@@ -67,7 +79,6 @@ pub const fillPoly = polygon.fillPoly;
 pub const fillConvexPoly = polygon.fillConvexPoly;
 pub const polylines = polygon.polylines;
 
-pub const Point2f = shape.Point2f;
 pub const Rect = shape.Rect;
 pub const RotatedRect = shape.RotatedRect;
 pub const Moments = shape.Moments;

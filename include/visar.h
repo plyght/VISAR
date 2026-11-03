@@ -52,6 +52,16 @@ int visar_resize(const visar_image *src, const visar_image *dst, int interpolati
 int visar_gaussian_blur(const visar_image *src, const visar_image *dst, int kw, int kh, double sigma_x, double sigma_y, int border);
 int visar_box_filter(const visar_image *src, const visar_image *dst, int kw, int kh, int normalize, int border);
 int visar_sobel(const visar_image *src, const visar_image *dst, int dx, int dy, int ksize, double scale, int border);
+/* pyramids: dst is ((w+1)/2, (h+1)/2) for pyr_down, (2w, 2h) for pyr_up (border must be 4, BORDER_DEFAULT) */
+int visar_pyr_down(const visar_image *src, const visar_image *dst, int border);
+int visar_pyr_up(const visar_image *src, const visar_image *dst, int border);
+/* corners: src VISAR_8U or VISAR_32F with one channel, dst VISAR_32F; ksize 1, 3, 5, 7 or -1 (Scharr) */
+int visar_corner_min_eigen_val(const visar_image *src, const visar_image *dst, int block_size, int ksize, int border);
+int visar_corner_harris(const visar_image *src, const visar_image *dst, int block_size, int ksize, double k, int border);
+/* writes up to cap (x, y) pairs to corners and the number found to *count; mask may be NULL */
+int visar_good_features_to_track(const visar_image *src, float *corners, size_t cap, size_t *count, int max_corners,
+                                 double quality_level, double min_distance, const visar_image *mask, int block_size,
+                                 int gradient_size, int use_harris, double k);
 int visar_threshold(const visar_image *src, const visar_image *dst, double thresh, double maxval, int type, double *used);
 int visar_morphology(const visar_image *src, const visar_image *dst, int op, int shape, int kw, int kh, int iterations);
 int visar_flip(const visar_image *src, const visar_image *dst, int code);
@@ -116,6 +126,11 @@ int visar_fit_ellipse(const void *pts, size_t n, int depth, visar_rotated_rect *
 int visar_approx_poly_dp(const void *pts, size_t n, int depth, double epsilon, int closed, void *out, size_t *count);
 int visar_point_polygon_test(const void *pts, size_t n, int depth, float x, float y, int measure_dist, double *out);
 int visar_match_shapes(const void *a, size_t na, int depth_a, const void *b, size_t nb, int depth_b, int method, double *out);
+/* video: pyramidal Lucas-Kanade on VISAR_8U images; points are n (x, y) float pairs; err may be NULL.
+   criteria_type: 1 COUNT | 2 EPS; flags: 4 USE_INITIAL_FLOW | 8 LK_GET_MIN_EIGENVALS */
+int visar_calc_optical_flow_pyr_lk(const visar_image *prev, const visar_image *next, const float *prev_pts, float *next_pts,
+                                   uint8_t *status, float *err, size_t n, int win_w, int win_h, int max_level,
+                                   int criteria_type, int max_count, double epsilon, int flags, double min_eig_threshold);
 
 /* core: op 0 add, 1 subtract, 2 absdiff, 3 multiply, 4 divide, 5 min, 6 max, 7 and, 8 or, 9 xor */
 int visar_arith(int op, const visar_image *a, const visar_image *b, const visar_image *dst);
