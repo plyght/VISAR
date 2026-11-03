@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 
 pub const V16 = @Vector(16, u8);
 
-const is_arm = builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .aarch64_be;
+pub const is_arm = builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .aarch64_be;
 
 /// LLVM's NEON structured-store intrinsics (aarch64, LLVM backend only).
 const neon = struct {

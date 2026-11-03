@@ -284,6 +284,34 @@ inline fn grayRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
                     d[x..][0..64].* = @as(vec.V64, @intCast(y_));
                 }
             }
+            if (vec.is_arm) {
+                // Coefficients split into bytes, c = 256 * hi + lo: both
+                // partial sums fit u16 and come from 8-bit multiply-
+                // accumulates (umull/umlal), and
+                //   (256 H + L + 2^14) >> 15 == (H + (L >> 8) + 64) >> 7
+                // exactly, i.e. usra then rshrn.
+                const W = @Vector(16, u16);
+                const hi = struct {
+                    fn f(c: u16) W {
+                        return @splat(c >> 8);
+                    }
+                }.f;
+                const lo = struct {
+                    fn f(c: u16) W {
+                        return @splat(c & 0xff);
+                    }
+                }.f;
+                while (x + 16 <= width) : (x += 16) {
+                    const ch = vec.load(inf.scn, s + x * inf.scn);
+                    const b: W = ch[bi];
+                    const g: W = ch[1];
+                    const r: W = ch[ri];
+                    const hs = b * hi(B2G) + g * hi(G2G) + r * hi(R2G);
+                    const ls = b * lo(B2G) + g * lo(G2G) + r * lo(R2G);
+                    const t = hs + (ls >> @splat(8));
+                    d[x..][0..16].* = @as(vec.V16, @truncate((t + @as(W, @splat(64))) >> @splat(7)));
+                }
+            }
             while (x + 16 <= width) : (x += 16) {
                 const ch = vec.load(inf.scn, s + x * inf.scn);
                 const b: U = ch[bi];
@@ -523,5 +551,33 @@ test "vector BGR -> HSV matches the scalar reference on every colour" {
         var want: [3]u8 = undefined;
         rgb2hsvU8(px[2], px[1], px[0], &want);
         try std.testing.expectEqualSlices(u8, &want, dst.slice()[p * 3 ..][0..3]);
+    }
+}
+
+test "vector BGR/BGRA -> gray matches the scalar formula" {
+    const gpa = std.testing.allocator;
+    inline for (.{ Code.bgr2gray, Code.rgb2gray, Code.bgra2gray }) |code| {
+        const scn: u16 = if (code == .bgra2gray) 4 else 3;
+        const n: u32 = 52 * 52 * 52;
+        var src = try Image(u8).init(gpa, n, 1, scn);
+        defer src.deinit(gpa);
+        var dst = try Image(u8).init(gpa, n, 1, 1);
+        defer dst.deinit(gpa);
+        var i: usize = 0;
+        for (0..52) |b| for (0..52) |g| for (0..52) |r| {
+            const px = src.slice()[i * scn ..];
+            px[0] = @intCast(@min(255, b * 5));
+            px[1] = @intCast(@min(255, g * 5));
+            px[2] = @intCast(@min(255, r * 5));
+            if (scn == 4) px[3] = 7;
+            i += 1;
+        };
+        try cvtColor(.serial, src, dst, code);
+        const sb: usize = if (code == .rgb2gray) 2 else 0;
+        for (0..n) |p| {
+            const px = src.slice()[p * scn ..];
+            const want = (@as(u32, px[sb]) * B2G + @as(u32, px[1]) * G2G + @as(u32, px[2 - sb]) * R2G + (1 << 14)) >> 15;
+            try std.testing.expectEqual(@as(u8, @intCast(want)), dst.slice()[p]);
+        }
     }
 }
