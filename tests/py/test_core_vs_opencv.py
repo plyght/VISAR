@@ -155,6 +155,22 @@ def main():
         run(f"warpAffine nearest {tag}", lambda: (vs.warp_affine(bgr, m, (w, h), 0), cv2.warpAffine(bgr, m, (w, h), flags=cv2.INTER_NEAREST)))
         run(f"warpAffine linear {tag}", lambda: (vs.warp_affine(bgr, m, (w, h), 1), cv2.warpAffine(bgr, m, (w, h), flags=cv2.INTER_LINEAR)))
 
+        # --- connected components (labels, stats and centroids)
+        for conn in (4, 8):
+            for nm, m in [("random", (rng.random((h, w)) > 0.6).astype(np.uint8) * 255),
+                          ("threshold", cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)[1])]:
+                def cc():
+                    n, lab, st, ce = vs.connected_components_with_stats(m, conn)
+                    rn, rlab, rst, rce = cv2.connectedComponentsWithStats(m, connectivity=conn)
+                    if n != rn:
+                        return np.array([n]), np.array([rn])
+                    return (np.concatenate([lab.ravel(), st.ravel()]).astype(np.float64),
+                            np.concatenate([rlab.ravel(), rst.ravel()]).astype(np.float64))
+                run(f"connectedComponents {nm} conn{conn} {tag}", cc)
+                run(f"connectedComponents centroids {nm} conn{conn} {tag}",
+                    lambda: (np.nan_to_num(vs.connected_components_with_stats(m, conn)[3], nan=-7),
+                             np.nan_to_num(cv2.connectedComponentsWithStats(m, connectivity=conn)[3], nan=-7)), 1e-9)
+
         # --- histogram
         run(f"equalizeHist {tag}", lambda: (vs.equalize_hist(gray), cv2.equalizeHist(gray)))
 

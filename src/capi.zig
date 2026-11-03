@@ -296,6 +296,28 @@ export fn visar_convert_to(src: *const CImage, dst: *const CImage, alpha: f64, b
     }.f));
 }
 
+/// connectedComponentsWithStats. `labels` is i32 (VISAR_32S). Writes up to
+/// `max` rows of stats (left, top, width, height, area as int32) and
+/// centroids (cx, cy as double); returns the label count in `count`.
+export fn visar_connected_components(src: *const CImage, labels: *const CImage, connectivity: c_int, stats: ?[*]i32, centroids: ?[*]f64, max: usize, count: *usize) c_int {
+    const s = typed(u8, src) catch |e| return fail(e);
+    const l = typed(i32, labels) catch |e| return fail(e);
+    const conn: ip.components.Connectivity = if (connectivity == 4) .four else .eight;
+    var r = ip.connectedComponentsWithStats(gpa, s, l, conn) catch |e| return fail(e);
+    defer r.deinit(gpa);
+    count.* = r.count;
+    for (r.stats[0..@min(max, r.stats.len)], 0..) |st, i| {
+        // An empty label (only the background, when every pixel is set)
+        // is reported as OpenCV does: left -1, top INT_MAX.
+        if (stats) |o| o[i * 5 ..][0..5].* = if (st.area == 0)
+            .{ -1, std.math.maxInt(i32), 0, 0, 0 }
+        else
+            .{ @intCast(st.left), @intCast(st.top), @intCast(st.width), @intCast(st.height), @intCast(st.area) };
+        if (centroids) |c| c[i * 2 ..][0..2].* = .{ st.cx, st.cy };
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------- codecs
 
 /// Decodes an image file held in memory. `mode` is OpenCV's IMREAD flag

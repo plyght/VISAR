@@ -58,6 +58,8 @@ int visar_flip(const visar_image *src, const visar_image *dst, int code);
 int visar_rotate(const visar_image *src, const visar_image *dst, int code);
 int visar_warp_affine(const visar_image *src, const visar_image *dst, const double m[6], int interpolation, int border, double value);
 int visar_equalize_hist(const visar_image *src, const visar_image *dst);
+/* labels: VISAR_32S image; stats: max rows of left, top, width, height, area; centroids: max rows of cx, cy */
+int visar_connected_components(const visar_image *src, const visar_image *labels, int connectivity, int32_t *stats, double *centroids, size_t max, size_t *count);
 
 /* core: op 0 add, 1 subtract, 2 absdiff, 3 multiply, 4 divide, 5 min, 6 max, 7 and, 8 or, 9 xor */
 int visar_arith(int op, const visar_image *a, const visar_image *b, const visar_image *dst);
