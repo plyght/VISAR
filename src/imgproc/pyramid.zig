@@ -180,6 +180,33 @@ fn hdown(comptime T: type, comptime A: type, comptime cn: usize, p: []const A, o
     };
     const step = (N / cn) * cn;
     var x: usize = 0;
+    if (cn == 1) {
+        // Only the even outputs: with e/o the even/odd samples (a plain
+        // wide load plus stride shuffle, i.e. ld2 on NEON),
+        // out[x] = e[x] + 4 o[x] + 6 e[x+1] + 4 o[x+1] + e[x+2].
+        const V = @Vector(N, A);
+        const ev = comptime blk: {
+            var m: [N]i32 = undefined;
+            for (0..N) |i| m[i] = @intCast(2 * i);
+            break :blk m;
+        };
+        const od = comptime blk: {
+            var m: [N]i32 = undefined;
+            for (0..N) |i| m[i] = @intCast(2 * i + 1);
+            break :blk m;
+        };
+        while (x + N <= out.len) : (x += N) {
+            const w0: @Vector(2 * N, A) = p[2 * x ..][0 .. 2 * N].*;
+            const w1: @Vector(2 * N, A) = p[2 * x + 2 ..][0 .. 2 * N].*;
+            const w2: @Vector(2 * N, A) = p[2 * x + 4 ..][0 .. 2 * N].*;
+            const e0: V = @shuffle(A, w0, undefined, ev);
+            const o0: V = @shuffle(A, w0, undefined, od);
+            const e1: V = @shuffle(A, w1, undefined, ev);
+            const o1: V = @shuffle(A, w1, undefined, od);
+            const e2: V = @shuffle(A, w2, undefined, ev);
+            out[x..][0..N].* = finishV(T, 8, N, (e0 + e2) + (o0 + o1) * splat(A, N, 4) + e1 * splat(A, N, 6));
+        }
+    }
     while (x + N <= out.len) : (x += step) {
         const lo = h5(A, N, p, 2 * x, cn);
         const hi = h5(A, N, p, 2 * x + N, cn);
