@@ -8,6 +8,7 @@ pub const pool = @import("pool.zig");
 pub const sat = @import("saturate.zig");
 pub const arith = @import("arith.zig");
 pub const vec = @import("vec.zig");
+pub const fft = @import("fft.zig");
 pub const simd = @import("simd.zig");
 
 pub const Image = image.Image;
