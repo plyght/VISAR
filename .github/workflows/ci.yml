@@ -23,6 +23,10 @@ jobs:
       # bugs show up that Debug (self-hosted backend on Linux) never sees.
       - run: zig build test -Doptimize=ReleaseSafe --summary all
       - run: zig build -Doptimize=ReleaseSafe
+      # Windows Debug goes through LLVM with the Windows calling convention;
+      # pin AVX2 so the x86 SIMD paths are compiled whatever the runner's CPU.
+      - if: runner.os == 'Windows'
+        run: zig build test -Dcpu=x86_64_v3 --summary all
 
   cpu-levels:
     runs-on: ubuntu-latest

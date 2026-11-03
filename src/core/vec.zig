@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const simd = @import("simd.zig");
 
 pub const V16 = @Vector(16, u8);
 
@@ -190,7 +191,7 @@ pub inline fn store(comptime cn: usize, ch: [cn]V16, p: [*]u8) void {
     }
     // AArch64: NEON structured stores. LLVM does not reliably match the
     // interleaving shuffle below to st3/st4, so call the intrinsics.
-    if (comptime is_arm and builtin.zig_backend == .stage2_llvm) {
+    if (comptime is_arm and simd.llvm_intrinsics) {
         switch (cn) {
             2 => return neon.st2(ch[0], ch[1], p),
             3 => return neon.st3(ch[0], ch[1], ch[2], p),

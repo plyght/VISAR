@@ -18,7 +18,7 @@ pub const has_vbmi = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHa
 
 /// AArch64 (LLVM backend): NEON tbl over four registers is the same 64-byte
 /// table lookup, 16 bytes at a time.
-const arm_tbl = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .aarch64;
+const arm_tbl = core.simd.llvm_intrinsics and builtin.cpu.arch == .aarch64;
 
 /// x86 with AVX2 but no VBMI (LLVM backend): the 64-byte lookup is four
 /// in-lane vpshufb, one per 16-byte chunk, with per-chunk indices that are
@@ -33,8 +33,22 @@ const idx_len = if (avx2_shuf) 128 else 64;
 
 const avx2 = struct {
     const B = @Vector(32, u8);
-    extern fn @"llvm.x86.avx2.pshuf.b"(B, B) B;
-    extern fn @"llvm.x86.avx2.pmadd.wd"(@Vector(16, i16), @Vector(16, i16)) @Vector(8, i32);
+    // Inline asm rather than LLVM intrinsics: independent of the calling
+    // convention (Windows passes vectors by reference to extern functions).
+    inline fn pshufb(t: B, i: B) B {
+        return asm ("vpshufb %[i], %[t], %[r]"
+            : [r] "=x" (-> B),
+            : [t] "x" (t),
+              [i] "x" (i),
+        );
+    }
+    inline fn pmaddwd(a: @Vector(16, i16), b: @Vector(16, i16)) @Vector(8, i32) {
+        return asm ("vpmaddwd %[b], %[a], %[r]"
+            : [r] "=x" (-> @Vector(8, i32)),
+            : [a] "x" (a),
+              [b] "x" (b),
+        );
+    }
 };
 
 const neon = struct {
@@ -214,12 +228,12 @@ inline fn hrowGroup(comptime W: usize, s: []const u8, out: []i16, g: Group) void
         inline for (0..W / 16) |k| {
             const c: @Vector(16, u8) = w[k * 16 ..][0..16].*;
             const both = @shuffle(u8, c, undefined, dup16);
-            bytes |= avx2.@"llvm.x86.avx2.pshuf.b"(both, g.idx[k * 32 ..][0..32].*);
+            bytes |= avx2.pshufb(both, g.idx[k * 32 ..][0..32].*);
         }
         const a: @Vector(32, i16) = @intCast(bytes);
         const wv: @Vector(32, i16) = g.w;
-        const lo = avx2.@"llvm.x86.avx2.pmadd.wd"(@shuffle(i16, a, undefined, lo16), @shuffle(i16, wv, undefined, lo16));
-        const hi = avx2.@"llvm.x86.avx2.pmadd.wd"(@shuffle(i16, a, undefined, hi16), @shuffle(i16, wv, undefined, hi16));
+        const lo = avx2.pmaddwd(@shuffle(i16, a, undefined, lo16), @shuffle(i16, wv, undefined, lo16));
+        const hi = avx2.pmaddwd(@shuffle(i16, a, undefined, hi16), @shuffle(i16, wv, undefined, hi16));
         const acc = @shuffle(i32, lo, hi, [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, -1, -2, -3, -4, -5, -6, -7, -8 }) >> @splat(4);
         out[0..16].* = @as(@Vector(16, i16), @truncate(acc));
         return;

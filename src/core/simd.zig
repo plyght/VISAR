@@ -28,13 +28,29 @@ pub inline fn splat(comptime V: type, x: @typeInfo(V).vector.child) V {
 }
 
 /// Round half to even for f32 values already clamped to |x| < 2^22.
-const arm_cvt = @import("builtin").zig_backend == .stage2_llvm and @import("builtin").cpu.arch == .aarch64;
+/// LLVM intrinsics are declared as extern functions, which Zig lowers with
+/// the C calling convention; Windows passes vectors by reference there, so
+/// the declarations would not match the intrinsics. Not used on Windows.
+pub const llvm_intrinsics = @import("builtin").zig_backend == .stage2_llvm and @import("builtin").os.tag != .windows;
+const arm_cvt = llvm_intrinsics and @import("builtin").cpu.arch == .aarch64;
 extern fn @"llvm.aarch64.neon.fcvtns.v4i32.v4f32"(@Vector(4, f32)) @Vector(4, i32);
 const x86_llvm = @import("builtin").zig_backend == .stage2_llvm and @import("builtin").cpu.arch == .x86_64;
 const x86_avx_cvt = x86_llvm and std.Target.x86.featureSetHas(@import("builtin").cpu.features, .avx);
 const x86_sse_cvt = x86_llvm and std.Target.x86.featureSetHas(@import("builtin").cpu.features, .sse2);
-extern fn @"llvm.x86.avx.cvt.ps2dq.256"(@Vector(8, f32)) @Vector(8, i32);
-extern fn @"llvm.x86.sse2.cvtps2dq"(@Vector(4, f32)) @Vector(4, i32);
+// x86 conversions through inline asm (independent of the calling
+// convention, so Windows gets them too).
+inline fn cvtps2dq256(v: @Vector(8, f32)) @Vector(8, i32) {
+    return asm ("vcvtps2dq %[v], %[r]"
+        : [r] "=x" (-> @Vector(8, i32)),
+        : [v] "x" (v),
+    );
+}
+inline fn cvtps2dq128(v: @Vector(4, f32)) @Vector(4, i32) {
+    return asm ("cvtps2dq %[v], %[r]"
+        : [r] "=x" (-> @Vector(4, i32)),
+        : [v] "x" (v),
+    );
+}
 extern fn @"llvm.aarch64.neon.sqxtun.v4i16"(@Vector(4, i32)) @Vector(4, u16);
 extern fn @"llvm.aarch64.neon.uqxtn.v8i8"(@Vector(8, u16)) @Vector(8, u8);
 
@@ -56,13 +72,13 @@ pub inline fn roundI32(comptime n: comptime_int, v: @Vector(n, f32)) @Vector(n, 
     if (comptime x86_avx_cvt and n % 8 == 0) {
         const fv: [n]f32 = v;
         var r: [n]i32 = undefined;
-        inline for (0..n / 8) |k| r[k * 8 ..][0..8].* = @"llvm.x86.avx.cvt.ps2dq.256"(fv[k * 8 ..][0..8].*);
+        inline for (0..n / 8) |k| r[k * 8 ..][0..8].* = cvtps2dq256(fv[k * 8 ..][0..8].*);
         return r;
     }
     if (comptime x86_sse_cvt and n % 4 == 0) {
         const fv: [n]f32 = v;
         var r: [n]i32 = undefined;
-        inline for (0..n / 4) |k| r[k * 4 ..][0..4].* = @"llvm.x86.sse2.cvtps2dq"(fv[k * 4 ..][0..4].*);
+        inline for (0..n / 4) |k| r[k * 4 ..][0..4].* = cvtps2dq128(fv[k * 4 ..][0..4].*);
         return r;
     }
     return @intFromFloat(rintSmall(v));
