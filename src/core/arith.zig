@@ -46,7 +46,7 @@ inline fn binRow(comptime T: type, comptime op: BinOp, a: []const T, b: []const 
             d[i..][0..N].* = switch (op) {
                 .add => if (is_int) x +| y else x + y,
                 .sub => if (is_int) x -| y else x - y,
-                .absdiff => if (is_int) @max(x, y) - @min(x, y) else @abs(x - y),
+                .absdiff => if (is_int) @max(x, y) -% @min(x, y) else @abs(x - y),
                 .min => @min(x, y),
                 .max => @max(x, y),
                 .bit_and => if (is_int) x & y else unreachable,
@@ -62,7 +62,7 @@ inline fn binRow(comptime T: type, comptime op: BinOp, a: []const T, b: []const 
         d[i] = switch (op) {
             .add => if (is_int) x +| y else x + y,
             .sub => if (is_int) x -| y else x - y,
-            .absdiff => if (is_int) @max(x, y) - @min(x, y) else @abs(x - y),
+            .absdiff => if (is_int) @max(x, y) -% @min(x, y) else @abs(x - y),
             .min => @min(x, y),
             .max => @max(x, y),
             .bit_and => if (is_int) x & y else unreachable,
