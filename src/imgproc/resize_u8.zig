@@ -42,6 +42,7 @@ const neon = struct {
     extern fn @"llvm.aarch64.neon.tbl4.v16i8"(V, V, V, V, V) V;
     extern fn @"llvm.aarch64.neon.tbl2.v16i8"(V, V, V) V;
     extern fn @"llvm.aarch64.neon.tbl1.v16i8"(V, V) V;
+    extern fn @"llvm.aarch64.neon.uaddlp.v8i16.v16i8"(V) @Vector(8, u16);
     inline fn tbl(comptime k: usize, t: [k]V, idx: V) V {
         return switch (k) {
             1 => @"llvm.aarch64.neon.tbl1.v16i8"(t[0], idx),
@@ -280,6 +281,26 @@ fn halfRow(comptime cn: usize, a: []const u8, b: []const u8, d: []u8) void {
     const VO = @Vector(16 * cn, u16);
     const w = d.len / cn;
     var x: usize = 0;
+    if (comptime planar) {
+        // NEON: deinterleave (ldN), add neighbouring pixels of a channel
+        // pairwise into u16 (uaddlp), round-shift-narrow, interleave (stN).
+        const H = @Vector(8, u16);
+        while (x + 16 <= w) : (x += 16) {
+            const so = 2 * x * cn;
+            var half8: [2][cn]@Vector(8, u8) = undefined;
+            inline for (0..2) |h| {
+                const ca = vec.load(cn, a.ptr + so + h * 16 * cn);
+                const cb = vec.load(cn, b.ptr + so + h * 16 * cn);
+                inline for (0..cn) |ch| {
+                    const sum: H = neon.@"llvm.aarch64.neon.uaddlp.v8i16.v16i8"(ca[ch]) + neon.@"llvm.aarch64.neon.uaddlp.v8i16.v16i8"(cb[ch]);
+                    half8[h][ch] = @truncate((sum + @as(H, @splat(2))) >> @splat(2));
+                }
+            }
+            var out: [cn]vec.V16 = undefined;
+            inline for (0..cn) |ch| out[ch] = std.simd.join(half8[0][ch], half8[1][ch]);
+            vec.store(cn, out, d.ptr + x * cn);
+        }
+    }
     while (x + 16 <= w) : (x += 16) {
         const so = 2 * x * cn;
         const va: @Vector(L, u8) = a[so..][0..L].*;
