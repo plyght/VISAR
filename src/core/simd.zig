@@ -38,6 +38,18 @@ pub inline fn rintSmall(v: anytype) @TypeOf(v) {
     return (v + m) - m;
 }
 
+/// Rounds f32 lanes (|v| < 2^22) half to even and converts to i32: one
+/// fcvtns per 4 lanes on aarch64, the magic-number rint elsewhere.
+pub inline fn roundI32(comptime n: comptime_int, v: @Vector(n, f32)) @Vector(n, i32) {
+    if (comptime arm_cvt and n % 4 == 0) {
+        const fv: [n]f32 = v;
+        var r: [n]i32 = undefined;
+        inline for (0..n / 4) |k| r[k * 4 ..][0..4].* = @"llvm.aarch64.neon.fcvtns.v4i32.v4f32"(fv[k * 4 ..][0..4].*);
+        return r;
+    }
+    return @intFromFloat(rintSmall(v));
+}
+
 /// Converts f32 lanes to the integer type `D` with OpenCV's saturate_cast
 /// semantics (round half to even, clamp, NaN -> 0). `D` must be at most
 /// 16 bits wide so the clamped range is exactly representable.

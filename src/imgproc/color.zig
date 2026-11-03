@@ -344,9 +344,9 @@ inline fn hsvDivs(comptime N: usize, v: @Vector(N, i32), diff: @Vector(N, i32)) 
     const recip = @as(F, @splat(1.0)) / prod;
     const fd: F = @floatFromInt(diff);
     const fv: F = @floatFromInt(v);
-    const sd = sat.rint(fd * @as(F, @splat(255 << hsv_shift)) * recip);
-    const hd = sat.rint(fv * @as(F, @splat((180 << hsv_shift) / 6)) * recip);
-    return .{ .sdiv = @intFromFloat(sd), .hdiv = @intFromFloat(hd) };
+    const sd = fd * @as(F, @splat(255 << hsv_shift)) * recip;
+    const hd = fv * @as(F, @splat((180 << hsv_shift) / 6)) * recip;
+    return .{ .sdiv = core.simd.roundI32(N, sd), .hdiv = core.simd.roundI32(N, hd) };
 }
 
 test "single-reciprocal HSV divisions match the tables" {
@@ -370,23 +370,28 @@ test "single-reciprocal HSV divisions match the tables" {
 
 /// OpenCV's RGB2HSV_b on N-lane vectors (N = 16 or 64).
 inline fn hsvBlock(comptime N: usize, b8: @Vector(N, u8), g8: @Vector(N, u8), r8: @Vector(N, u8)) [3]@Vector(N, u8) {
+    // Comparisons, selects and the hue numerator fit i16 (|h| <= 4 * 255 +
+    // 255); only the two products need 32 bits.
+    const W = @Vector(N, i16);
     const I = @Vector(N, i32);
     const half: I = @splat(1 << (hsv_shift - 1));
-    const b: I = b8;
-    const g: I = g8;
-    const r: I = r8;
+    const b: W = b8;
+    const g: W = g8;
+    const r: W = r8;
     const v = @max(r, @max(g, b));
     const vmin = @min(r, @min(g, b));
     const diff = v - vmin;
-    const zero: I = @splat(0);
-    const ones: I = @splat(-1);
-    const vr = @select(i32, v == r, ones, zero);
-    const vg = @select(i32, v == g, ones, zero);
-    const t = hsvDivs(N, v, diff);
-    const sat_ = (diff * t.sdiv + half) >> @splat(hsv_shift);
-    var h = (vr & (g - b)) + (~vr & ((vg & (b - r + diff + diff)) + (~vg & (r - g + @as(I, @splat(4)) * diff))));
-    h = (h * t.hdiv + half) >> @splat(hsv_shift);
-    h += @select(i32, h < zero, @as(I, @splat(180)), zero);
+    const zero: W = @splat(0);
+    const ones: W = @splat(-1);
+    const vr = @select(i16, v == r, ones, zero);
+    const vg = @select(i16, v == g, ones, zero);
+    const h16 = (vr & (g - b)) + (~vr & ((vg & (b - r + diff + diff)) + (~vg & (r - g + @as(W, @splat(4)) * diff))));
+    const vi: I = v;
+    const di: I = diff;
+    const t = hsvDivs(N, vi, di);
+    const sat_ = (di * t.sdiv + half) >> @splat(hsv_shift);
+    var h = (@as(I, h16) * t.hdiv + half) >> @splat(hsv_shift);
+    h += @select(i32, h < @as(I, @splat(0)), @as(I, @splat(180)), @as(I, @splat(0)));
     return .{ core.simd.narrow(u8, h), core.simd.narrow(u8, sat_), core.simd.narrow(u8, v) };
 }
 
@@ -486,5 +491,37 @@ test "gray and swap" {
         try std.testing.expectEqual(src.at(x, 2, 0), bgra.at(x, 2, 2));
         try std.testing.expectEqual(src.at(x, 2, 2), bgra.at(x, 2, 0));
         try std.testing.expectEqual(@as(u8, 255), bgra.at(x, 2, 3));
+    }
+}
+
+test "vector BGR -> HSV matches the scalar reference on every colour" {
+    // All 2^24 colours would be slow in Debug; a 1-in-7 lattice in each
+    // channel plus the extremes covers every branch and rounding case.
+    const gpa = std.testing.allocator;
+    var vals: [40]u8 = undefined;
+    var nv: usize = 0;
+    var c: u32 = 0;
+    while (c < 256) : (c += 7) {
+        vals[nv] = @intCast(c);
+        nv += 1;
+    }
+    vals[nv] = 255;
+    nv += 1;
+    const n = nv * nv * nv;
+    var src = try Image(u8).init(gpa, @intCast(n), 1, 3);
+    defer src.deinit(gpa);
+    var dst = try Image(u8).init(gpa, @intCast(n), 1, 3);
+    defer dst.deinit(gpa);
+    var i: usize = 0;
+    for (vals[0..nv]) |b| for (vals[0..nv]) |g| for (vals[0..nv]) |r| {
+        src.slice()[i * 3 ..][0..3].* = .{ b, g, r };
+        i += 1;
+    };
+    try cvtColor(.serial, src, dst, .bgr2hsv);
+    for (0..n) |p| {
+        const px = src.slice()[p * 3 ..][0..3];
+        var want: [3]u8 = undefined;
+        rgb2hsvU8(px[2], px[1], px[0], &want);
+        try std.testing.expectEqualSlices(u8, &want, dst.slice()[p * 3 ..][0..3]);
     }
 }
