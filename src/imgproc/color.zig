@@ -334,59 +334,78 @@ const hsv_tables = blk: {
     break :blk .{ .sdiv = sdiv, .hdiv = hdiv };
 };
 
-/// OpenCV's division tables, computed with an f32 division instead of a
-/// lookup (gathers are slow): exact for every table index, see the test.
-inline fn sdivV(v: @Vector(16, i32)) @Vector(16, i32) {
-    const f: @Vector(16, f32) = @floatFromInt(@max(v, @as(@Vector(16, i32), @splat(1))));
-    const q: @Vector(16, i32) = @intFromFloat(@round(@as(@Vector(16, f32), @splat(255 << hsv_shift)) / f));
-    return @select(i32, v == @as(@Vector(16, i32), @splat(0)), @as(@Vector(16, i32), @splat(0)), q);
-}
-inline fn hdivV(v: @Vector(16, i32)) @Vector(16, i32) {
-    const f: @Vector(16, f32) = @floatFromInt(@max(v, @as(@Vector(16, i32), @splat(1))));
-    const q: @Vector(16, i32) = @intFromFloat(@round(@as(@Vector(16, f32), @splat((180 << hsv_shift) / 6)) / f));
-    return @select(i32, v == @as(@Vector(16, i32), @splat(0)), @as(@Vector(16, i32), @splat(0)), q);
-}
-
-/// 16 pixels at a time of OpenCV's RGB2HSV_b; returns pixels handled.
-inline fn hsvU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [*]T, width: usize) usize {
-    if (T != u8) return 0;
-    const I = @Vector(16, i32);
-    const half: I = @splat(1 << (hsv_shift - 1));
-    var x: usize = 0;
-    while (x + 16 <= width) : (x += 16) {
-        const ch = vec.load(3, s + x * 3);
-        const b: I = ch[inf.sb];
-        const g: I = ch[1];
-        const r: I = ch[2 - inf.sb];
-        const v = @max(r, @max(g, b));
-        const vmin = @min(r, @min(g, b));
-        const diff = v - vmin;
-        const zero: I = @splat(0);
-        const ones: I = @splat(-1);
-        const vr = @select(i32, v == r, ones, zero);
-        const vg = @select(i32, v == g, ones, zero);
-        const sat_ = (diff * sdivV(v) + half) >> @splat(hsv_shift);
-        var h = (vr & (g - b)) + (~vr & ((vg & (b - r + diff + diff)) + (~vg & (r - g + @as(I, @splat(4)) * diff))));
-        h = (h * hdivV(diff) + half) >> @splat(hsv_shift);
-        h += @select(i32, h < zero, @as(I, @splat(180)), zero);
-        vec.store(3, .{ vec.narrowU8(16, h), vec.narrowU8(16, sat_), vec.narrowU8(16, v) }, d + x * 3);
-    }
-    return x;
+/// Both table entries (sdiv[v] and hdiv[diff]) from one f32 reciprocal of
+/// v*diff and two multiplies: exactly the table values for every pair
+/// with diff <= v (checked exhaustively in a test), at half the cost of two
+/// divisions. When diff is 0 both products are 0 or unused.
+inline fn hsvDivs(comptime N: usize, v: @Vector(N, i32), diff: @Vector(N, i32)) struct { sdiv: @Vector(N, i32), hdiv: @Vector(N, i32) } {
+    const F = @Vector(N, f32);
+    const prod: F = @floatFromInt(@max(v * diff, @as(@Vector(N, i32), @splat(1))));
+    const recip = @as(F, @splat(1.0)) / prod;
+    const fd: F = @floatFromInt(diff);
+    const fv: F = @floatFromInt(v);
+    const sd = sat.rint(fd * @as(F, @splat(255 << hsv_shift)) * recip);
+    const hd = sat.rint(fv * @as(F, @splat((180 << hsv_shift) / 6)) * recip);
+    return .{ .sdiv = @intFromFloat(sd), .hdiv = @intFromFloat(hd) };
 }
 
-test "f32 division reproduces OpenCV's HSV tables" {
-    var vs: @Vector(16, i32) = undefined;
-    var base: i32 = 0;
-    while (base < 256) : (base += 16) {
-        inline for (0..16) |i| vs[i] = base + @as(i32, i);
-        const sd: [16]i32 = sdivV(vs);
-        const hd: [16]i32 = hdivV(vs);
-        for (0..16) |i| {
-            const k: usize = @intCast(base + @as(i32, @intCast(i)));
-            try std.testing.expectEqual(hsv_tables.sdiv[k], sd[i]);
-            try std.testing.expectEqual(hsv_tables.hdiv[k], hd[i]);
+test "single-reciprocal HSV divisions match the tables" {
+    var v: i32 = 1;
+    while (v < 256) : (v += 1) {
+        var d: i32 = 1;
+        while (d <= v) : (d += 16) {
+            var dv: @Vector(16, i32) = undefined;
+            inline for (0..16) |i| dv[i] = @min(d + @as(i32, i), v);
+            const r = hsvDivs(16, @splat(v), dv);
+            const sd: [16]i32 = r.sdiv;
+            const hd: [16]i32 = r.hdiv;
+            const ds: [16]i32 = dv;
+            for (0..16) |i| {
+                try std.testing.expectEqual(hsv_tables.sdiv[@intCast(v)], sd[i]);
+                try std.testing.expectEqual(hsv_tables.hdiv[@intCast(ds[i])], hd[i]);
+            }
         }
     }
+}
+
+/// OpenCV's RGB2HSV_b on N-lane vectors (N = 16 or 64).
+inline fn hsvBlock(comptime N: usize, b8: @Vector(N, u8), g8: @Vector(N, u8), r8: @Vector(N, u8)) [3]@Vector(N, u8) {
+    const I = @Vector(N, i32);
+    const half: I = @splat(1 << (hsv_shift - 1));
+    const b: I = b8;
+    const g: I = g8;
+    const r: I = r8;
+    const v = @max(r, @max(g, b));
+    const vmin = @min(r, @min(g, b));
+    const diff = v - vmin;
+    const zero: I = @splat(0);
+    const ones: I = @splat(-1);
+    const vr = @select(i32, v == r, ones, zero);
+    const vg = @select(i32, v == g, ones, zero);
+    const t = hsvDivs(N, v, diff);
+    const sat_ = (diff * t.sdiv + half) >> @splat(hsv_shift);
+    var h = (vr & (g - b)) + (~vr & ((vg & (b - r + diff + diff)) + (~vg & (r - g + @as(I, @splat(4)) * diff))));
+    h = (h * t.hdiv + half) >> @splat(hsv_shift);
+    h += @select(i32, h < zero, @as(I, @splat(180)), zero);
+    return .{ core.simd.narrow(u8, h), core.simd.narrow(u8, sat_), core.simd.narrow(u8, v) };
+}
+
+/// 16 (or, with AVX-512 VBMI, 64) pixels at a time of OpenCV's RGB2HSV_b;
+/// returns pixels handled.
+inline fn hsvU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [*]T, width: usize) usize {
+    if (T != u8) return 0;
+    var x: usize = 0;
+    if (vec.has_vbmi) {
+        while (x + 64 <= width) : (x += 64) {
+            const ch = vec.load64(3, s + x * 3);
+            vec.store64(3, hsvBlock(64, ch[inf.sb], ch[1], ch[2 - inf.sb]), d + x * 3);
+        }
+    }
+    while (x + 16 <= width) : (x += 16) {
+        const ch = vec.load(3, s + x * 3);
+        vec.store(3, hsvBlock(16, ch[inf.sb], ch[1], ch[2 - inf.sb]), d + x * 3);
+    }
+    return x;
 }
 
 inline fn rgb2hsvU8(r8: u8, g8: u8, b8: u8, o: [*]u8) void {

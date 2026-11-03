@@ -64,6 +64,33 @@ pub inline fn load64(comptime cn: usize, p: [*]const u8) [cn]V64 {
     return out;
 }
 
+/// Like `store`, for 64 pixels at a time (for `has_vbmi` targets).
+pub inline fn store64(comptime cn: usize, ch: [cn]V64, p: [*]u8) void {
+    if (cn == 1) {
+        p[0..64].* = ch[0];
+        return;
+    }
+    inline for (0..cn) |b| {
+        const masks = comptime blk: {
+            @setEvalBranchQuota(100000);
+            var m: [cn - 1][64]i32 = undefined;
+            for (0..cn - 1) |step| for (0..64) |t| {
+                const g = 64 * b + t;
+                const src = (g % cn) * 64 + g / cn;
+                const blk = src / 64;
+                const off: i32 = @intCast(src % 64);
+                m[step][t] = if (step == 0)
+                    (if (blk == 0) off else if (blk == 1) ~off else 0)
+                else if (blk == step + 1) ~off else @intCast(t);
+            };
+            break :blk m;
+        };
+        var acc = @shuffle(u8, ch[0], ch[1], masks[0]);
+        inline for (1..cn - 1) |step| acc = @shuffle(u8, acc, ch[step + 1], masks[step]);
+        p[64 * b ..][0..64].* = acc;
+    }
+}
+
 /// Narrows i32 lanes already in [0, 255] to u8. Goes through u32 because
 /// LLVM (Zig 0.17, AVX2 without AVX-512) can lower a direct i32 -> u8
 /// narrowing to signed packs, turning 150 into 127.
@@ -232,6 +259,17 @@ test "remap 3 -> 4 with fill" {
         try std.testing.expectEqual(buf[i * 3], out[i * 4 + 2]);
         try std.testing.expectEqual(@as(u8, 255), out[i * 4 + 3]);
     }
+}
+
+test "load64/store64 round trip" {
+    var buf: [192]u8 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @truncate(i * 7);
+    const ch = load64(3, &buf);
+    var out: [192]u8 = undefined;
+    store64(3, ch, &out);
+    try std.testing.expectEqualSlices(u8, &buf, &out);
+    const c1: [64]u8 = ch[1];
+    for (c1, 0..) |v, i| try std.testing.expectEqual(buf[3 * i + 1], v);
 }
 
 test "reorderRow matches scalar" {
