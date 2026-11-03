@@ -270,12 +270,19 @@ pub inline fn remap(comptime scn: usize, comptime dcn: usize, comptime map: [dcn
 /// sides. Returns the number of pixels done; the caller finishes the rest.
 pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map: [dcn]?u8, fill: u8, s: [*]const u8, d: [*]u8, n: usize) usize {
     // AArch64: ldN + stN do the whole reorder in two instructions per 16
-    // pixels when the pixel size changes (BGR <-> BGRA). A same-size swap
-    // (BGR <-> RGB) uses the overlapping single-register tbl path below:
-    // ld3/st3 split into several micro-ops each on Apple cores.
-    if (comptime is_arm and scn != dcn) {
+    // pixels (measured faster than single-register tbl groups for BGR <->
+    // RGB on Apple cores), two blocks per iteration.
+    if (comptime is_arm) {
         const f: V16 = @splat(fill);
         var x: usize = 0;
+        while (x + 32 <= n) : (x += 32) {
+            inline for (0..2) |b| {
+                const ch = load(scn, s + (x + 16 * b) * scn);
+                var out: [dcn]V16 = undefined;
+                inline for (0..dcn) |c| out[c] = if (map[c]) |sc| ch[sc] else f;
+                store(dcn, out, d + (x + 16 * b) * dcn);
+            }
+        }
         while (x + 16 <= n) : (x += 16) {
             const ch = load(scn, s + x * scn);
             var out: [dcn]V16 = undefined;
