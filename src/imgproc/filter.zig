@@ -456,6 +456,19 @@ pub fn gaussianBlur(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src),
         var ky: [127]f32 = undefined;
         for (kx[0..kw], kxd[0..kw]) |*a, b| a.* = @floatCast(b);
         for (ky[0..kh], kyd[0..kh]) |*a, b| a.* = @floatCast(b);
+        // OpenCV's fixed small kernels, unrolled at compile time.
+        if (T == f32 and kw == kh and std.mem.eql(f32, kx[0..kw], ky[0..kh])) {
+            const t3 = [_]f32{ 0.25, 0.5, 0.25 };
+            const t5 = [_]f32{ 0.0625, 0.25, 0.375, 0.25, 0.0625 };
+            if (kw == 3 and std.mem.eql(f32, kx[0..3], &t3)) {
+                const P = SpecK(T, f32, f32, T, f32, FinishCast, &t3, &t3);
+                return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, 1);
+            }
+            if (kw == 5 and std.mem.eql(f32, kx[0..5], &t5)) {
+                const P = SpecK(T, f32, f32, T, f32, FinishCast, &t5, &t5);
+                return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, 1);
+            }
+        }
         const P = Spec(T, f32, f32, T, f32, FinishCast);
         return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, 1);
     }
