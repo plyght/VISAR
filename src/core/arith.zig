@@ -5,6 +5,7 @@ const std = @import("std");
 const image = @import("image.zig");
 const pool = @import("pool.zig");
 const sat = @import("saturate.zig");
+const simd = @import("simd.zig");
 const Image = image.Image;
 const Exec = pool.Exec;
 
@@ -34,7 +35,7 @@ fn rowsGrain(img: anytype) usize {
 }
 
 inline fn binRow(comptime T: type, comptime op: BinOp, a: []const T, b: []const T, d: []T) void {
-    const N = comptime @max(1, (std.simd.suggestVectorLength(T) orelse 1));
+    const N = comptime simd.lanes(T);
     const V = @Vector(N, T);
     var i: usize = 0;
     const is_int = @typeInfo(T) == .int;
@@ -101,18 +102,58 @@ pub fn convertTo(exec: Exec, src: anytype, dst: anytype, alpha: f64, beta: f64) 
                 const s = c.s.row(y);
                 const d = c.d.row(y);
                 if (identity) {
-                    for (s, d) |v, *o| o.* = sat.cast(D, v);
+                    if (S == D) {
+                        @memcpy(d, s);
+                        continue;
+                    }
+                    var i: usize = 0;
+                    if (comptime vecConvertible(S) and vecConvertible(D)) {
+                        const n = 32;
+                        while (i + n <= d.len) : (i += n) {
+                            const v: @Vector(n, S) = s[i..][0..n].*;
+                            d[i..][0..n].* = identityVec(S, D, n, v);
+                        }
+                    }
+                    for (s[i..], d[i..]) |v, *o| o.* = sat.cast(D, v);
                 } else if (@typeInfo(D) == .float or (@sizeOf(S) <= 2 and @typeInfo(S) == .int)) {
                     // f32 math matches OpenCV's 8/16-bit and float paths.
                     const a: f32 = @floatCast(c.a);
                     const b: f32 = @floatCast(c.b);
-                    for (s, d) |v, *o| o.* = sat.cast(D, toF32(S, v) * a + b);
+                    var i: usize = 0;
+                    if (comptime vecConvertible(S) and vecConvertible(D)) {
+                        const n = 32;
+                        const va: @Vector(n, f32) = @splat(a);
+                        const vb: @Vector(n, f32) = @splat(b);
+                        while (i + n <= d.len) : (i += n) {
+                            const v: @Vector(n, S) = s[i..][0..n].*;
+                            d[i..][0..n].* = fromF32(D, n, simd.toF32(n, v) * va + vb);
+                        }
+                    }
+                    for (s[i..], d[i..]) |v, *o| o.* = sat.cast(D, toF32(S, v) * a + b);
                 } else {
                     for (s, d) |v, *o| o.* = sat.cast(D, toF64(S, v) * c.a + c.b);
                 }
             }
         }
     }.run);
+}
+
+/// Types the f32 vector paths handle: integers up to 16 bits and f32.
+fn vecConvertible(comptime T: type) bool {
+    return T == f32 or (@typeInfo(T) == .int and @bitSizeOf(T) <= 16);
+}
+
+/// saturate_cast<D> of f32 lanes (D as in vecConvertible).
+inline fn fromF32(comptime D: type, comptime n: comptime_int, v: @Vector(n, f32)) @Vector(n, D) {
+    return if (D == f32) v else simd.satF32(D, n, v);
+}
+
+inline fn identityVec(comptime S: type, comptime D: type, comptime n: comptime_int, v: @Vector(n, S)) @Vector(n, D) {
+    if (S == f32 or D == f32) return fromF32(D, n, simd.toF32(n, v));
+    const w: @Vector(n, i32) = v;
+    const lo: @Vector(n, i32) = @splat(std.math.minInt(D));
+    const hi: @Vector(n, i32) = @splat(std.math.maxInt(D));
+    return @intCast(@min(@max(w, lo), hi));
 }
 
 /// dst = saturate_u8(|src * alpha + beta|)
@@ -122,23 +163,54 @@ pub fn convertScaleAbs(exec: Exec, src: anytype, dst: Image(u8), alpha: f64, bet
     const Ctx = struct { s: Image(S), d: Image(u8), a: f32, b: f32 };
     exec.parallelFor(src.height, rowsGrain(src), Ctx{ .s = src, .d = dst, .a = @floatCast(alpha), .b = @floatCast(beta) }, struct {
         fn run(c: Ctx, y0: usize, y1: usize) void {
-            for (y0..y1) |y| for (c.s.row(y), c.d.row(y)) |v, *o| {
-                o.* = sat.cast(u8, @abs(toF32(S, v) * c.a + c.b));
-            };
+            for (y0..y1) |y| {
+                const s = c.s.row(y);
+                const d = c.d.row(y);
+                var i: usize = 0;
+                if (comptime vecConvertible(S)) {
+                    const n = 32;
+                    const va: @Vector(n, f32) = @splat(c.a);
+                    const vb: @Vector(n, f32) = @splat(c.b);
+                    while (i + n <= d.len) : (i += n) {
+                        const v: @Vector(n, S) = s[i..][0..n].*;
+                        d[i..][0..n].* = simd.satF32(u8, n, @abs(simd.toF32(n, v) * va + vb));
+                    }
+                }
+                for (s[i..], d[i..]) |v, *o| o.* = sat.cast(u8, @abs(toF32(S, v) * c.a + c.b));
+            }
         }
     }.run);
 }
 
-/// dst = saturate(a*alpha + b*beta + gamma)
+/// dst = saturate(a*alpha + b*beta + gamma), evaluated in f32 as
+/// fma(a, alpha, fma(b, beta, gamma)) like OpenCV's SIMD path.
 pub fn addWeighted(exec: Exec, a: anytype, alpha: f64, b: @TypeOf(a), beta: f64, gamma: f64, dst: @TypeOf(a)) Error!void {
     const T = @TypeOf(a).Elem;
     if (!a.sameShape(b) or !a.sameShape(dst)) return error.SizeMismatch;
     const Ctx = struct { a: Image(T), b: Image(T), d: Image(T), al: f32, be: f32, ga: f32 };
     exec.parallelFor(a.height, rowsGrain(a), Ctx{ .a = a, .b = b, .d = dst, .al = @floatCast(alpha), .be = @floatCast(beta), .ga = @floatCast(gamma) }, struct {
         fn run(c: Ctx, y0: usize, y1: usize) void {
-            for (y0..y1) |y| for (c.a.row(y), c.b.row(y), c.d.row(y)) |x, z, *o| {
-                o.* = sat.cast(T, @mulAdd(f32, toF32(T, x), c.al, @mulAdd(f32, toF32(T, z), c.be, c.ga)));
-            };
+            for (y0..y1) |y| {
+                const ra = c.a.row(y);
+                const rb = c.b.row(y);
+                const d = c.d.row(y);
+                var i: usize = 0;
+                if (comptime vecConvertible(T)) {
+                    const n = 32;
+                    const F = @Vector(n, f32);
+                    const al: F = @splat(c.al);
+                    const be: F = @splat(c.be);
+                    const ga: F = @splat(c.ga);
+                    while (i + n <= d.len) : (i += n) {
+                        const x = simd.toF32(n, @as(@Vector(n, T), ra[i..][0..n].*));
+                        const z = simd.toF32(n, @as(@Vector(n, T), rb[i..][0..n].*));
+                        d[i..][0..n].* = fromF32(T, n, @mulAdd(F, x, al, @mulAdd(F, z, be, ga)));
+                    }
+                }
+                for (ra[i..], rb[i..], d[i..]) |x, z, *o| {
+                    o.* = sat.cast(T, @mulAdd(f32, toF32(T, x), c.al, @mulAdd(f32, toF32(T, z), c.be, c.ga)));
+                }
+            }
         }
     }.run);
 }
@@ -271,4 +343,8 @@ test "binary ops saturate" {
     try std.testing.expectEqual(@as(u8, 150), d.at(5, 0, 0));
     const m = mean(a);
     try std.testing.expectEqual(@as(f64, 200), m[0]);
+}
+
+test {
+    _ = simd;
 }

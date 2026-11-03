@@ -12,11 +12,11 @@
 //! coefficient buffer first and then output through the same row pipeline.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("../common.zig");
 const tables = @import("tables.zig");
 const dct = @import("dct.zig");
 
-pub var dbg_skip: u8 = 0;
 const Image = common.Image;
 const AnyImage = common.AnyImage;
 const DecodeError = common.DecodeError;
@@ -24,7 +24,7 @@ const Allocator = std.mem.Allocator;
 const natural_order = tables.natural_order;
 
 /// Bits looked up at once by the Huffman decoder.
-const fast_bits = 9;
+const fast_bits = 10;
 const fast_size = 1 << fast_bits;
 
 // ---------------------------------------------------------------------------
@@ -349,45 +349,48 @@ const Decoder = struct {
             switch (m) {
                 0xd9 => break, // EOI
                 0xd8, 0xd0...0xd7, 0x01 => {},
-                0xc0, 0xc1, 0xc2 => try d.readFrame(d.readMarkerSegment() catch |e| return d.lateError(e), m == 0xc2),
+                0xc0, 0xc1, 0xc2 => try d.readFrame((try d.segment()) orelse break, m == 0xc2),
                 0xc3, 0xc5...0xc7, 0xc9...0xcb, 0xcd...0xcf => return error.Unsupported,
-                0xc4 => try d.readDht(d.readMarkerSegment() catch |e| return d.lateError(e)),
-                0xdb => try d.readDqt(d.readMarkerSegment() catch |e| return d.lateError(e)),
+                0xc4 => try d.readDht((try d.segment()) orelse break),
+                0xdb => try d.readDqt((try d.segment()) orelse break),
                 0xdd => {
-                    const seg = d.readMarkerSegment() catch |e| return d.lateError(e);
+                    const seg = (try d.segment()) orelse break;
                     if (seg.len < 2) return error.InvalidData;
                     d.restart_interval = std.mem.readInt(u16, seg[0..2], .big);
                 },
                 0xda => {
-                    const seg = d.readMarkerSegment() catch |e| return d.lateError(e);
+                    const seg = (try d.segment()) orelse break;
                     try d.readScan(seg);
                     if (d.streamed) break;
                 },
                 0xe0 => {
-                    const seg = d.readMarkerSegment() catch |e| return d.lateError(e);
+                    const seg = (try d.segment()) orelse break;
                     if (seg.len >= 5 and std.mem.eql(u8, seg[0..5], "JFIF\x00")) d.jfif = true;
                 },
                 0xee => {
-                    const seg = d.readMarkerSegment() catch |e| return d.lateError(e);
+                    const seg = (try d.segment()) orelse break;
                     if (seg.len >= 12 and std.mem.eql(u8, seg[0..5], "Adobe")) {
                         d.adobe = true;
                         d.adobe_transform = seg[11];
                     }
                 },
-                else => _ = d.readMarkerSegment() catch |e| return d.lateError(e),
+                else => _ = (try d.segment()) orelse break,
             }
         }
         if (d.scans == 0) return if (d.have_frame) error.Truncated else error.InvalidData;
         if (d.buffered) try d.outputBuffered();
     }
 
-    /// Running out of data after the first scan still yields an image.
-    fn lateError(d: *Decoder, e: DecodeError) DecodeError!void {
-        if (d.scans > 0 and e == error.Truncated) {
-            d.pos = d.data.len;
-            return;
-        }
-        return e;
+    /// The next marker segment, or null when the data ends inside it after
+    /// the first scan (the image decoded so far is still returned).
+    fn segment(d: *Decoder) DecodeError!?[]const u8 {
+        return d.readMarkerSegment() catch |e| {
+            if (d.scans > 0 and e == error.Truncated) {
+                d.pos = d.data.len;
+                return null;
+            }
+            return e;
+        };
     }
 
     fn readDqt(d: *Decoder, seg: []const u8) DecodeError!void {
@@ -569,7 +572,9 @@ const Decoder = struct {
             .ycc, .rgb => if (want_gray) 1 else 3,
             .cmyk, .ycck => 3,
         };
-        d.out_bgr = d.out_ch == 3 and d.opts.order == .bgr;
+        // Emit BGR directly unless finish() will still reduce to gray (its
+        // weights assume RGB order).
+        d.out_bgr = d.out_ch == 3 and d.opts.order == .bgr and !want_gray;
         for (d.comps[0..d.ncomp], 0..) |*c, i| {
             c.needed = !(want_gray and d.cs == .ycc and i != 0);
         }
@@ -675,7 +680,6 @@ const Decoder = struct {
         const rows = 8 * @as(u32, d.vmax);
         const y0 = m * rows;
         const y1 = @min(y0 + rows, d.height);
-        if (dbg_skip & 1 != 0) return;
         if (y0 < y1) d.emitRows(y0, y1);
     }
 
@@ -684,7 +688,8 @@ const Decoder = struct {
 
     fn decodeStreaming(d: *Decoder, sc: Scan) DecodeError!void {
         var br: BitReader = .{ .data = d.data, .pos = d.pos };
-        var blk: [64]i32 align(64) = @splat(0);
+        var blks: [2][64]i32 align(64) = @splat(@splat(0));
+        var pair: IdctPair = .{};
         const ri = d.restart_interval;
         var since: u32 = 0;
         var dead = false;
@@ -707,18 +712,26 @@ const Decoder = struct {
                     const ring_row0 = (my % 3) * @as(usize, c.v) * 8;
                     for (0..c.v) |bv| {
                         for (0..c.h) |bh| {
+                            const blk = &blks[pair.free];
                             var has_ac = false;
-                            if (!dead) has_ac = try decodeBlock(&br, dc_tab, ac_tab, &c.qz, &blk, &c.pred);
-                            if (c.needed and dbg_skip & 2 == 0) {
+                            if (!dead) has_ac = try decodeBlock(&br, dc_tab, ac_tab, &c.qz, blk, &c.pred);
+                            if (c.needed) {
                                 const dst = c.ring.ptr + (ring_row0 + bv * 8) * c.ring_stride + (@as(usize, mx) * c.h + bh) * 8;
-                                if (has_ac) dct.idct(&blk, dst, c.ring_stride) else dct.idctDc(blk[0], dst, c.ring_stride);
+                                if (has_ac) {
+                                    pair.add(&blks, dst, c.ring_stride);
+                                } else {
+                                    dct.idctDc(blk[0], dst, c.ring_stride);
+                                    blk[0] = 0;
+                                }
+                            } else if (has_ac) blk.* = @splat(0) else {
+                                blk[0] = 0;
                             }
-                            if (has_ac) blk = @splat(0) else blk[0] = 0;
                         }
                     }
                 }
                 if (!dead and br.overran()) dead = true;
             }
+            pair.flush(&blks);
             if (my > 0) d.emitMcuRow(my - 1);
         }
         d.emitMcuRow(d.mcuy - 1);
@@ -729,14 +742,19 @@ const Decoder = struct {
     // Buffered (progressive / multi-scan) decode
 
     fn decodeBufferedScan(d: *Decoder, sc: Scan) DecodeError!void {
+        const kind: BlockKind = if (!d.progressive) .seq else if (sc.ss == 0)
+            (if (sc.ah == 0) .dc_first else .dc_refine)
+        else if (sc.ah == 0) .ac_first else .ac_refine;
+        switch (kind) {
+            inline else => |k| try d.decodeBufferedScanK(k, sc),
+        }
+    }
+
+    fn decodeBufferedScanK(d: *Decoder, comptime kind: BlockKind, sc: Scan) DecodeError!void {
         var br: BitReader = .{ .data = d.data, .pos = d.pos };
         const ri = d.restart_interval;
         var since: u32 = 0;
         var dead = false;
-        const kind: BlockKind = if (!d.progressive) .seq else if (sc.ss == 0)
-            (if (sc.ah == 0) .dc_first else .dc_refine)
-        else if (sc.ah == 0) .ac_first else .ac_refine;
-
         if (sc.ns == 1) {
             const c = &d.comps[sc.cidx[0]];
             const nbx = ceilDiv(c.dw, 8);
@@ -791,12 +809,12 @@ const Decoder = struct {
 
     const BlockKind = enum { seq, dc_first, dc_refine, ac_first, ac_refine };
 
-    fn decodeCoefBlock(d: *Decoder, kind: BlockKind, br: *BitReader, c: *Comp, sc: Scan, blk: *[64]i16) DecodeError!void {
+    inline fn decodeCoefBlock(d: *Decoder, comptime kind: BlockKind, br: *BitReader, c: *Comp, sc: Scan, blk: *[64]i16) DecodeError!void {
         switch (kind) {
             .seq => {
                 var tmp: [64]i32 = @splat(0);
                 _ = try decodeBlock(br, &d.dc_tab[c.td], &d.ac_tab[c.ta], &ones80, &tmp, &c.pred);
-                for (blk, tmp) |*o, v| o.* = @truncate(v);
+                for (blk, 0..) |*o, kk| o.* = @truncate(tmp[natural_order[kk]]);
             },
             .dc_first => {
                 br.refill();
@@ -827,7 +845,7 @@ const Decoder = struct {
                     if (s != 0) {
                         k += r;
                         const v = br.receive(s);
-                        blk[natural_order[k]] = @truncate(v *% (@as(i32, 1) << @intCast(sc.al)));
+                        blk[@min(k, 63)] = @truncate(v *% (@as(i32, 1) << @intCast(sc.al)));
                     } else if (r == 15) {
                         k += 15;
                     } else {
@@ -839,49 +857,43 @@ const Decoder = struct {
                 }
             },
             .ac_refine => {
+                // Coefficients are stored in zigzag order, so a 64-bit mask
+                // of the non-zero ones lets us visit only those for
+                // correction bits and find the next zero with bit tricks.
                 const p1: i16 = @as(i16, 1) << @intCast(sc.al);
                 const m1: i16 = @as(i16, -1) *% p1;
+                const se: u32 = sc.se;
+                const Z = @Vector(64, i16);
+                var nz: u64 = @bitCast(@as(Z, blk.*) != @as(Z, @splat(0)));
                 var k: u32 = sc.ss;
                 if (d.eobrun == 0) {
                     const ac = &d.ac_tab[c.ta];
-                    while (k <= sc.se) : (k += 1) {
+                    while (k <= se) : (k += 1) {
                         br.refill();
                         const rs = br.huff(ac);
-                        var r: i32 = rs >> 4;
+                        const r: u32 = rs >> 4;
                         var s: i16 = 0;
                         if ((rs & 15) != 0) {
                             s = if (br.bit()) p1 else m1;
                         } else if (r != 15) {
                             d.eobrun = @as(u32, 1) << @intCast(r);
-                            if (r != 0) d.eobrun += @intCast(br.bits(@intCast(r)));
+                            if (r != 0) d.eobrun += @intCast(br.bits(r));
                             break;
                         }
-                        while (k <= sc.se) {
-                            const pos = natural_order[k];
-                            const cur = blk[pos];
-                            if (cur != 0) {
-                                if (br.bit()) {
-                                    if ((cur & p1) == 0) blk[pos] = if (cur >= 0) cur +% p1 else cur +% m1;
-                                }
-                            } else {
-                                r -= 1;
-                                if (r < 0) break;
-                            }
-                            k += 1;
+                        // Position of the (r+1)-th zero coefficient in k..se.
+                        const zeros = nthSetBit(~nz & rangeMask(k, se), r);
+                        const pos: u32 = if (zeros == 0) se + 1 else @ctz(zeros);
+                        if (pos > k) refineBits(br, blk, nz & rangeMask(k, pos - 1), p1, m1);
+                        k = pos;
+                        if (s != 0) {
+                            const at = @min(k, 63);
+                            blk[at] = s;
+                            nz |= @as(u64, 1) << @intCast(at);
                         }
-                        if (s != 0) blk[natural_order[k]] = s;
                     }
                 }
                 if (d.eobrun > 0) {
-                    while (k <= sc.se) : (k += 1) {
-                        const pos = natural_order[k];
-                        const cur = blk[pos];
-                        if (cur != 0) {
-                            if (br.bit()) {
-                                if ((cur & p1) == 0) blk[pos] = if (cur >= 0) cur +% p1 else cur +% m1;
-                            }
-                        }
-                    }
+                    if (k <= se) refineBits(br, blk, nz & rangeMask(k, se), p1, m1);
                     d.eobrun -= 1;
                 }
             },
@@ -898,7 +910,8 @@ const Decoder = struct {
                 for (0..c.v) |bv| {
                     const by = m * c.v + bv;
                     for (0..c.bw) |bx| {
-                        const src = c.coefs[(by * c.bw + bx) * 64 ..][0..64];
+                        const zz: @Vector(64, i16) = c.coefs[(by * c.bw + bx) * 64 ..][0..64].*;
+                        const src: [64]i16 = @shuffle(i16, zz, undefined, unzigzag);
                         const dst = c.ring.ptr + (ring_row0 + bv * 8) * c.ring_stride + bx * 8;
                         var any: @Vector(8, i16) = @splat(0);
                         inline for (0..8) |i| {
@@ -919,6 +932,78 @@ const Decoder = struct {
 };
 
 const ones80: [80]i32 = @splat(1);
+
+/// Bits lo..hi (inclusive) set; lo <= hi <= 63.
+inline fn rangeMask(lo: u32, hi: u32) u64 {
+    return (~@as(u64, 0) << @intCast(lo)) & (~@as(u64, 0) >> @intCast(63 - hi));
+}
+
+const has_pdep = builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .bmi2);
+
+/// The `n`-th (0-based) set bit of `x` as a one-bit mask, or 0.
+inline fn nthSetBit(x: u64, n: u32) u64 {
+    if (has_pdep) {
+        return asm ("pdep %[x], %[src], %[ret]"
+            : [ret] "=r" (-> u64),
+            : [src] "r" (@as(u64, 1) << @intCast(n)),
+              [x] "r" (x),
+        );
+    }
+    var z = x;
+    for (0..n) |_| z &= z -% 1;
+    return z & (~z +% 1);
+}
+
+/// Applies one correction bit to each coefficient in `mask` (all non-zero),
+/// in order, as libjpeg's refinement pass does.
+inline fn refineBits(br: *BitReader, blk: *[64]i16, mask: u64, p1: i16, m1: i16) void {
+    var mm = mask;
+    while (mm != 0) {
+        const j = @ctz(mm);
+        mm &= mm - 1;
+        if (br.bit()) {
+            const cur = blk[j];
+            if ((cur & p1) == 0) blk[j] = if (cur >= 0) cur +% p1 else cur +% m1;
+        }
+    }
+}
+
+/// unzigzag[p] = zigzag index of natural position p.
+const unzigzag: [64]i32 = blk: {
+    var m: [64]i32 = undefined;
+    for (0..64) |k| m[natural_order[k]] = k;
+    break :blk m;
+};
+
+/// Holds back one block with AC coefficients so IDCTs run two at a time.
+/// `free` is the buffer to decode the next block into.
+const IdctPair = struct {
+    free: u1 = 0,
+    dst: ?[*]u8 = null,
+    stride: usize = 0,
+
+    inline fn add(p: *IdctPair, blks: *[2][64]i32, dst: [*]u8, stride: usize) void {
+        if (p.dst) |d0| {
+            dct.idct2(&blks[p.free ^ 1], d0, p.stride, &blks[p.free], dst, stride);
+            blks[0] = @splat(0);
+            blks[1] = @splat(0);
+            p.dst = null;
+        } else {
+            p.dst = dst;
+            p.stride = stride;
+            p.free ^= 1;
+        }
+    }
+
+    inline fn flush(p: *IdctPair, blks: *[2][64]i32) void {
+        if (p.dst) |d0| {
+            const b = &blks[p.free ^ 1];
+            dct.idct(b, d0, p.stride);
+            b.* = @splat(0);
+            p.dst = null;
+        }
+    }
+};
 
 inline fn ceilDiv(a: u32, b: u32) u32 {
     return (a + b - 1) / b;
@@ -1011,16 +1096,25 @@ inline fn load16(p: [*]const u8) V16 {
     return b;
 }
 
-inline fn interleave2(a: U16, b: U16) [32]u8 {
-    const mask = comptime blk: {
-        var m: [32]i32 = undefined;
-        for (0..16) |i| {
+inline fn store2(out: [*]u8, a: U16, b: U16) void {
+    const lo = comptime blk: {
+        var m: [16]i32 = undefined;
+        for (0..8) |i| {
             m[2 * i] = i;
             m[2 * i + 1] = ~@as(i32, i);
         }
         break :blk m;
     };
-    return @shuffle(u8, a, b, mask);
+    const hi = comptime blk: {
+        var m: [16]i32 = undefined;
+        for (0..8) |i| {
+            m[2 * i] = 8 + i;
+            m[2 * i + 1] = ~@as(i32, 8 + i);
+        }
+        break :blk m;
+    };
+    out[0..16].* = @as([16]u8, @shuffle(u8, a, b, lo));
+    out[16..32].* = @as([16]u8, @shuffle(u8, a, b, hi));
 }
 
 inline fn lo8(v: V16) U16 {
@@ -1041,7 +1135,7 @@ fn upH2v1(in: [*]const u8, dw: u32, cs: []i16, out: [*]u8) void {
         const c3 = c *% @as(V16, @splat(3));
         const e = lo8((c3 +% l +% @as(V16, @splat(1))) >> @splat(2));
         const o = lo8((c3 +% r +% @as(V16, @splat(2))) >> @splat(2));
-        out[2 * i ..][0..32].* = interleave2(e, o);
+        store2(out + 2 * i, e, o);
     }
 }
 
@@ -1071,7 +1165,7 @@ fn upH2v2(near: [*]const u8, far: [*]const u8, dw: u32, cs: []i16, out: [*]u8) v
         const c3 = c *% @as(V16, @splat(3));
         const e = lo8((c3 +% l +% @as(V16, @splat(8))) >> @splat(4));
         const o = lo8((c3 +% r +% @as(V16, @splat(7))) >> @splat(4));
-        out[2 * i ..][0..32].* = interleave2(e, o);
+        store2(out + 2 * i, e, o);
     }
 }
 
@@ -1084,45 +1178,80 @@ const one_half: i32 = 1 << 15;
 
 const VI = @Vector(16, i32);
 
-inline fn interleave3(a: U16, b: U16, c: U16) [48]u8 {
-    const ab = @shuffle(u8, a, b, blk: {
-        var m: [32]i32 = undefined;
-        for (0..16) |i| {
-            m[i] = i;
-            m[16 + i] = ~@as(i32, i);
-        }
+/// Byte shuffle drawing from three 16-lane sources, done as two two-source
+/// shuffles so it lowers to pshufb/blend instead of scalar inserts.
+/// `sel[i]` = 16 * source + lane.
+pub inline fn shuf3(a: U16, b: U16, c: U16, comptime sel: [16]u8) U16 {
+    const m1 = comptime blk: {
+        var m: [16]i32 = undefined;
+        for (sel, 0..) |x, i| m[i] = switch (x / 16) {
+            0 => x % 16,
+            1 => ~@as(i32, x % 16),
+            else => 0,
+        };
         break :blk m;
-    });
-    const cc = @shuffle(u8, c, c, blk: {
-        var m: [32]i32 = undefined;
-        for (0..32) |i| m[i] = i % 16;
+    };
+    const m2 = comptime blk: {
+        var m: [16]i32 = undefined;
+        for (sel, 0..) |x, i| m[i] = if (x / 16 == 2) ~@as(i32, x % 16) else i;
         break :blk m;
-    });
-    return @shuffle(u8, ab, cc, blk: {
-        var m: [48]i32 = undefined;
-        for (0..16) |p| {
-            m[3 * p] = p;
-            m[3 * p + 1] = 16 + p;
-            m[3 * p + 2] = ~@as(i32, p);
-        }
-        break :blk m;
-    });
+    };
+    const t = @shuffle(u8, a, b, m1);
+    return @shuffle(u8, t, c, m2);
+}
+
+fn interleaveSel(comptime j: usize) [16]u8 {
+    var m: [16]u8 = undefined;
+    for (0..16) |l| {
+        const n = 16 * j + l;
+        m[l] = @intCast(16 * (n % 3) + n / 3);
+    }
+    return m;
+}
+
+inline fn store3(out: []u8, a: U16, b: U16, c: U16) void {
+    out[0..16].* = shuf3(a, b, c, comptime interleaveSel(0));
+    out[16..32].* = shuf3(a, b, c, comptime interleaveSel(1));
+    out[32..48].* = shuf3(a, b, c, comptime interleaveSel(2));
 }
 
 inline fn clampU8(v: VI) U16 {
     return @intCast(@min(@max(v, @as(VI, @splat(0))), @as(VI, @splat(255))));
 }
 
+/// (a * b) >> 16 per lane (pmulhw).
+inline fn mulhi(a: V16, comptime b: i16) V16 {
+    const W = @Vector(16, i32);
+    return @truncate((@as(W, a) * @as(W, @splat(b))) >> @splat(16));
+}
+
+/// libjpeg's fixed-point YCbCr->RGB on 16 pixels in 16-bit lanes. Each
+/// constant c * 2^16 is split into k * 2^16 + c' with |c'| < 2^15, and
+/// (c' x + 2^15) >> 16 is formed as (mulhi(2x, c') + 1) >> 1, which is
+/// exact (checked over all inputs in the tests).
+inline fn yccVec(y: V16, cb: V16, cr: V16) [3]U16 {
+    const one: V16 = @splat(1);
+    // R: 1.40200 = 1 + 26345 / 2^16.
+    const r = y + cr + ((mulhi(cr + cr, 26345) + one) >> @splat(1));
+    // B: 1.77200 = 2 - 14942 / 2^16.
+    const b = y + cb + cb + ((mulhi(cb + cb, -14942) + one) >> @splat(1));
+    // G: -0.34414 cb - 0.71414 cr = (-22554 cb + 18734 cr) / 2^16 - cr.
+    const W = @Vector(16, i32);
+    const gt: V16 = @truncate((@as(W, cb) * @as(W, @splat(-fix_0_34414)) + @as(W, cr) * @as(W, @splat(65536 - fix_0_71414)) + @as(W, @splat(one_half))) >> @splat(16));
+    const g = y - cr + gt;
+    return .{ sat8(r), sat8(g), sat8(b) };
+}
+
+inline fn sat8(v: V16) U16 {
+    return @intCast(@min(@max(v, @as(V16, @splat(0))), @as(V16, @splat(255))));
+}
+
 fn yccRow(comptime bgr: bool, yp: [*]const u8, cbp: [*]const u8, crp: [*]const u8, out: []u8, w: usize) void {
     var x: usize = 0;
+    const c128: V16 = @splat(128);
     while (x + 16 <= w) : (x += 16) {
-        const y: VI = @as(U16, yp[x..][0..16].*);
-        const cb = @as(VI, @as(U16, cbp[x..][0..16].*)) - @as(VI, @splat(128));
-        const cr = @as(VI, @as(U16, crp[x..][0..16].*)) - @as(VI, @splat(128));
-        const r = y + ((cr * @as(VI, @splat(fix_1_40200)) + @as(VI, @splat(one_half))) >> @splat(16));
-        const g = y + ((cb * @as(VI, @splat(-fix_0_34414)) + cr * @as(VI, @splat(-fix_0_71414)) + @as(VI, @splat(one_half))) >> @splat(16));
-        const b = y + ((cb * @as(VI, @splat(fix_1_77200)) + @as(VI, @splat(one_half))) >> @splat(16));
-        out[3 * x ..][0..48].* = if (bgr) interleave3(clampU8(b), clampU8(g), clampU8(r)) else interleave3(clampU8(r), clampU8(g), clampU8(b));
+        const rgb = yccVec(load16(yp + x), load16(cbp + x) - c128, load16(crp + x) - c128);
+        if (bgr) store3(out[3 * x ..][0..48], rgb[2], rgb[1], rgb[0]) else store3(out[3 * x ..][0..48], rgb[0], rgb[1], rgb[2]);
     }
     while (x < w) : (x += 1) {
         const rgb = yccPixel(yp[x], cbp[x], crp[x]);
@@ -1131,6 +1260,35 @@ fn yccRow(comptime bgr: bool, yp: [*]const u8, cbp: [*]const u8, crp: [*]const u
             out[3 * x + 1] = rgb[1];
             out[3 * x + 2] = rgb[0];
         } else out[3 * x ..][0..3].* = rgb;
+    }
+}
+
+test "jpeg ycc vector matches libjpeg tables" {
+    var cbv: [16]i16 = undefined;
+    var crv: [16]i16 = undefined;
+    var yv: [16]i16 = undefined;
+    // Exhaustive outside Debug builds; every 5th luma value in Debug.
+    const step: usize = if (@import("builtin").mode == .debug) 5 else 1;
+    var y: usize = 0;
+    while (y < 256) : (y += step) {
+        for (0..256) |cb| {
+            var cr: usize = 0;
+            while (cr < 256) : (cr += 16) {
+                for (0..16) |i| {
+                    yv[i] = @intCast(y);
+                    cbv[i] = @as(i16, @intCast(cb)) - 128;
+                    crv[i] = @as(i16, @intCast(cr + i)) - 128;
+                }
+                const v = yccVec(yv, cbv, crv);
+                const r: [16]u8 = v[0];
+                const g: [16]u8 = v[1];
+                const b: [16]u8 = v[2];
+                for (0..16) |i| {
+                    const want = yccPixel(@intCast(y), @intCast(cb), @intCast(cr + i));
+                    try std.testing.expectEqual(want, [3]u8{ r[i], g[i], b[i] });
+                }
+            }
+        }
     }
 }
 

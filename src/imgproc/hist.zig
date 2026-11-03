@@ -21,7 +21,8 @@ pub fn calcHist(src: Image(u8)) Error![256]u32 {
 /// excluding the first occupied bin).
 pub fn equalizeHist(exec: Exec, src: Image(u8), dst: Image(u8)) Error!void {
     if (src.channels != 1 or !src.sameShape(dst)) return error.SizeMismatch;
-    const hist = try calcHist(src);
+    var hist: [256]u32 = @splat(0);
+    threshold.histogram8Exec(exec, src, &hist);
     const total = src.pixelCount();
     var i: usize = 0;
     while (hist[i] == 0) i += 1;

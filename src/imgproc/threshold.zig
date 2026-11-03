@@ -5,6 +5,7 @@ const core = @import("../core/core.zig");
 const Image = core.Image;
 const Exec = core.Exec;
 const sat = core.sat;
+const simd = @import("../core/simd.zig");
 
 pub const Error = core.Error || error{Unsupported};
 
@@ -28,86 +29,162 @@ pub fn threshold(exec: Exec, src: anytype, dst: @TypeOf(src), thresh_in: f64, ma
     if (auto != .none) {
         if (T != u8 or src.channels != 1) return error.Unsupported;
         var hist: [256]u32 = @splat(0);
-        histogram8(src, &hist);
+        histogram8Exec(exec, src, &hist);
         thresh = switch (auto) {
             .otsu => otsu(&hist, src.pixelCount()),
             .triangle => triangle(&hist),
             .none => unreachable,
         };
     }
+    // Like OpenCV, 8-bit thresholds are floored to an integer; out-of-range
+    // ones go through the LUT below.
+    const ti: i32 = if (T == u8) @intFromFloat(@floor(thresh)) else 0;
+    const t: T = if (T == u8) @intCast(std.math.clamp(ti, 0, 255)) else if (@typeInfo(T) == .float) @floatCast(thresh) else sat.cast(T, @floor(thresh));
+    const m: T = sat.cast(T, maxval);
     if (T == u8) {
-        const t: i32 = @intFromFloat(@floor(thresh));
-        const m: u8 = sat.cast(u8, maxval);
-        var lut: [256]u8 = undefined;
-        for (&lut, 0..) |*l, i_| {
-            const i: i32 = @intCast(i_);
-            const v: u8 = @intCast(i_);
-            l.* = switch (kind) {
-                .binary => if (i > t) m else 0,
-                .binary_inv => if (i > t) 0 else m,
-                .trunc => if (i > t) sat.cast(u8, t) else v,
-                .tozero => if (i > t) v else 0,
-                .tozero_inv => if (i > t) 0 else v,
-            };
+        if (ti < 0 or ti >= 255) {
+            var lut: [256]u8 = undefined;
+            for (&lut, 0..) |*l, i_| {
+                const i: i32 = @intCast(i_);
+                const v: u8 = @intCast(i_);
+                l.* = switch (kind) {
+                    .binary => if (i > ti) m else 0,
+                    .binary_inv => if (i > ti) 0 else m,
+                    .trunc => if (i > ti) sat.cast(u8, ti) else v,
+                    .tozero => if (i > ti) v else 0,
+                    .tozero_inv => if (i > ti) 0 else v,
+                };
+            }
+            applyLut(exec, src, dst, &lut);
+            return thresh;
         }
-        if (t < 0 or t >= 255) {
-            // OpenCV special-cases out-of-range thresholds; the LUT covers it.
+    }
+    if (T != u8 and @typeInfo(T) == .int and @floor(thresh) < std.math.minInt(T)) {
+        // Every value is above the threshold; like OpenCV, trunc gives 0.
+        // (Thresholds above the range saturate to the maximum, which no value
+        // exceeds, so the general path handles them.)
+        switch (kind) {
+            .tozero => if (src.data != dst.data) dst.copyFrom(src),
+            .binary => dst.fill(m),
+            .binary_inv, .trunc, .tozero_inv => dst.fill(0),
         }
-        applyLut(exec, src, dst, &lut);
         return thresh;
     }
     const Ctx = struct { s: @TypeOf(src), d: @TypeOf(src), t: T, m: T, kind: Type };
-    const t: T = if (@typeInfo(T) == .float) @floatCast(thresh) else sat.cast(T, @floor(thresh));
-    const m: T = sat.cast(T, maxval);
-    exec.parallelFor(src.height, 16, Ctx{ .s = src, .d = dst, .t = t, .m = m, .kind = kind }, struct {
+    exec.parallelFor(src.height, @max(1, (1 << 15) / @max(1, src.rowLen())), Ctx{ .s = src, .d = dst, .t = t, .m = m, .kind = kind }, struct {
         fn run(c: Ctx, y0: usize, y1: usize) void {
-            for (y0..y1) |y| {
-                const s = c.s.row(y);
-                const d = c.d.row(y);
-                switch (c.kind) {
-                    inline else => |k| for (s, d) |v, *o| {
-                        o.* = switch (k) {
-                            .binary => if (v > c.t) c.m else 0,
-                            .binary_inv => if (v > c.t) 0 else c.m,
-                            .trunc => if (v > c.t) c.t else v,
-                            .tozero => if (v > c.t) v else 0,
-                            .tozero_inv => if (v > c.t) 0 else v,
-                        };
-                    },
-                }
+            switch (c.kind) {
+                inline else => |k| for (y0..y1) |y| threshRow(T, k, c.s.row(y), c.d.row(y), c.t, c.m),
             }
         }
     }.run);
     return thresh;
 }
 
+inline fn threshOne(comptime T: type, comptime k: Type, v: anytype, t: @TypeOf(v), m: @TypeOf(v)) @TypeOf(v) {
+    const V = @TypeOf(v);
+    const z: V = if (@typeInfo(V) == .vector) @splat(0) else 0;
+    const gt = v > t;
+    const sel = struct {
+        inline fn f(c: anytype, a: V, b: V) V {
+            return if (@typeInfo(V) == .vector) @select(T, c, a, b) else if (c) a else b;
+        }
+    }.f;
+    return switch (k) {
+        .binary => sel(gt, m, z),
+        .binary_inv => sel(gt, z, m),
+        .trunc => sel(gt, t, v),
+        .tozero => sel(gt, v, z),
+        .tozero_inv => sel(gt, z, v),
+    };
+}
+
+fn threshRow(comptime T: type, comptime k: Type, s: []const T, d: []T, t: T, m: T) void {
+    const N = simd.lanes(T);
+    const V = @Vector(N, T);
+    const vt: V = @splat(t);
+    const vm: V = @splat(m);
+    var i: usize = 0;
+    while (i + 2 * N <= s.len) : (i += 2 * N) {
+        const a: V = s[i..][0..N].*;
+        const b: V = s[i + N ..][0..N].*;
+        d[i..][0..N].* = threshOne(T, k, a, vt, vm);
+        d[i + N ..][0..N].* = threshOne(T, k, b, vt, vm);
+    }
+    while (i + N <= s.len) : (i += N) {
+        const a: V = s[i..][0..N].*;
+        d[i..][0..N].* = threshOne(T, k, a, vt, vm);
+    }
+    while (i < s.len) : (i += 1) d[i] = threshOne(T, k, s[i], t, m);
+}
+
 /// dst[i] = lut[src[i]] for 8-bit images (any channel count, same in/out).
 pub fn applyLut(exec: Exec, src: Image(u8), dst: Image(u8), lut: *const [256]u8) void {
     const Ctx = struct { s: Image(u8), d: Image(u8), lut: *const [256]u8 };
-    exec.parallelFor(src.height, 32, Ctx{ .s = src, .d = dst, .lut = lut }, struct {
+    exec.parallelFor(src.height, @max(1, (1 << 15) / @max(1, src.rowLen())), Ctx{ .s = src, .d = dst, .lut = lut }, struct {
         fn run(c: Ctx, y0: usize, y1: usize) void {
-            for (y0..y1) |y| for (c.s.row(y), c.d.row(y)) |v, *o| {
-                o.* = c.lut[v];
-            };
+            for (y0..y1) |y| lutRow(c.s.row(y), c.d.row(y), c.lut);
         }
     }.run);
 }
 
+fn lutRow(s: []const u8, d: []u8, lut: *const [256]u8) void {
+    var i: usize = 0;
+    // 8 bytes per load/store: the gathers are independent of each other.
+    while (i + 8 <= s.len) : (i += 8) {
+        const v = std.mem.readInt(u64, s[i..][0..8], .little);
+        var o: u64 = 0;
+        inline for (0..8) |j| o |= @as(u64, lut[@as(u8, @truncate(v >> (8 * j)))]) << (8 * j);
+        std.mem.writeInt(u64, d[i..][0..8], o, .little);
+    }
+    while (i < s.len) : (i += 1) d[i] = lut[s[i]];
+}
+
 pub fn histogram8(src: Image(u8), hist: *[256]u32) void {
-    // Four sub-histograms hide store-to-load dependencies on repeated values.
-    var h: [4][256]u32 = @splat(@splat(0));
-    for (0..src.height) |y| {
+    histRows(src, 0, src.height, hist);
+}
+
+/// histogram8, split over row bands when `exec` has threads.
+pub fn histogram8Exec(exec: Exec, src: Image(u8), hist: *[256]u32) void {
+    const bands = @min(exec.threads() * 2, 32, src.height / 32);
+    if (bands <= 1 or src.pixelCount() < 1 << 16) return histogram8(src, hist);
+    var parts: [32][256]u32 = undefined;
+    const Ctx = struct { s: Image(u8), parts: *[32][256]u32, bands: usize };
+    exec.parallelFor(bands, 1, Ctx{ .s = src, .parts = &parts, .bands = bands }, struct {
+        fn run(c: Ctx, b0: usize, b1: usize) void {
+            for (b0..b1) |b| {
+                c.parts[b] = @splat(0);
+                histRows(c.s, c.s.height * b / c.bands, c.s.height * (b + 1) / c.bands, &c.parts[b]);
+            }
+        }
+    }.run);
+    for (parts[0..bands]) |*p| for (hist, p) |*o, v| {
+        o.* += v;
+    };
+}
+
+fn histRows(src: Image(u8), y0: usize, y1: usize, hist: *[256]u32) void {
+    // Sub-histograms hide store-to-load dependencies on repeated values
+    // (common in natural images, where neighbours are often equal).
+    var h: [8][256]u32 = @splat(@splat(0));
+    for (y0..y1) |y| {
         const r = src.row(y);
         var i: usize = 0;
-        while (i + 4 <= r.len) : (i += 4) {
-            h[0][r[i]] += 1;
-            h[1][r[i + 1]] += 1;
-            h[2][r[i + 2]] += 1;
-            h[3][r[i + 3]] += 1;
+        while (i + 16 <= r.len) : (i += 16) {
+            const a = std.mem.readInt(u64, r[i..][0..8], .little);
+            const b = std.mem.readInt(u64, r[i + 8 ..][0..8], .little);
+            inline for (0..8) |j| {
+                h[j][@as(u8, @truncate(a >> (8 * j)))] += 1;
+                h[(j + 4) % 8][@as(u8, @truncate(b >> (8 * j)))] += 1;
+            }
         }
         while (i < r.len) : (i += 1) h[0][r[i]] += 1;
     }
-    for (hist, 0..) |*o, i| o.* += h[0][i] + h[1][i] + h[2][i] + h[3][i];
+    for (hist, 0..) |*o, i| {
+        var t: u32 = 0;
+        for (&h) |*sub| t += sub[i];
+        o.* += t;
+    }
 }
 
 /// Otsu's method, OpenCV's getThreshVal_Otsu_8u.

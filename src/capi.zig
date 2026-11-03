@@ -11,7 +11,9 @@ const codecs = visar.codecs;
 const Image = core.Image;
 const Depth = core.Depth;
 
-const gpa = if (builtin.cpu.arch.isWasm()) std.heap.wasm_allocator else std.heap.smp_allocator;
+/// The system allocator where libc is linked: it reuses freed blocks, where
+/// smp_allocator maps fresh pages (and page faults) for every large image.
+const gpa = if (builtin.cpu.arch.isWasm()) std.heap.wasm_allocator else if (builtin.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
 
 pub const CImage = extern struct {
     width: u32,

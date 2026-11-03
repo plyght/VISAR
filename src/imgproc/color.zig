@@ -240,16 +240,15 @@ inline fn reorderRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d
     const alpha: T = if (@typeInfo(T) == .float) 1.0 else std.math.maxInt(T);
     var x: usize = 0;
     if (T == u8) {
-        const ones: vec.V16 = @splat(255);
-        while (x + 16 <= width) : (x += 16) {
-            const ch = vec.load(inf.scn, s + x * inf.scn);
-            var out: [inf.dcn]vec.V16 = undefined;
-            out[0] = if (swap) ch[2] else ch[0];
-            out[1] = ch[1];
-            out[2] = if (swap) ch[0] else ch[2];
-            if (inf.dcn == 4) out[3] = if (inf.scn == 4) ch[3] else ones;
-            vec.store(inf.dcn, out, d + x * inf.dcn);
-        }
+        const map = comptime blk: {
+            var m: [inf.dcn]?u8 = undefined;
+            m[0] = if (swap) 2 else 0;
+            m[1] = 1;
+            m[2] = if (swap) 0 else 2;
+            if (inf.dcn == 4) m[3] = if (inf.scn == 4) 3 else null;
+            break :blk m;
+        };
+        while (x + 16 <= width) : (x += 16) vec.remap(inf.scn, inf.dcn, map, 255, s + x * inf.scn, d + x * inf.dcn);
     }
     while (x < width) : (x += 1) {
         const p = s + x * inf.scn;
