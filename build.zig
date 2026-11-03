@@ -73,13 +73,16 @@ pub fn build(b: *std.Build) void {
 
     // Unit tests.
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring") orelse &.{};
-    const tests = b.addTest(.{ .root_module = visar, .filters = test_filters });
+    // `-Duse-llvm`: Debug tests through LLVM instead of the self-hosted
+    // backend (as on Windows/macOS), which catches LLVM-only miscompiles.
+    const use_llvm = b.option(bool, "use-llvm", "Compile tests with the LLVM backend even in Debug") orelse null;
+    const tests = b.addTest(.{ .root_module = visar, .filters = test_filters, .use_llvm = use_llvm });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
-    const capi_tests = b.addTest(.{ .root_module = capi, .filters = test_filters });
+    const capi_tests = b.addTest(.{ .root_module = capi, .filters = test_filters, .use_llvm = use_llvm });
     test_step.dependOn(&b.addRunArtifact(capi_tests).step);
-    const cli_tests = b.addTest(.{ .root_module = cli, .filters = test_filters });
+    const cli_tests = b.addTest(.{ .root_module = cli, .filters = test_filters, .use_llvm = use_llvm });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
     // Differential tests against OpenCV (needs python3 with numpy and cv2).

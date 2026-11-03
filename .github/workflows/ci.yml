@@ -36,6 +36,8 @@ jobs:
         with:
           version: 0.17.0
       - run: zig build test -Dcpu=${{ matrix.cpu }} -Doptimize=ReleaseSafe --summary all
+      # Debug through LLVM (what Windows and macOS Debug use).
+      - run: zig build test -Dcpu=${{ matrix.cpu }} -Duse-llvm --summary all
 
   opencv-difftest:
     runs-on: ubuntu-latest

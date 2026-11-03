@@ -21,6 +21,7 @@
 //! as level 9), 2-9 = `std.compress.flate` LZ77 at that level.
 
 const std = @import("std");
+const simd = @import("../core/simd.zig");
 const common = @import("common.zig");
 const flate = std.compress.flate;
 
@@ -998,7 +999,7 @@ fn unfilter(comptime bpp: usize, ft: u8, cur: []u8, prev: []const u8) DecodeErro
                 const pc = @abs(a + b - c - c);
                 const bc = @select(i16, pb <= pc, b, c);
                 const pred = @select(i16, pa <= pb, @select(i16, pa <= pc, a, bc), bc);
-                const r = x +% @as(V8, @intCast(pred));
+                const r = x +% simd.narrow(u8, pred);
                 cur[i..][0..bpp].* = r;
                 a = r;
                 c = b;
