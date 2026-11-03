@@ -28,6 +28,11 @@ pub inline fn splat(comptime V: type, x: @typeInfo(V).vector.child) V {
 }
 
 /// Round half to even for f32 values already clamped to |x| < 2^22.
+const arm_cvt = @import("builtin").zig_backend == .stage2_llvm and @import("builtin").cpu.arch == .aarch64;
+extern fn @"llvm.aarch64.neon.fcvtns.v4i32.v4f32"(@Vector(4, f32)) @Vector(4, i32);
+extern fn @"llvm.aarch64.neon.sqxtun.v4i16"(@Vector(4, i32)) @Vector(4, u16);
+extern fn @"llvm.aarch64.neon.uqxtn.v8i8"(@Vector(8, u16)) @Vector(8, u8);
+
 pub inline fn rintSmall(v: anytype) @TypeOf(v) {
     const m: @TypeOf(v) = @splat(12582912.0);
     return (v + m) - m;
@@ -37,6 +42,26 @@ pub inline fn rintSmall(v: anytype) @TypeOf(v) {
 /// semantics (round half to even, clamp, NaN -> 0). `D` must be at most
 /// 16 bits wide so the clamped range is exactly representable.
 pub inline fn satF32(comptime D: type, comptime n: comptime_int, v: @Vector(n, f32)) @Vector(n, D) {
+    if (comptime arm_cvt and n % 4 == 0) {
+        // fcvtns rounds half to even and saturates (NaN -> 0) in one step;
+        // the clamp to D then lowers to saturating narrows.
+        const fv: [n]f32 = v;
+        var r: [n]i32 = undefined;
+        inline for (0..n / 4) |k| r[k * 4 ..][0..4].* = @"llvm.aarch64.neon.fcvtns.v4i32.v4f32"(fv[k * 4 ..][0..4].*);
+        if (D == u8 and n % 8 == 0) {
+            // sqxtun (i32 -> u16, saturating) then uqxtn (u16 -> u8).
+            var o: [n]u8 = undefined;
+            inline for (0..n / 8) |k| {
+                const a = @"llvm.aarch64.neon.sqxtun.v4i16"(r[k * 8 ..][0..4].*);
+                const b = @"llvm.aarch64.neon.sqxtun.v4i16"(r[k * 8 + 4 ..][0..4].*);
+                o[k * 8 ..][0..8].* = @"llvm.aarch64.neon.uqxtn.v8i8"(std.simd.join(a, b));
+            }
+            return o;
+        }
+        const lo: @Vector(n, i32) = @splat(std.math.minInt(D));
+        const hi: @Vector(n, i32) = @splat(std.math.maxInt(D));
+        return narrow(D, @min(@max(@as(@Vector(n, i32), r), lo), hi));
+    }
     const lo: @Vector(n, f32) = @splat(@floatFromInt(std.math.minInt(D)));
     const hi: @Vector(n, f32) = @splat(@floatFromInt(std.math.maxInt(D)));
     // @max/@min return the non-NaN operand, so NaN clamps to the low bound
