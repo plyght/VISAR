@@ -19,7 +19,23 @@ jobs:
           version: 0.17.0
       - run: zig fmt --check src build.zig
       - run: zig build test --summary all
+      # Release builds go through LLVM's optimizer, where vector-lowering
+      # bugs show up that Debug (self-hosted backend on Linux) never sees.
+      - run: zig build test -Doptimize=ReleaseSafe --summary all
       - run: zig build -Doptimize=ReleaseSafe
+
+  cpu-levels:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [x86_64, x86_64_v2, x86_64_v3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test -Dcpu=${{ matrix.cpu }} -Doptimize=ReleaseSafe --summary all
 
   opencv-difftest:
     runs-on: ubuntu-latest

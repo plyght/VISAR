@@ -4,6 +4,7 @@
 //! on all 8 rows or columns at once as an 8-lane i32 vector.
 
 const std = @import("std");
+const simd = @import("../../core/simd.zig");
 
 pub const V = @Vector(8, i32);
 
@@ -167,7 +168,7 @@ inline fn concat(a: V, b: V) V16 {
 
 inline fn toU8(comptime L: usize, v: @Vector(L, i32)) @Vector(L, u8) {
     const T = @Vector(L, i32);
-    return @intCast(@min(@max(v +% @as(T, @splat(128)), @as(T, @splat(0))), @as(T, @splat(255))));
+    return simd.narrow(u8, @min(@max(v +% @as(T, @splat(128)), @as(T, @splat(0))), @as(T, @splat(255))));
 }
 
 /// IDCT of a block whose only non-zero coefficient is the (dequantized) DC.

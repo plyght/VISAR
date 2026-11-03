@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const core = @import("../core/core.zig");
+const simd = core.simd;
 const Image = core.Image;
 const Exec = core.Exec;
 const sat = core.sat;
@@ -543,7 +544,7 @@ inline fn roundU8(v: @Vector(16, f32)) vec.V16 {
         )
     else
         @intFromFloat(@min(@max(sat.rint(v), @as(@Vector(16, f32), @splat(-1.0))), @as(@Vector(16, f32), @splat(256.0))));
-    return @intCast(@min(@max(q, @as(I, @splat(0))), @as(I, @splat(255))));
+    return simd.narrow(u8, @min(@max(q, @as(I, @splat(0))), @as(I, @splat(255))));
 }
 
 fn up2VCubic(comptime R: usize, comptime cn: usize, r: [4]Planar(f32), b: [R][4]i32, d: [R][]u8) void {

@@ -54,7 +54,7 @@ inline fn satV(comptime D: type, comptime N: usize, v: anytype) @Vector(N, D) {
     }
     const W = if (@bitSizeOf(S) > @bitSizeOf(D)) S else i64;
     const w: @Vector(N, W) = v;
-    return @intCast(@min(@max(w, @as(@Vector(N, W), @splat(lo))), @as(@Vector(N, W), @splat(hi))));
+    return core.simd.narrow(D, @min(@max(w, @as(@Vector(N, W), @splat(lo))), @as(@Vector(N, W), @splat(hi))));
 }
 
 /// Finish kinds: plain saturating cast, scaled (f32 multiply), u8 fixed point.

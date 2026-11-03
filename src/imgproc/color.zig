@@ -226,9 +226,9 @@ inline fn ycrcbU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
         const lo: I = @splat(0);
         const hi: I = @splat(255);
         vec.store(3, .{
-            @intCast(@min(@max(y_, lo), hi)),
-            @intCast(@min(@max(cr, lo), hi)),
-            @intCast(@min(@max(cb, lo), hi)),
+            vec.narrowU8(16, @min(@max(y_, lo), hi)),
+            vec.narrowU8(16, @min(@max(cr, lo), hi)),
+            vec.narrowU8(16, @min(@max(cb, lo), hi)),
         }, d + x * 3);
     }
     return x;
@@ -358,7 +358,7 @@ inline fn hsvU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [*]
         var h = (vr & (g - b)) + (~vr & ((vg & (b - r + diff + diff)) + (~vg & (r - g + @as(I, @splat(4)) * diff))));
         h = (h * hdivV(diff) + half) >> @splat(hsv_shift);
         h += @select(i32, h < zero, @as(I, @splat(180)), zero);
-        vec.store(3, .{ @intCast(h), @intCast(sat_), @intCast(v) }, d + x * 3);
+        vec.store(3, .{ vec.narrowU8(16, h), vec.narrowU8(16, sat_), vec.narrowU8(16, v) }, d + x * 3);
     }
     return x;
 }

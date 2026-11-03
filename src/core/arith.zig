@@ -153,7 +153,7 @@ inline fn identityVec(comptime S: type, comptime D: type, comptime n: comptime_i
     const w: @Vector(n, i32) = v;
     const lo: @Vector(n, i32) = @splat(std.math.minInt(D));
     const hi: @Vector(n, i32) = @splat(std.math.maxInt(D));
-    return @intCast(@min(@max(w, lo), hi));
+    return simd.narrow(D, @min(@max(w, lo), hi));
 }
 
 /// dst = saturate_u8(|src * alpha + beta|)
@@ -235,7 +235,7 @@ pub fn sum(src: anytype) [4]f64 {
             var acc: [4]u64 = @splat(0);
             var iacc: [4]i64 = @splat(0);
             for (r, 0..) |v, i| {
-                if (@typeInfo(T).int.signedness == .unsigned) acc[i % cn % 4] += v else iacc[i % cn % 4] += v;
+                if (@typeInfo(T).int.signedness == .unsigned) acc[(i % cn) % 4] += v else iacc[(i % cn) % 4] += v;
             }
             for (0..@min(cn, 4)) |ch| out[ch] += @as(f64, @floatFromInt(acc[ch])) + @as(f64, @floatFromInt(iacc[ch]));
         } else {

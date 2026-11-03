@@ -43,8 +43,29 @@ pub inline fn satF32(comptime D: type, comptime n: comptime_int, v: @Vector(n, f
     // first; fix it to 0 explicitly when 0 is not the low bound.
     var c = @min(@max(v, lo), hi);
     if (std.math.minInt(D) != 0) c = @select(f32, v == v, c, @as(@Vector(n, f32), @splat(0)));
+    // Unsigned results go through u32: LLVM (Zig 0.17, AVX2 without
+    // AVX-512) can lower i32 -> u8 to signed packs, turning 150 into 127.
+    if (std.math.minInt(D) == 0) {
+        const u: @Vector(n, u32) = @intFromFloat(rintSmall(c));
+        return @intCast(u);
+    }
     const r: @Vector(n, i32) = @intFromFloat(rintSmall(c));
     return @intCast(r);
+}
+
+/// Narrows integer lanes that are already within `D`'s range. For unsigned
+/// `D` the value goes through the unsigned type of the source width: LLVM
+/// (Zig 0.17, AVX2 without AVX-512) can lower a signed -> u8 narrowing to
+/// signed packs, turning 150 into 127.
+pub inline fn narrow(comptime D: type, v: anytype) @Vector(@typeInfo(@TypeOf(v)).vector.len, D) {
+    const n = @typeInfo(@TypeOf(v)).vector.len;
+    const S = @typeInfo(@TypeOf(v)).vector.child;
+    if (@typeInfo(D).int.signedness == .unsigned and @typeInfo(S).int.signedness == .signed) {
+        const U = @Int(.unsigned, @bitSizeOf(S));
+        const u: @Vector(n, U) = @bitCast(v);
+        return @intCast(u);
+    }
+    return @intCast(v);
 }
 
 /// Widens integer or float lanes to f32.
@@ -64,4 +85,17 @@ test "satF32" {
     try std.testing.expectEqual(@Vector(8, u8){ 0, 0, 2, 2, 254, 255, 255, 0 }, r);
     const s = satF32(i16, 8, v * @as(@Vector(8, f32), @splat(-200)));
     try std.testing.expectEqual(@Vector(8, i16){ 200, -100, -300, -500, -32768, -32768, -32768, 0 }, s);
+}
+
+test "narrow via unsigned (AVX2 miscompile regression)" {
+    // 32 lanes of f32 -> i32 -> u8 is the shape LLVM got wrong.
+    var x: @Vector(32, f32) = @splat(150);
+    _ = &x;
+    const r = satF32(u8, 32, x);
+    const arr: [32]u8 = r;
+    for (arr) |v| try std.testing.expectEqual(@as(u8, 150), v);
+    var w: @Vector(32, i32) = @splat(200);
+    _ = &w;
+    const q: [32]u8 = narrow(u8, w);
+    for (q) |v| try std.testing.expectEqual(@as(u8, 200), v);
 }

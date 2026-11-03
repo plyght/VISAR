@@ -23,6 +23,14 @@ pub inline fn opaqueV(v: V16) V16 {
     };
 }
 
+/// Narrows i32 lanes already in [0, 255] to u8. Goes through u32 because
+/// LLVM (Zig 0.17, AVX2 without AVX-512) can lower a direct i32 -> u8
+/// narrowing to signed packs, turning 150 into 127.
+pub inline fn narrowU8(comptime n: usize, v: @Vector(n, i32)) @Vector(n, u8) {
+    const u: @Vector(n, u32) = @bitCast(v);
+    return @intCast(u);
+}
+
 /// Shuffle masks that gather `src(i)` (an index into `nblocks` 16-byte
 /// blocks) for each output lane i, as a chain of two-input shuffles:
 /// step 0 combines blocks 0 and 1, step j>0 combines the running result

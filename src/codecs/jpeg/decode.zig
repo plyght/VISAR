@@ -12,6 +12,7 @@
 //! coefficient buffer first and then output through the same row pipeline.
 
 const std = @import("std");
+const simd = @import("../../core/simd.zig");
 const builtin = @import("builtin");
 const common = @import("../common.zig");
 const tables = @import("tables.zig");
@@ -1216,7 +1217,7 @@ inline fn store3(out: []u8, a: U16, b: U16, c: U16) void {
 }
 
 inline fn clampU8(v: VI) U16 {
-    return @intCast(@min(@max(v, @as(VI, @splat(0))), @as(VI, @splat(255))));
+    return simd.narrow(u8, @min(@max(v, @as(VI, @splat(0))), @as(VI, @splat(255))));
 }
 
 /// (a * b) >> 16 per lane (pmulhw).
@@ -1243,7 +1244,7 @@ inline fn yccVec(y: V16, cb: V16, cr: V16) [3]U16 {
 }
 
 inline fn sat8(v: V16) U16 {
-    return @intCast(@min(@max(v, @as(V16, @splat(0))), @as(V16, @splat(255))));
+    return simd.narrow(u8, @min(@max(v, @as(V16, @splat(0))), @as(V16, @splat(255))));
 }
 
 fn yccRow(comptime bgr: bool, yp: [*]const u8, cbp: [*]const u8, crp: [*]const u8, out: []u8, w: usize) void {
