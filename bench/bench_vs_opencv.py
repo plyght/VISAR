@@ -22,7 +22,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "py"))
 import visar_ctypes as vs  # noqa: E402
-from test_vs_opencv import natural  # noqa: E402
+from test_core_vs_opencv import natural  # noqa: E402
 
 
 def timeit_pair(a, b, min_time=0.4, max_rounds=400):

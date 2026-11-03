@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
     // Differential tests against OpenCV (needs python3 with numpy and cv2).
-    const difftest = b.addSystemCommand(&.{ "python3", "tests/py/test_vs_opencv.py", "--lib" });
+    const difftest = b.addSystemCommand(&.{ "python3", "tests/py/run_all.py", "--lib" });
     difftest.addArtifactArg(shared);
     b.step("difftest", "Compare against OpenCV (python3 + cv2)").dependOn(&difftest.step);
 
