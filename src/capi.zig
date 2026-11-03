@@ -200,6 +200,24 @@ export fn visar_sobel(src: *const CImage, dst: *const CImage, dx: c_int, dy: c_i
     }.f));
 }
 
+export fn visar_pyr_down(src: *const CImage, dst: *const CImage, b: c_int) c_int {
+    const bd = border(b) catch |e| return fail(e);
+    return run(dispatch(src, .{ dst, bd }, struct {
+        fn f(comptime T: type, a: anytype, s: Image(T)) !void {
+            return ip.pyrDown(exec(), gpa, s, try typed(T, a[0]), a[1]);
+        }
+    }.f));
+}
+
+export fn visar_pyr_up(src: *const CImage, dst: *const CImage, b: c_int) c_int {
+    const bd = border(b) catch |e| return fail(e);
+    return run(dispatch(src, .{ dst, bd }, struct {
+        fn f(comptime T: type, a: anytype, s: Image(T)) !void {
+            return ip.pyrUp(exec(), gpa, s, try typed(T, a[0]), a[1]);
+        }
+    }.f));
+}
+
 /// `type` uses OpenCV's encoding: 0-4 plus THRESH_OTSU (8) or THRESH_TRIANGLE (16).
 export fn visar_threshold(src: *const CImage, dst: *const CImage, thresh: f64, maxval: f64, kind: c_int, used: ?*f64) c_int {
     const k = std.enums.fromInt(ip.ThresholdType, kind & 7) orelse return fail(error.Unsupported);

@@ -124,6 +124,18 @@ def sobel(a, ddepth, dx, dy, ksize=3, scale=1.0, border=4, dst=None):
     return dst
 
 
+def pyr_down(a, border=4, dst=None):
+    dst = _out(_shape(a, w=(a.shape[1] + 1) // 2, h=(a.shape[0] + 1) // 2), a.dtype) if dst is None else dst
+    _check(lib.visar_pyr_down(ctypes.byref(desc(a)), ctypes.byref(desc(dst)), border))
+    return dst
+
+
+def pyr_up(a, border=4, dst=None):
+    dst = _out(_shape(a, w=a.shape[1] * 2, h=a.shape[0] * 2), a.dtype) if dst is None else dst
+    _check(lib.visar_pyr_up(ctypes.byref(desc(a)), ctypes.byref(desc(dst)), border))
+    return dst
+
+
 def threshold(a, thresh, maxval, kind, dst=None):
     dst = np.empty_like(a) if dst is None else dst
     used = ctypes.c_double(0)
