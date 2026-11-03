@@ -1,0 +1,84 @@
+name: release
+
+# Stable releases on v* tags, and a rolling "nightly" pre-release rebuilt
+# from every push to main (install.sh falls back to it while there is no
+# stable release). Every binary is cross-compiled from Linux: VISAR needs no
+# SDK, and macOS frameworks (camera, window) are loaded at run time.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Version
+        id: v
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"; else echo "tag=nightly" >> "$GITHUB_OUTPUT"; fi
+      - name: Build release binaries
+        run: |
+          set -euo pipefail
+          tag="${{ steps.v.outputs.tag }}"
+          mkdir -p dist
+          # "<target>[:<cpu>]": aarch64 already has NEON in its baseline; the
+          # x86-64 targets also get an AVX2 (-v3) build.
+          for spec in aarch64-macos x86_64-macos x86_64-macos:x86_64_v3 \
+                      x86_64-linux-musl x86_64-linux-musl:x86_64_v3 aarch64-linux-musl \
+                      x86_64-windows-gnu x86_64-windows-gnu:x86_64_v3; do
+            t="${spec%%:*}"
+            cpu="${spec#*:}"
+            if [ "$cpu" = "$spec" ]; then
+              zig build -Doptimize=ReleaseFast -Dtarget="$t" --prefix "zig-out/$spec"
+              name="visar-${tag}-${t}"
+            else
+              zig build -Doptimize=ReleaseFast -Dtarget="$t" -Dcpu="$cpu" --prefix "zig-out/$spec"
+              name="visar-${tag}-${t}-v3"
+            fi
+            staging="dist/$name"
+            mkdir -p "$staging"
+            cp README.md LICENSE "$staging/"
+            case "$t" in
+              *windows*)
+                cp "zig-out/$spec/bin/visar.exe" "$staging/"
+                (cd dist && zip -qr "$name.zip" "$name")
+                ;;
+              *)
+                cp "zig-out/$spec/bin/visar" "$staging/"
+                tar -C dist -czf "dist/$name.tar.gz" "$name"
+                ;;
+            esac
+            rm -rf "$staging"
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -la dist
+      - name: Replace the nightly pre-release
+        if: steps.v.outputs.tag == 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --prerelease --target "$GITHUB_SHA" --title "Nightly (${GITHUB_SHA::7})" \
+            --notes "Built from ${GITHUB_SHA} on main. Install: curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh"
+      - name: Publish the tagged release
+        if: steps.v.outputs.tag != 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.v.outputs.tag }}" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --title "VISAR ${{ steps.v.outputs.tag }}" --generate-notes
