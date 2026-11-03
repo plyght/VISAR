@@ -22,7 +22,7 @@ See [PRD.md](PRD.md) for the full scope and roadmap. VISAR is early: the roadmap
 | imgproc | `cvtColor` (gray, BGR/RGB/A reorders, HSV, YCrCb), resize (nearest, linear, area, cubic), Gaussian/box/Sobel/Scharr/separable filters, threshold (incl. Otsu, triangle), `inRange`, morphology (all `morphologyEx` ops and element shapes), flip/rotate/transpose, `warpAffine`/`warpPerspective`, `copyMakeBorder`, `equalizeHist`, `integral`, `connectedComponentsWithStats`, drawing |
 | Codecs | PNG (all colour types and depths, Adam7; custom inflate), JPEG (in progress), QOI, PNM/PAM, BMP (incl. RLE), animated GIF (encode) |
 | Video | Background subtraction, multi-object tracker |
-| Interfaces | Zig module, C ABI, `visar` CLI |
+| Interfaces | Zig module, C ABI, `visar` CLI (clig.dev-style: JSON output, helpful errors, pipelines, bench, demos) |
 
 ## Build
 
@@ -35,6 +35,26 @@ zig build difftest -Doptimize=ReleaseSafe # compare against OpenCV (needs python
 zig build bench -Doptimize=ReleaseFast -- --threads 1   # speed vs OpenCV
 zig build demo-track -Doptimize=ReleaseFast -- --out track.gif
 ```
+
+## Command line
+
+```console
+$ visar inspect photo.png photo.jpg
+FILE       FORMAT     SIZE  CHANNELS  DEPTH     BYTES
+─────────  ──────  ───────  ────────  ─────  ────────
+photo.png  png     480x270  3 RGB     u8     33.2 KiB
+photo.jpg  jpeg    480x270  3 RGB     u8     49.9 KiB
+
+$ visar resize photo.png thumb.png 320x
+  ✓ thumb.png  320×180 RGB 8-bit · PNG 72.9 KiB · 22.76 ms · area
+
+$ visar pipeline scan.jpg mask.png -- gray , blur --sigma 1.5 , threshold --otsu , morph open
+$ cat photo.png | visar gray - - --format png | visar inspect -
+$ visar demo track --out track.gif          # the demo above, on your machine
+$ visar bench --filter blur,resize          # time the kernels on this CPU
+```
+
+Commands: `info`, `inspect`, `convert`, `resize`, `rotate`, `flip`, `gray`, `blur`, `threshold`, `edges`, `equalize`, `morph`, `pipeline`, `bench`, `demo`. Every command takes `--json`, `--threads`, `-q` and `-v`. Errors come with a hint, and mistyped commands, options and file names get a "did you mean". An existing output file is never overwritten without `-f`. Run `visar help <command>` for examples.
 
 ## Use from Zig
 
