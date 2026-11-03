@@ -537,6 +537,12 @@ fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, bor
     const ry: usize = kh / 2;
     const col_buf = try gpa.alloc(A, n + 2 * rx * cn);
     defer gpa.free(col_buf);
+    // Wide windows: wrapping prefix sums along the row (per channel), so a
+    // window is pre[x + kw*cn] - pre[x] whatever kw. Exact because every
+    // window sum fits A.
+    const use_prefix = kw >= 5 and cn <= 4;
+    const pre = try gpa.alloc(A, if (use_prefix) col_buf.len + cn else 0);
+    defer gpa.free(pre);
     const col = col_buf[rx * cn ..][0..n];
     const N = comptime lanes(A);
     const VA = @Vector(N, A);
@@ -589,6 +595,18 @@ fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, bor
             @memcpy(col_buf[i * cn ..][0..cn], col[lx * cn ..][0..cn]);
             @memcpy(col_buf[(rx + s.width + i) * cn ..][0..cn], col[rxx * cn ..][0..cn]);
         }
+        if (use_prefix) switch (cn) {
+            inline 1, 2, 3, 4 => |k| prefixRow(A, k, col_buf, pre),
+            else => unreachable,
+        };
+        const win = struct {
+            inline fn f(comptime M: usize, cb: []const A, p: []const A, pf: bool, kw_: usize, cn_: usize, x0: usize) @Vector(M, A) {
+                if (pf) return @as(@Vector(M, A), p[x0 + kw_ * cn_ ..][0..M].*) -% @as(@Vector(M, A), p[x0..][0..M].*);
+                var total: @Vector(M, A) = cb[x0..][0..M].*;
+                for (1..kw_) |i| total += cb[x0 + i * cn_ ..][0..M].*;
+                return total;
+            }
+        }.f;
         const out = d.row(y);
         var x: usize = 0;
         // Integer scaling when it reproduces the f32 result for every sum.
@@ -596,8 +614,7 @@ fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, bor
             const M: VA = @splat(int_scale.?);
             const one: VA = @splat(1);
             while (x + N <= n) : (x += N) {
-                var sum: VA = col_buf[x..][0..N].*;
-                for (1..kw) |i| sum += col_buf[x + i * cn ..][0..N].*;
+                const sum: VA = win(N, col_buf, pre, use_prefix, kw, cn, x);
                 const hi: VA = @intCast((@as(@Vector(N, u32), sum) * @as(@Vector(N, u32), M)) >> @splat(16));
                 out[x..][0..N].* = @as(@Vector(N, u8), @intCast(@min((hi + one) >> @splat(1), @as(VA, @splat(255)))));
             }
@@ -605,8 +622,7 @@ fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, bor
         // Sum in full-width lanes of A, then scale in f32 halves.
         if (N == 2 * NF) {
             while (x + N <= n) : (x += N) {
-                var sum: VA = col_buf[x..][0..N].*;
-                for (1..kw) |i| sum += col_buf[x + i * cn ..][0..N].*;
+                const sum: VA = win(N, col_buf, pre, use_prefix, kw, cn, x);
                 const arr: [N]A = sum;
                 const lo: @Vector(NF, A) = arr[0..NF].*;
                 const hi: @Vector(NF, A) = arr[NF..N].*;
@@ -615,8 +631,7 @@ fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, bor
             }
         }
         while (x + NF <= n) : (x += NF) {
-            var sum: @Vector(NF, A) = col_buf[x..][0..NF].*;
-            for (1..kw) |i| sum += col_buf[x + i * cn ..][0..NF].*;
+            const sum = win(NF, col_buf, pre, use_prefix, kw, cn, x);
             out[x..][0..NF].* = satV(u8, NF, cvtV(f32, NF, sum) * sc);
         }
         while (x < n) : (x += 1) {
@@ -625,6 +640,41 @@ fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, bor
             out[x] = sat.cast(u8, @as(f32, @floatFromInt(sum)) * scs);
         }
     }
+}
+
+/// Inclusive prefix sums of `src` per channel (stride cn), wrapping, into
+/// pre[cn..]; pre[0..cn] = 0, so sum(src[x + i*cn], i < k) =
+/// pre[x + k*cn] - pre[x].
+fn prefixRow(comptime A: type, comptime cn: usize, src: []const A, pre: []A) void {
+    const N = comptime lanes(A);
+    const V = @Vector(N, A);
+    const zero: V = @splat(0);
+    // For lane i, the lane of the previous vector holding the same channel's
+    // running total (the last one before this vector).
+    const carry_mask = comptime blk: {
+        var m: [N]i32 = undefined;
+        for (0..N) |i| m[i] = @intCast(N + i - cn * (i / cn + 1));
+        break :blk m;
+    };
+    @memset(pre[0..cn], 0);
+    var prev: V = zero;
+    var x: usize = 0;
+    while (x + N <= src.len) : (x += N) {
+        var v: V = src[x..][0..N].*;
+        comptime var k = cn;
+        inline while (k < N) : (k *= 2) {
+            const m = comptime blk: {
+                var mm: [N]i32 = undefined;
+                for (0..N) |i| mm[i] = if (i >= k) @intCast(i - k) else -1;
+                break :blk mm;
+            };
+            v +%= @shuffle(A, v, zero, m);
+        }
+        v +%= @shuffle(A, prev, undefined, carry_mask);
+        pre[cn + x ..][0..N].* = v;
+        prev = v;
+    }
+    while (x < src.len) : (x += 1) pre[cn + x] = pre[x] +% src[x];
 }
 
 /// blur(): normalised box filter.
@@ -758,4 +808,32 @@ test "sobel kernels" {
     var k5: [5]i32 = undefined;
     try derivKernel(&k5, 1, 5);
     try std.testing.expectEqualSlices(i32, &.{ -1, -2, 0, 2, 1 }, &k5);
+}
+
+test "box filter: prefix-sum and direct windows match a naive sum" {
+    const gpa = std.testing.allocator;
+    inline for (.{ 1, 2, 3, 4 }) |cn| {
+        var src = try Image(u8).init(gpa, 67, 23, cn);
+        defer src.deinit(gpa);
+        var seed: u32 = 99;
+        for (src.slice()) |*v| {
+            seed = seed *% 1103515245 +% 12345;
+            v.* = @truncate(seed >> 16);
+        }
+        for ([_][2]u32{ .{ 3, 3 }, .{ 5, 5 }, .{ 7, 3 }, .{ 9, 1 }, .{ 15, 15 }, .{ 31, 31 }, .{ 1, 9 } }) |k| {
+            var dst = try Image(u8).init(gpa, 67, 23, cn);
+            defer dst.deinit(gpa);
+            try boxFilter(.serial, gpa, src, dst, .{ .kw = k[0], .kh = k[1] });
+            const scale: f32 = @floatCast(1.0 / @as(f64, @floatFromInt(k[0] * k[1])));
+            for (0..23) |y| for (0..67) |x| for (0..cn) |ch| {
+                var total: u32 = 0;
+                for (0..k[1]) |j| for (0..k[0]) |i| {
+                    const sy = border_mod.map(@as(isize, @intCast(y + j)) - @as(isize, @intCast(k[1] / 2)), 23, .reflect101).?;
+                    const sx = border_mod.map(@as(isize, @intCast(x + i)) - @as(isize, @intCast(k[0] / 2)), 67, .reflect101).?;
+                    total += src.row(sy)[sx * cn + ch];
+                };
+                try std.testing.expectEqual(sat.cast(u8, @as(f32, @floatFromInt(total)) * scale), dst.row(y)[x * cn + ch]);
+            };
+        }
+    }
 }
