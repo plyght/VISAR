@@ -6,6 +6,7 @@
 //!   args.zig      argument parser   term.zig    colour, tables, progress
 //!   ctx.zig       shared context    imageio.zig reading and writing images
 //!   ops.zig       image operations  cmd_*.zig   the commands
+//!   cmd_track.zig live tracking (camera, window, threads)
 //!
 //! Exit codes: 0 success, 1 runtime failure, 2 usage error.
 
@@ -273,6 +274,7 @@ test {
     _ = @import("cmd_image.zig");
     _ = @import("cmd_bench.zig");
     _ = @import("cmd_demo.zig");
+    _ = @import("cmd_track.zig");
     _ = cmd_info;
 }
 

@@ -11,6 +11,7 @@ const cmd_info = @import("cmd_info.zig");
 const cmd_image = @import("cmd_image.zig");
 const cmd_bench = @import("cmd_bench.zig");
 const cmd_demo = @import("cmd_demo.zig");
+const cmd_track = @import("cmd_track.zig");
 
 pub const tagline = "computer vision in pure Zig";
 pub const about = "Inspect, convert and process images with VISAR, a dependency-free computer-vision library.";
@@ -280,6 +281,23 @@ pub const list = [_]Command{
         .opts = &cmd_demo.opts,
         .writes = true,
         .run = cmd_demo.run,
+    },
+    .{
+        .name = "track",
+        .group = .tools,
+        .summary = "Live object tracking from the camera, in a window with IDs, trails and FPS",
+        .usage = &.{ "track [--camera N] [--size WxH] [--fps N] [--detect-width N] [--record FILE]", "track --source synthetic [--headless] [--frames N] [--json]", "track --list-cameras [--json]" },
+        .about = "Opens the camera and a window showing it live, with every moving object boxed, numbered and trailed. The pipeline is the one of 'visar demo track' (gray, blur, background subtraction, morphology, connected components, tracker), run on a worker thread at --detect-width while the camera captures and the window shows the previous result. The HUD shows the camera's frame rate, VISAR's time per frame (and the rate that allows) and the display rate. The camera format with the highest frame rate at or below --size is chosen; --list-cameras shows what each camera offers. On first use macOS asks whether your terminal may use the camera. --source synthetic tracks the demo's generated scene instead, on any platform; --headless prints stats instead of opening a window.",
+        .examples = &.{
+            .{ .cmd = "visar track", .note = "the default camera, in a window" },
+            .{ .cmd = "visar track --list-cameras", .note = "sizes and frame rates of every camera (can it do 120 fps?)" },
+            .{ .cmd = "visar track --size 640x480 --fps 60", .note = "a smaller, faster format" },
+            .{ .cmd = "visar track --source synthetic --headless --frames 600 --json", .note = "measure VISAR's throughput anywhere" },
+            .{ .cmd = "visar track --frames 300 --record clip.gif", .note = "save what the window showed" },
+        },
+        .opts = &cmd_track.opts,
+        .writes = true,
+        .run = cmd_track.run,
     },
 };
 

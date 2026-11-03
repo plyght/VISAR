@@ -66,6 +66,7 @@ jobs:
           - aarch64-linux-musl
           - x86_64-windows-gnu
           - aarch64-macos
+          - x86_64-macos
           - riscv64-linux-musl
           - wasm32-wasi
     steps:
@@ -84,3 +85,80 @@ jobs:
         with:
           version: master
       - run: zig build test --summary all
+
+  # `visar track` for real on a Mac: AVFoundation device discovery (runners
+  # have no camera), the camera path failing cleanly, the AppKit window
+  # (screenshot uploaded as an artifact) and the pipeline's throughput.
+  macos-track:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build -Doptimize=ReleaseFast
+      - name: List cameras (none on a runner; must exit 0)
+        run: |
+          ./zig-out/bin/visar track --list-cameras | tee cameras.txt
+          ./zig-out/bin/visar track --list-cameras --json | tee cameras.json
+      - name: Camera without a camera fails cleanly (exit 1, no crash)
+        run: |
+          set +e
+          ./zig-out/bin/visar track --headless --frames 10 > nocam.txt 2>&1
+          code=$?
+          cat nocam.txt
+          test "$code" -eq 1
+      - name: Synthetic source, headless, 1280x720
+        run: |
+          ./zig-out/bin/visar track --source synthetic --headless --frames 600 --json > headless.json
+          cat headless.json
+      - name: Synthetic source with two MOSSE locks
+        run: |
+          ./zig-out/bin/visar track --source synthetic --headless --frames 600 --lock 602,481,123,48 --lock 129,514,63,63 --json > locks.json
+          cat locks.json
+      - name: Window (AppKit) with a screenshot
+        run: |
+          ./zig-out/bin/visar track --source synthetic --frames 240 --fps 30 --lock 602,481,123,48 --json > window.json 2> window.err &
+          pid=$!
+          sleep 3
+          screencapture -x shot.png || echo "screencapture failed"
+          code=0
+          wait "$pid" || code=$?
+          cat window.err window.json
+          test -s shot.png
+          exit "$code"
+      - name: x86_64 build under Rosetta
+        continue-on-error: true
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos --prefix x86
+          file x86/bin/visar
+          x86/bin/visar track --list-cameras
+          x86/bin/visar track --source synthetic --headless --frames 300 -q --json > x86.json
+          x86/bin/visar track --source synthetic --frames 60 --fps 30 -q
+          cat x86.json
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### visar track on macOS ($(uname -m), $(sw_vers -productVersion))"
+            echo
+            echo "#### Cameras"
+            echo '```'
+            cat cameras.txt 2>/dev/null
+            echo '```'
+            for f in headless locks window x86; do
+              if [ -s "$f.json" ]; then
+                echo "#### $f"
+                echo '```json'
+                cat "$f.json"
+                echo '```'
+              fi
+            done
+            echo "The window screenshot is attached as the artifact 'visar-track-window'."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: visar-track-window
+          path: shot.png
+          if-no-files-found: warn
