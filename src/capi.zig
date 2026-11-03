@@ -318,6 +318,106 @@ export fn visar_connected_components(src: *const CImage, labels: *const CImage, 
     return 0;
 }
 
+// -------------------------------------------------------------- contours
+
+/// Variable-length contour output, owned by VISAR until visar_contours_free.
+pub const CContours = extern struct {
+    count: usize,
+    total: usize,
+    points: ?[*]i32,
+    starts: ?[*]usize,
+    hierarchy: ?[*]i32,
+};
+
+/// findContours. mode: RETR_EXTERNAL 0, LIST 1, CCOMP 2, TREE 3; method:
+/// CHAIN_APPROX_NONE 1, SIMPLE 2, TC89_L1 3, TC89_KCOS 4.
+export fn visar_find_contours(src: *const CImage, mode: c_int, method: c_int, ox: c_int, oy: c_int, out: *CContours) c_int {
+    out.* = .{ .count = 0, .total = 0, .points = null, .starts = null, .hierarchy = null };
+    const s = typed(u8, src) catch |e| return fail(e);
+    const m = std.enums.fromInt(ip.ContourMode, mode) orelse return fail(error.Unsupported);
+    const a = std.enums.fromInt(ip.ContourMethod, method) orelse return fail(error.Unsupported);
+    const c = ip.findContours(gpa, s, m, a, .{ .x = ox, .y = oy }) catch |e| return fail(e);
+    if (c.len() == 0) return 0;
+    out.* = .{
+        .count = c.len(),
+        .total = c.points.len,
+        .points = @ptrCast(c.points.ptr),
+        .starts = c.starts.ptr,
+        .hierarchy = @ptrCast(c.hierarchy.ptr),
+    };
+    return 0;
+}
+
+export fn visar_contours_free(c: *CContours) void {
+    if (c.count != 0) {
+        var r: ip.Contours = .{
+            .points = @as([*]ip.Point, @ptrCast(c.points.?))[0..c.total],
+            .starts = c.starts.?[0 .. c.count + 1],
+            .hierarchy = @as([*][4]i32, @ptrCast(c.hierarchy.?))[0..c.count],
+        };
+        r.deinit(gpa);
+    }
+    c.* = .{ .count = 0, .total = 0, .points = null, .starts = null, .hierarchy = null };
+}
+
+fn colorBytes(color: *const [4]f64) [4]u8 {
+    var c: [4]u8 = undefined;
+    for (color, &c) |v, *o| o.* = core.sat.cast(u8, v);
+    return c;
+}
+
+fn lineType(t: c_int) !ip.LineType {
+    return switch (t) {
+        1, 4 => .four,
+        0, 8 => .eight,
+        else => error.Unsupported, // LINE_AA is not implemented
+    };
+}
+
+fn contourView(points: [*]const i32, starts: [*]const usize, count: usize) ip.Contours {
+    const total = starts[count];
+    return .{
+        .points = @constCast(@as([*]const ip.Point, @ptrCast(points))[0..total]),
+        .starts = @constCast(starts[0 .. count + 1]),
+        .hierarchy = &.{},
+    };
+}
+
+/// drawContours on an 8-bit image. The contours use the visar_contours
+/// layout (points, starts with count + 1 entries); hierarchy (count * 4)
+/// may be NULL. thickness < 0 fills. line_type: 8 or 4.
+export fn visar_draw_contours(img: *const CImage, points: [*]const i32, starts: [*]const usize, count: usize, hierarchy: ?[*]const i32, index: c_int, color: *const [4]f64, thickness: c_int, line_type: c_int, max_level: c_int, ox: c_int, oy: c_int) c_int {
+    const im = typed(u8, img) catch |e| return fail(e);
+    const lt = lineType(line_type) catch |e| return fail(e);
+    const cs = contourView(points, starts, count);
+    const h: ?[]const [4]i32 = if (hierarchy) |p| @as([*]const [4]i32, @ptrCast(p))[0..count] else null;
+    const col = colorBytes(color);
+    return run(ip.drawContours(gpa, im, cs, index, &col, thickness, lt, h, max_level, .{ .x = ox, .y = oy }));
+}
+
+/// fillPoly with the same polygon layout as visar_draw_contours.
+export fn visar_fill_poly(img: *const CImage, points: [*]const i32, starts: [*]const usize, count: usize, color: *const [4]f64, line_type: c_int, ox: c_int, oy: c_int) c_int {
+    const im = typed(u8, img) catch |e| return fail(e);
+    const lt = lineType(line_type) catch |e| return fail(e);
+    const cs = contourView(points, starts, count);
+    const polys = gpa.alloc([]const ip.Point, count) catch |e| return fail(e);
+    defer gpa.free(polys);
+    for (polys, 0..) |*p, i| p.* = cs.get(i);
+    const col = colorBytes(color);
+    return run(ip.fillPoly(gpa, im, polys, &col, lt, .{ .x = ox, .y = oy }));
+}
+
+/// polylines with the same polygon layout as visar_draw_contours.
+export fn visar_polylines(img: *const CImage, points: [*]const i32, starts: [*]const usize, count: usize, closed: c_int, color: *const [4]f64, thickness: c_int, line_type: c_int) c_int {
+    const im = typed(u8, img) catch |e| return fail(e);
+    const lt = lineType(line_type) catch |e| return fail(e);
+    if (thickness < 0) return fail(error.InvalidArgument);
+    const cs = contourView(points, starts, count);
+    const col = colorBytes(color);
+    for (0..count) |i| ip.polylines(im, cs.get(i), closed != 0, &col, @intCast(thickness), lt);
+    return 0;
+}
+
 // ---------------------------------------------------------------- codecs
 
 /// Decodes an image file held in memory. `mode` is OpenCV's IMREAD flag

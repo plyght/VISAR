@@ -61,6 +61,33 @@ int visar_equalize_hist(const visar_image *src, const visar_image *dst);
 /* labels: VISAR_32S image; stats: max rows of left, top, width, height, area; centroids: max rows of cx, cy */
 int visar_connected_components(const visar_image *src, const visar_image *labels, int connectivity, int32_t *stats, double *centroids, size_t max, size_t *count);
 
+/* contours: results are VISAR-owned buffers, released with visar_contours_free.
+ * Contour i is points[2*starts[i] .. 2*starts[i+1]) as (x, y) pairs;
+ * hierarchy[4*i .. 4*i+4) is OpenCV's [next, previous, first child, parent]. */
+typedef struct visar_contours {
+    size_t count;       /* number of contours */
+    size_t total;       /* number of points over all contours */
+    int32_t *points;    /* total (x, y) pairs */
+    size_t *starts;     /* count + 1 offsets into points (in points, not ints) */
+    int32_t *hierarchy; /* count * 4 */
+} visar_contours;
+/* mode: RETR_EXTERNAL 0, RETR_LIST 1, RETR_CCOMP 2, RETR_TREE 3;
+ * method: CHAIN_APPROX_NONE 1, SIMPLE 2, TC89_L1 3, TC89_KCOS 4. src: 8-bit, 1 channel, nonzero = foreground */
+int visar_find_contours(const visar_image *src, int mode, int method, int offset_x, int offset_y, visar_contours *out);
+void visar_contours_free(visar_contours *contours);
+
+/* drawing (8-bit images; matches OpenCV pixel for pixel). Polygons use the
+ * visar_contours layout: points (x, y pairs) and starts (count + 1 entries).
+ * color: per-channel values (like cv::Scalar); line_type: 8 (LINE_8) or 4 (LINE_4). */
+int visar_draw_contours(const visar_image *img, const int32_t *points, const size_t *starts, size_t count,
+                        const int32_t *hierarchy /* count * 4 or NULL */, int contour_idx /* -1 = all */,
+                        const double color[4], int thickness /* < 0 fills */, int line_type, int max_level,
+                        int offset_x, int offset_y);
+int visar_fill_poly(const visar_image *img, const int32_t *points, const size_t *starts, size_t count,
+                    const double color[4], int line_type, int offset_x, int offset_y);
+int visar_polylines(const visar_image *img, const int32_t *points, const size_t *starts, size_t count, int closed,
+                    const double color[4], int thickness, int line_type);
+
 /* core: op 0 add, 1 subtract, 2 absdiff, 3 multiply, 4 divide, 5 min, 6 max, 7 and, 8 or, 9 xor */
 int visar_arith(int op, const visar_image *a, const visar_image *b, const visar_image *dst);
 int visar_add_weighted(const visar_image *a, double alpha, const visar_image *b, double beta, double gamma, const visar_image *dst);

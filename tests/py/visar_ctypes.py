@@ -224,3 +224,86 @@ def connected_components_with_stats(a, connectivity=8):
                                           stats.shape[0], ctypes.byref(count)))
     n = count.value
     return n, labels, stats[:n].copy(), cents[:n].copy()
+
+
+# ------------------------------------------------------------- contours
+
+class Contours(ctypes.Structure):
+    _fields_ = [
+        ("count", ctypes.c_size_t),
+        ("total", ctypes.c_size_t),
+        ("points", ctypes.POINTER(ctypes.c_int32)),
+        ("starts", ctypes.POINTER(ctypes.c_size_t)),
+        ("hierarchy", ctypes.POINTER(ctypes.c_int32)),
+    ]
+
+
+def find_contours(a, mode, method, offset=(0, 0), raw=False):
+    """Returns (contours, hierarchy) shaped like cv2.findContours: a tuple of
+    N x 1 x 2 int32 arrays and a 1 x N x 4 hierarchy (None when empty).
+    With raw=True returns (points (P x 2), starts (N + 1), hierarchy (N x 4))."""
+    out = Contours()
+    _check(lib.visar_find_contours(ctypes.byref(desc(a)), mode, method, offset[0], offset[1], ctypes.byref(out)))
+    try:
+        n, total = out.count, out.total
+        if n == 0:
+            if raw:
+                return np.zeros((0, 2), np.int32), np.zeros(1, np.uintp), np.zeros((0, 4), np.int32)
+            return (), None
+        pts = np.ctypeslib.as_array(out.points, (total * 2,)).reshape(-1, 2).copy()
+        starts = np.ctypeslib.as_array(out.starts, (n + 1,)).copy()
+        hier = np.ctypeslib.as_array(out.hierarchy, (n * 4,)).reshape(n, 4).copy()
+    finally:
+        lib.visar_contours_free(ctypes.byref(out))
+    if raw:
+        return pts, starts, hier
+    cs = tuple(pts[starts[i]:starts[i + 1]].reshape(-1, 1, 2) for i in range(n))
+    return cs, hier.reshape(1, n, 4)
+
+
+def _poly_args(polys):
+    """(points, starts) arrays for a list of point arrays (any N x ... x 2 shape)."""
+    arrs = [np.ascontiguousarray(np.asarray(p, np.int32).reshape(-1, 2)) for p in polys]
+    starts = np.zeros(len(arrs) + 1, np.uintp)
+    if arrs:
+        starts[1:] = np.cumsum([len(a) for a in arrs])
+    pts = np.ascontiguousarray(np.concatenate(arrs) if arrs else np.zeros((0, 2), np.int32))
+    return pts, starts
+
+
+def _color(c):
+    c = list(c) if isinstance(c, (tuple, list)) else [c]
+    c = (c + [c[-1]] * 4)[:4] if len(c) < 4 else c[:4]
+    return (ctypes.c_double * 4)(*c)
+
+
+def _iptr(a):
+    return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+
+
+def _sptr(a):
+    return a.ctypes.data_as(ctypes.POINTER(ctypes.c_size_t))
+
+
+def draw_contours(img, contours, idx, color, thickness=1, line_type=8, hierarchy=None, max_level=2**31 - 1, offset=(0, 0)):
+    """In place, like cv2.drawContours."""
+    pts, starts = _poly_args(contours)
+    h = None if hierarchy is None else np.ascontiguousarray(np.asarray(hierarchy, np.int32).reshape(-1, 4))
+    _check(lib.visar_draw_contours(ctypes.byref(desc(img)), _iptr(pts), _sptr(starts), len(contours),
+                                   None if h is None else _iptr(h), idx, _color(color), thickness, line_type,
+                                   max_level, offset[0], offset[1]))
+    return img
+
+
+def fill_poly(img, polys, color, line_type=8, offset=(0, 0)):
+    pts, starts = _poly_args(polys)
+    _check(lib.visar_fill_poly(ctypes.byref(desc(img)), _iptr(pts), _sptr(starts), len(polys), _color(color),
+                               line_type, offset[0], offset[1]))
+    return img
+
+
+def polylines(img, polys, closed, color, thickness=1, line_type=8):
+    pts, starts = _poly_args(polys)
+    _check(lib.visar_polylines(ctypes.byref(desc(img)), _iptr(pts), _sptr(starts), len(polys), int(closed),
+                               _color(color), thickness, line_type))
+    return img

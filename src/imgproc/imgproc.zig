@@ -12,6 +12,8 @@ pub const geometry = @import("geometry.zig");
 pub const hist = @import("hist.zig");
 pub const components = @import("components.zig");
 pub const draw = @import("draw.zig");
+pub const contours = @import("contours.zig");
+pub const polygon = @import("polygon.zig");
 
 pub const Border = border.Border;
 
@@ -52,6 +54,17 @@ pub const equalizeHist = hist.equalizeHist;
 pub const integral = hist.integral;
 
 pub const connectedComponentsWithStats = components.connectedComponentsWithStats;
+
+pub const Point = contours.Point;
+pub const Contours = contours.Contours;
+pub const ContourMode = contours.Mode;
+pub const ContourMethod = contours.Method;
+pub const findContours = contours.findContours;
+pub const LineType = polygon.LineType;
+pub const drawContours = polygon.drawContours;
+pub const fillPoly = polygon.fillPoly;
+pub const fillConvexPoly = polygon.fillConvexPoly;
+pub const polylines = polygon.polylines;
 
 test {
     std.testing.refAllDecls(@This());
