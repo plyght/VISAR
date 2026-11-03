@@ -248,7 +248,7 @@ inline fn reorderRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d
             if (inf.dcn == 4) m[3] = if (inf.scn == 4) 3 else null;
             break :blk m;
         };
-        while (x + 16 <= width) : (x += 16) vec.remap(inf.scn, inf.dcn, map, 255, s + x * inf.scn, d + x * inf.dcn);
+        x = vec.reorderRow(inf.scn, inf.dcn, map, 255, s, d, width);
     }
     while (x < width) : (x += 1) {
         const p = s + x * inf.scn;
@@ -273,6 +273,17 @@ inline fn grayRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
     if (T == u8 or T == u16) {
         const U = @Vector(16, u32);
         if (T == u8) {
+            if (vec.has_vbmi) {
+                const U64 = @Vector(64, u32);
+                while (x + 64 <= width) : (x += 64) {
+                    const ch = vec.load64(inf.scn, s + x * inf.scn);
+                    const b: U64 = ch[bi];
+                    const g: U64 = ch[1];
+                    const r: U64 = ch[ri];
+                    const y_ = (b * @as(U64, @splat(B2G)) + g * @as(U64, @splat(G2G)) + r * @as(U64, @splat(R2G)) + @as(U64, @splat(1 << (gray_shift - 1)))) >> @splat(gray_shift);
+                    d[x..][0..64].* = @as(vec.V64, @intCast(y_));
+                }
+            }
             while (x + 16 <= width) : (x += 16) {
                 const ch = vec.load(inf.scn, s + x * inf.scn);
                 const b: U = ch[bi];

@@ -23,6 +23,47 @@ pub inline fn opaqueV(v: V16) V16 {
     };
 }
 
+/// x86 targets with AVX-512 VBMI: 64-byte two-source byte permutes
+/// (vpermt2b) are single instructions, so 64-pixel deinterleaves are cheap.
+pub const has_vbmi = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi);
+
+pub const V64 = @Vector(64, u8);
+
+inline fn opaque64(v: V64) V64 {
+    return if (has_vbmi) asm (""
+        : [ret] "=v" (-> V64),
+        : [v] "0" (v),
+    ) else v;
+}
+
+/// Like `load`, for 64 pixels at a time (for `has_vbmi` targets).
+pub inline fn load64(comptime cn: usize, p: [*]const u8) [cn]V64 {
+    var blocks: [cn]V64 = undefined;
+    inline for (0..cn) |b| blocks[b] = opaque64(p[64 * b ..][0..64].*);
+    if (cn == 1) return blocks;
+    var out: [cn]V64 = undefined;
+    inline for (0..cn) |c| {
+        const masks = comptime blk: {
+            @setEvalBranchQuota(100000);
+            var m: [cn - 1][64]i32 = undefined;
+            for (0..cn - 1) |step| for (0..64) |i| {
+                const src = i * cn + c;
+                const blk = src / 64;
+                const off: i32 = @intCast(src % 64);
+                m[step][i] = if (step == 0)
+                    (if (blk == 0) off else if (blk == 1) ~off else 0)
+                else if (blk == step + 1) ~off else @intCast(i);
+            };
+            break :blk m;
+        };
+        var acc = @shuffle(u8, blocks[0], blocks[1], masks[0]);
+        inline for (1..cn - 1) |step| acc = @shuffle(u8, acc, blocks[step + 1], masks[step]);
+        out[c] = acc;
+    }
+    return out;
+}
+
 /// Narrows i32 lanes already in [0, 255] to u8. Goes through u32 because
 /// LLVM (Zig 0.17, AVX2 without AVX-512) can lower a direct i32 -> u8
 /// narrowing to signed packs, turning 150 into 127.
@@ -135,6 +176,33 @@ pub inline fn remap(comptime scn: usize, comptime dcn: usize, comptime map: [dcn
     }
 }
 
+/// Reorders whole rows of pixels with overlapping 16-byte loads and one
+/// single-source byte shuffle per step (pshufb / tbl). Each step converts
+/// `16 / max(scn, dcn)` pixels; loads and stores may run past the bytes a
+/// step uses, so the loop stops while a full 16 bytes still fit on both
+/// sides. Returns the number of pixels done; the caller finishes the rest.
+pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map: [dcn]?u8, fill: u8, s: [*]const u8, d: [*]u8, n: usize) usize {
+    const widest: usize = if (scn > dcn) scn else dcn;
+    const per: usize = 16 / widest;
+    const mask = comptime blk: {
+        var m: [16]i32 = undefined;
+        for (0..16) |t| {
+            const p = t / dcn;
+            const c = t % dcn;
+            m[t] = if (p >= per) 0 else if (map[c]) |sc| @intCast(p * scn + sc) else -1;
+        }
+        break :blk m;
+    };
+    const f: @Vector(1, u8) = .{fill};
+    var x: usize = 0;
+    // Need 16 readable bytes at x*scn and 16 writable at x*dcn.
+    while ((x + per) * scn + 16 - per * scn <= n * scn and x * dcn + 16 <= n * dcn) : (x += per) {
+        const v = opaqueV(s[x * scn ..][0..16].*);
+        d[x * dcn ..][0..16].* = @shuffle(u8, v, f, mask);
+    }
+    return x;
+}
+
 /// gather() restricted to the listed blocks.
 inline fn gatherFrom(comptime total: usize, blocks: [total]V16, comptime list: anytype, comptime src: [16]usize) V16 {
     const n = list.len;
@@ -164,6 +232,22 @@ test "remap 3 -> 4 with fill" {
         try std.testing.expectEqual(buf[i * 3], out[i * 4 + 2]);
         try std.testing.expectEqual(@as(u8, 255), out[i * 4 + 3]);
     }
+}
+
+test "reorderRow matches scalar" {
+    var src: [3 * 37]u8 = undefined;
+    for (&src, 0..) |*v, i| v.* = @intCast(i);
+    var dst: [4 * 37]u8 = @splat(0);
+    const done = reorderRow(3, 4, .{ 2, 1, 0, null }, 255, &src, &dst, 37);
+    try std.testing.expect(done > 0 and done <= 37);
+    for (0..done) |i| {
+        try std.testing.expectEqual(src[3 * i + 2], dst[4 * i]);
+        try std.testing.expectEqual(src[3 * i], dst[4 * i + 2]);
+        try std.testing.expectEqual(@as(u8, 255), dst[4 * i + 3]);
+    }
+    var d3: [3 * 37]u8 = @splat(0);
+    const done3 = reorderRow(3, 3, .{ 2, 1, 0 }, 0, &src, &d3, 37);
+    for (0..done3) |i| try std.testing.expectEqual(src[3 * i + 2], d3[3 * i]);
 }
 
 test "load/store round trip" {

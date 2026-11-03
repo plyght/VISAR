@@ -506,83 +506,80 @@ fn boxU8(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), kw: u32, kh
 }
 
 fn boxChunk(s: Image(u8), d: Image(u8), kw: u32, kh: u32, border: Border, scale: f64, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
+    if (@as(u64, kw) * kh <= 257) return boxChunkT(u16, s, d, kw, kh, border, scale, gpa, y0, y1);
+    return boxChunkT(u32, s, d, kw, kh, border, scale, gpa, y0, y1);
+}
+
+/// Running column sums (add the entering row, subtract the leaving one)
+/// in `A`, then the horizontal window sum along that one L1-resident row,
+/// scaled and rounded straight into the output.
+fn boxChunkT(comptime A: type, s: Image(u8), d: Image(u8), kw: u32, kh: u32, border: Border, scale: f64, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
     const cn: usize = s.channels;
     const n = s.rowLen();
     const rx: usize = kw / 2;
     const ry: usize = kh / 2;
-    const pad = try gpa.alloc(u8, n + 2 * rx * cn);
-    defer gpa.free(pad);
-    const ring = try gpa.alloc(u16, @as(usize, kh) * n);
-    defer gpa.free(ring);
-    const col = try gpa.alloc(u32, n);
-    defer gpa.free(col);
-    const N = comptime lanes(u32);
-    const V32 = @Vector(N, u32);
-
-    const Row = struct {
-        /// Copies source row v (with border) into the padded buffer.
-        fn load(img: Image(u8), v: isize, b: Border, p: []u8, r: usize, ch: usize) void {
-            const sr = img.row(border_mod.map(v, img.height, b).?);
-            @memcpy(p[r * ch ..][0..sr.len], sr);
-            for (0..r) |i| {
-                const lx = border_mod.map(@as(isize, @intCast(i)) - @as(isize, @intCast(r)), img.width, b).?;
-                const rxx = border_mod.map(@intCast(img.width + i), img.width, b).?;
-                @memcpy(p[i * ch ..][0..ch], sr[lx * ch ..][0..ch]);
-                @memcpy(p[(r + img.width + i) * ch ..][0..ch], sr[rxx * ch ..][0..ch]);
-            }
-        }
-        inline fn hsumV(p: []const u8, x: usize, w: usize, ch: usize) V32 {
-            var a: @Vector(N, u16) = @as(@Vector(N, u8), p[x..][0..N].*);
-            for (1..w) |i| a += @as(@Vector(N, u8), p[x + i * ch ..][0..N].*);
-            return a;
-        }
-        inline fn hsum(p: []const u8, x: usize, w: usize, ch: usize) u16 {
-            var a: u16 = p[x];
-            for (1..w) |i| a += p[x + i * ch];
-            return a;
-        }
-    };
-
-    const v0: isize = @as(isize, @intCast(y0)) - @as(isize, @intCast(ry));
-    const khi: isize = @intCast(kh);
-    // Prime: col = sum of rows y0-ry .. y0+ry-1 (kh-1 rows).
-    @memset(col, 0);
-    for (0..kh - 1) |j| {
-        const v = v0 + @as(isize, @intCast(j));
-        Row.load(s, v, border, pad, rx, cn);
-        const slot: usize = @intCast(@mod(v - v0, khi));
-        const row = ring[slot * n ..][0..n];
-        for (0..n) |x| {
-            row[x] = Row.hsum(pad, x, kw, cn);
-            col[x] += row[x];
-        }
-    }
-    const sc: @Vector(N, f32) = @splat(@floatCast(scale));
+    const col_buf = try gpa.alloc(A, n + 2 * rx * cn);
+    defer gpa.free(col_buf);
+    const col = col_buf[rx * cn ..][0..n];
+    const N = comptime lanes(A);
+    const VA = @Vector(N, A);
+    const NF = comptime lanes(f32);
+    const sc: @Vector(NF, f32) = @splat(@floatCast(scale));
     const scs: f32 = @floatCast(scale);
+    const srow = struct {
+        fn f(img: Image(u8), v: isize, b: Border) [*]const u8 {
+            return img.row(border_mod.map(v, img.height, b).?).ptr;
+        }
+    }.f;
+
+    @memset(col, 0);
+    const top: isize = @as(isize, @intCast(y0)) - @as(isize, @intCast(ry));
+    for (0..kh) |j| {
+        const r = srow(s, top + @as(isize, @intCast(j)), border);
+        var x: usize = 0;
+        while (x + N <= n) : (x += N) col[x..][0..N].* = @as(VA, col[x..][0..N].*) + @as(VA, @as(@Vector(N, u8), r[x..][0..N].*));
+        while (x < n) : (x += 1) col[x] += r[x];
+    }
     for (y0..y1) |y| {
-        // One pass: horizontal sum of the entering row, emit, slide.
-        const vin: isize = @as(isize, @intCast(y + ry));
-        const vout: isize = @as(isize, @intCast(y)) - @as(isize, @intCast(ry));
-        Row.load(s, vin, border, pad, rx, cn);
-        const rin = ring[@as(usize, @intCast(@mod(vin - v0, khi))) * n ..][0..n];
-        const rout = ring[@as(usize, @intCast(@mod(vout - v0, khi))) * n ..][0..n];
+        if (y > y0) {
+            const add = srow(s, @as(isize, @intCast(y + ry)), border);
+            const sub = srow(s, @as(isize, @intCast(y)) - @as(isize, @intCast(ry)) - 1, border);
+            var x: usize = 0;
+            while (x + N <= n) : (x += N) {
+                const c: VA = col[x..][0..N].*;
+                col[x..][0..N].* = c + @as(VA, @as(@Vector(N, u8), add[x..][0..N].*)) - @as(VA, @as(@Vector(N, u8), sub[x..][0..N].*));
+            }
+            while (x < n) : (x += 1) col[x] = col[x] + add[x] - sub[x];
+        }
+        for (0..rx) |i| {
+            const lx = border_mod.map(@as(isize, @intCast(i)) - @as(isize, @intCast(rx)), s.width, border).?;
+            const rxx = border_mod.map(@intCast(s.width + i), s.width, border).?;
+            @memcpy(col_buf[i * cn ..][0..cn], col[lx * cn ..][0..cn]);
+            @memcpy(col_buf[(rx + s.width + i) * cn ..][0..cn], col[rxx * cn ..][0..cn]);
+        }
         const out = d.row(y);
         var x: usize = 0;
-        while (x + N <= n) : (x += N) {
-            const h = Row.hsumV(pad, x, kw, cn);
-            const c = @as(V32, col[x..][0..N].*) + h;
-            out[x..][0..N].* = satV(u8, N, cvtV(f32, N, c) * sc);
-            // When kh == 1 the entering and leaving rows are the same row.
-            const old: V32 = if (kh == 1) h else @as(@Vector(N, u16), rout[x..][0..N].*);
-            col[x..][0..N].* = c - old;
-            rin[x..][0..N].* = @as(@Vector(N, u16), @intCast(h));
+        // Sum in full-width lanes of A, then scale in f32 halves.
+        if (N == 2 * NF) {
+            while (x + N <= n) : (x += N) {
+                var sum: VA = col_buf[x..][0..N].*;
+                for (1..kw) |i| sum += col_buf[x + i * cn ..][0..N].*;
+                const arr: [N]A = sum;
+                const lo: @Vector(NF, A) = arr[0..NF].*;
+                const hi: @Vector(NF, A) = arr[NF..N].*;
+                out[x..][0..NF].* = satV(u8, NF, cvtV(f32, NF, lo) * sc);
+                out[x + NF ..][0..NF].* = satV(u8, NF, cvtV(f32, NF, hi) * sc);
+            }
+        }
+        while (x + NF <= n) : (x += NF) {
+            var sum: @Vector(NF, A) = col_buf[x..][0..NF].*;
+            for (1..kw) |i| sum += col_buf[x + i * cn ..][0..NF].*;
+            out[x..][0..NF].* = satV(u8, NF, cvtV(f32, NF, sum) * sc);
         }
         while (x < n) : (x += 1) {
-            const h = Row.hsum(pad, x, kw, cn);
-            const c = col[x] + h;
-            out[x] = sat.cast(u8, @as(f32, @floatFromInt(c)) * scs);
-            col[x] = c - (if (kh == 1) h else rout[x]);
-            rin[x] = h;
+            var sum: u32 = col_buf[x];
+            for (1..kw) |i| sum += col_buf[x + i * cn];
+            out[x] = sat.cast(u8, @as(f32, @floatFromInt(sum)) * scs);
         }
     }
 }
