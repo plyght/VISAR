@@ -284,7 +284,7 @@ test "mosse follows a moving textured patch" {
     var bg: [W * H]u8 = undefined;
     for (&bg) |*v| v.* = 90 + rnd.uintLessThan(u8, 30);
     var obj: [30 * 30]u8 = undefined;
-    for (&obj, 0..) |*v, i| v.* = if ((i / 30 / 5 + i % 30 / 5) % 2 == 0) 230 else 20;
+    for (&obj, 0..) |*v, i| v.* = if ((i / 30 / 5 + (i % 30) / 5) % 2 == 0) 230 else 20;
     const render = struct {
         fn f(img: Image(u8), b: []const u8, o: []const u8, ox: usize, oy: usize) void {
             @memcpy(img.slice(), b);

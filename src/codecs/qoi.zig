@@ -184,11 +184,11 @@ fn encodeTyped(comptime ch: usize, comptime bgr: bool, gpa: std.mem.Allocator, i
                     const vg_r = vr -% vg;
                     const vg_b = vb -% vg;
                     if (vr > -3 and vr < 2 and vg > -3 and vg < 2 and vb > -3 and vb < 2) {
-                        buf[o] = op_diff | @as(u8, @intCast(vr + 2)) << 4 | @as(u8, @intCast(vg + 2)) << 2 | @as(u8, @intCast(vb + 2));
+                        buf[o] = op_diff | (@as(u8, @intCast(vr + 2)) << 4) | (@as(u8, @intCast(vg + 2)) << 2) | @as(u8, @intCast(vb + 2));
                         o += 1;
                     } else if (vg_r > -9 and vg_r < 8 and vg > -33 and vg < 32 and vg_b > -9 and vg_b < 8) {
                         buf[o] = op_luma | @as(u8, @intCast(vg + 32));
-                        buf[o + 1] = @as(u8, @intCast(vg_r + 8)) << 4 | @as(u8, @intCast(vg_b + 8));
+                        buf[o + 1] = (@as(u8, @intCast(vg_r + 8)) << 4) | @as(u8, @intCast(vg_b + 8));
                         o += 2;
                     } else {
                         buf[o] = op_rgb;

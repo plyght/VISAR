@@ -566,7 +566,7 @@ test "ops run on a small image" {
     const env: Env = .{ .exec = .serial, .gpa = gpa };
     var img: AnyImage = .{ .u8 = try Image(u8).init(gpa, 8, 6, 3) };
     defer img.deinit(gpa);
-    for (img.u8.slice(), 0..) |*v, i| v.* = @intCast(i * 7 % 256);
+    for (img.u8.slice(), 0..) |*v, i| v.* = @intCast((i * 7) % 256);
     var r: Report = .{};
     try apply(env, .{ .rotate = .cw90 }, &img, &r);
     try std.testing.expectEqual(@as(u32, 6), img.width());

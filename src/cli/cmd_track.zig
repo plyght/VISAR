@@ -672,7 +672,7 @@ fn renderHud(live: *Live, hud: *Hud, fw: u32, fh: u32, ms_now: f64) void {
 
 /// A BGRA pixel as one little-endian u32 (alpha 255).
 fn bgra(r: u8, g: u8, b: u8) u32 {
-    return @as(u32, b) | @as(u32, g) << 8 | @as(u32, r) << 16 | 0xff00_0000;
+    return @as(u32, b) | (@as(u32, g) << 8) | (@as(u32, r) << 16) | 0xff00_0000;
 }
 
 /// Fills [x0, x1) x [y0, y1), clipped, in a 4-channel image.

@@ -1759,7 +1759,7 @@ fn randomImage(comptime T: type, gpa: std.mem.Allocator, rnd: std.Random, w: u32
             const base: u32 = @intCast((x * 3 + y * 2 + (i % c) * 40) % 256);
             const noise = rnd.uintLessThan(u32, 8);
             const v8: u32 = (base + noise) & 0xff;
-            v.* = if (T == u8) @intCast(v8) else @intCast(v8 * 257 ^ rnd.uintLessThan(u32, 4));
+            v.* = if (T == u8) @intCast(v8) else @intCast((v8 * 257) ^ rnd.uintLessThan(u32, 4));
         } else v.* = rnd.int(T);
     }
     return img;

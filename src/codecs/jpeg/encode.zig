@@ -382,7 +382,7 @@ pub fn encodeWith(gpa: Allocator, img: common.AnyImage, opts: common.EncodeOptio
     try o.u16be(@intCast(w));
     try o.bytes(&.{@intCast(nc)});
     for (0..nc) |i| {
-        const hv: u8 = if (i == 0) @intCast(hs << 4 | vs) else 0x11;
+        const hv: u8 = if (i == 0) @intCast((hs << 4) | vs) else 0x11;
         try o.bytes(&.{ @intCast(i + 1), hv, if (i == 0) 0 else 1 });
     }
     const specs = [_]struct { tc: u8, th: u8, s: tables.HuffSpec }{
