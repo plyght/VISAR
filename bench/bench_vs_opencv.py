@@ -1,7 +1,7 @@
 """Benchmarks VISAR (C ABI) against OpenCV on the same machine and inputs.
 
 Usage: zig build bench -Doptimize=ReleaseFast [-- --threads N] [--quick] [--md FILE]
-Each case reports the median wall time of both libraries and the speedup
+Each case reports the best wall time of both libraries, measured in alternation, and the speedup
 (OpenCV time / VISAR time; > 1 means VISAR is faster). OpenCV and VISAR use
 the same thread count.
 """
@@ -25,15 +25,22 @@ import visar_ctypes as vs  # noqa: E402
 from test_vs_opencv import natural  # noqa: E402
 
 
-def timeit(fn, min_time=0.25, max_reps=2000):
-    fn()  # warm up
-    times = []
+def timeit_pair(a, b, min_time=0.4, max_rounds=400):
+    """Times two functions in alternation and returns the fastest run of
+    each, so background load affects both libraries equally."""
+    a()
+    b()
+    ta, tb = [], []
     start = time.perf_counter()
-    while len(times) < 5 or (time.perf_counter() - start < min_time and len(times) < max_reps):
+    while len(ta) < 7 or (time.perf_counter() - start < min_time and len(ta) < max_rounds):
         t0 = time.perf_counter()
-        fn()
-        times.append(time.perf_counter() - t0)
-    return statistics.median(times)
+        a()
+        t1 = time.perf_counter()
+        b()
+        t2 = time.perf_counter()
+        ta.append(t1 - t0)
+        tb.append(t2 - t1)
+    return min(ta), min(tb)
 
 
 def cases(h, w):
@@ -108,11 +115,10 @@ def main():
         if args.filter and args.filter.lower() not in name.lower():
             continue
         try:
-            t_v = timeit(ours)
+            t_v, t_o = timeit_pair(ours, theirs)
         except vs.VisarError as e:
             print(f"  {name:<24} VISAR error: {e}")
             continue
-        t_o = timeit(theirs)
         rows.append((name, t_v, t_o))
         print(f"  {name:<24} visar {t_v * 1e3:8.3f} ms   opencv {t_o * 1e3:8.3f} ms   speedup {t_o / t_v:5.2f}x", flush=True)
     sp = [o / v for _, v, o in rows]

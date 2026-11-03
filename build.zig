@@ -30,13 +30,25 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(static);
     b.installFile("include/visar.h", "include/visar.h");
 
+    // The tracking demo's core, shared by `zig build demo-track` and
+    // `visar demo track`.
+    const track_lib = b.createModule(.{
+        .root_source_file = b.path("demos/track_lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "visar", .module = visar }},
+    });
+
     // The `visar` command-line tool.
     const cli = b.createModule(.{
         .root_source_file = b.path("src/cli/main.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "visar", .module = visar },
+            .{ .name = "track_lib", .module = track_lib },
+        },
     });
-    cli.addImport("visar", visar);
     const exe = b.addExecutable(.{ .name = "visar", .root_module = cli });
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
@@ -49,7 +61,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("demos/track.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "visar", .module = visar }},
+        .imports = &.{
+            .{ .name = "visar", .module = visar },
+            .{ .name = "track_lib", .module = track_lib },
+        },
     }) });
     b.installArtifact(demo_track);
     const run_track = b.addRunArtifact(demo_track);
@@ -64,6 +79,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     const capi_tests = b.addTest(.{ .root_module = capi, .filters = test_filters });
     test_step.dependOn(&b.addRunArtifact(capi_tests).step);
+    const cli_tests = b.addTest(.{ .root_module = cli, .filters = test_filters });
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
     // Differential tests against OpenCV (needs python3 with numpy and cv2).
     const difftest = b.addSystemCommand(&.{ "python3", "tests/py/test_vs_opencv.py", "--lib" });
