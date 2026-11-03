@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const core = @import("../core/core.zig");
+const vec = core.vec;
 const Image = core.Image;
 const Exec = core.Exec;
 const sat = core.sat;
@@ -70,10 +71,24 @@ fn nearest(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src)) Error!vo
     const Ctx = struct { s: Image(T), d: Image(T), xofs: []const u32, ify: f64 };
     exec.parallelFor(dst.height, 16, Ctx{ .s = src, .d = dst, .xofs = xofs, .ify = ify }, struct {
         fn run(c: Ctx, y0: usize, y1: usize) void {
+            var prev: ?u32 = null;
             for (y0..y1) |y| {
-                const sy: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(y)) * c.ify));
-                const sr = c.s.row(@min(sy, c.s.height - 1));
+                const sy: u32 = @min(@as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(y)) * c.ify))), c.s.height - 1);
                 const dr = c.d.row(y);
+                // Upscaling repeats source rows: copy the row just written.
+                if (prev == sy) {
+                    @memcpy(dr, c.d.row(y - 1));
+                    continue;
+                }
+                prev = sy;
+                const sr = c.s.row(sy);
+                if (T == u8 and c.d.width == 2 * c.s.width) switch (c.s.channels) {
+                    inline 1, 2, 3, 4 => |k| {
+                        dup2Row(k, sr, dr);
+                        continue;
+                    },
+                    else => {},
+                };
                 switch (c.s.channels) {
                     inline 1, 2, 3, 4 => |k| for (c.xofs, 0..) |o, x| {
                         inline for (0..k) |ch| dr[x * k + ch] = sr[o + ch];
@@ -83,6 +98,53 @@ fn nearest(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src)) Error!vo
             }
         }
     }.run);
+}
+
+/// Exact 2x nearest upscale of one row: every pixel twice, 16 source
+/// pixels per step through one byte shuffle.
+fn dup2Row(comptime cn: usize, s: []const u8, d: []u8) void {
+    const P = 16;
+    const mask = comptime blk: {
+        var m: [2 * P * cn]i32 = undefined;
+        for (0..2 * P) |x| for (0..cn) |c| {
+            m[x * cn + c] = @intCast((x / 2) * cn + c);
+        };
+        break :blk m;
+    };
+    const w = s.len / cn;
+    var x: usize = 0;
+    if (cn == 1) {
+        while (x + P <= w) : (x += P) {
+            const v: @Vector(P * cn, u8) = s[x * cn ..][0 .. P * cn].*;
+            d[2 * x * cn ..][0 .. 2 * P * cn].* = @shuffle(u8, v, undefined, mask);
+        }
+    } else {
+        // Deinterleave, duplicate each channel (zip with itself), interleave.
+        const zip = struct {
+            fn m(comptime hi: bool) [16]i32 {
+                var r: [16]i32 = undefined;
+                for (0..16) |i| r[i] = @intCast(i / 2 + (if (hi) 8 else 0));
+                return r;
+            }
+        };
+        while (x + P <= w) : (x += P) {
+            const ch = vec.load(cn, s.ptr + x * cn);
+            var lo: [cn]vec.V16 = undefined;
+            var hi: [cn]vec.V16 = undefined;
+            inline for (0..cn) |c| {
+                lo[c] = @shuffle(u8, ch[c], undefined, zip.m(false));
+                hi[c] = @shuffle(u8, ch[c], undefined, zip.m(true));
+            }
+            vec.store(cn, lo, d.ptr + 2 * x * cn);
+            vec.store(cn, hi, d.ptr + (2 * x + 16) * cn);
+        }
+    }
+    while (x < w) : (x += 1) {
+        inline for (0..cn) |c| {
+            d[2 * x * cn + c] = s[x * cn + c];
+            d[(2 * x + 1) * cn + c] = s[x * cn + c];
+        }
+    }
 }
 
 /// Source index and fractional weight for one destination coordinate, with
@@ -534,6 +596,27 @@ test "u8 fast paths match the generic fixed-point kernels" {
             try resize(.serial, gpa, src, a, .linear);
             try linear(.serial, gpa, src, b, false);
             try std.testing.expectEqualSlices(u8, b.slice(), a.slice());
+        }
+    }
+}
+
+test "nearest: 2x fast path and row reuse match the naive mapping" {
+    const gpa = std.testing.allocator;
+    inline for (.{ 1, 2, 3, 4 }) |cn| {
+        var src = try Image(u8).init(gpa, 37, 11, cn);
+        defer src.deinit(gpa);
+        for (src.slice(), 0..) |*v, i| v.* = @truncate(i *% 2654435761 >> 7);
+        for ([_][2]u32{ .{ 74, 22 }, .{ 74, 31 }, .{ 100, 40 }, .{ 20, 5 } }) |sz| {
+            var dst = try Image(u8).init(gpa, sz[0], sz[1], cn);
+            defer dst.deinit(gpa);
+            try resize(.serial, gpa, src, dst, .nearest);
+            const fx = 37.0 / @as(f64, @floatFromInt(sz[0]));
+            const fy = 11.0 / @as(f64, @floatFromInt(sz[1]));
+            for (0..sz[1]) |y| for (0..sz[0]) |x| for (0..cn) |c| {
+                const sx: usize = @min(36, @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(x)) * fx))));
+                const sy: usize = @min(10, @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(y)) * fy))));
+                try std.testing.expectEqual(src.row(sy)[sx * cn + c], dst.row(y)[x * cn + c]);
+            };
         }
     }
 }
