@@ -344,7 +344,7 @@ fn edgeRun(comptime op: Op, comptime T: type, o: []T, s: []const T, cn: usize, a
 
 /// Bytes of preprocessed rows a band keeps live; wider rows are processed
 /// in column strips so the ring stays in L2.
-const ring_budget = 192 * 1024;
+const ring_budget = 64 * 1024;
 
 /// Output rows [y0, y1) of one pass, with a ring of `el.h` preprocessed
 /// source rows.
@@ -617,7 +617,7 @@ test "erode/dilate rect vs general" {
 
 /// Morphology vectors are 32 bytes: nearly every load is unaligned (shifted
 /// by whole pixels), and 64-byte ones always split a cache line.
-const morph_vec_bytes = 64;
+const morph_vec_bytes = 32;
 fn lanesM(comptime T: type) comptime_int {
     return @max(1, morph_vec_bytes / @sizeOf(T));
 }
