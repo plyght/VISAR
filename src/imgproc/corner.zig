@@ -118,7 +118,7 @@ fn fused3(comptime T: type, exec: Exec, gpa: Allocator, src: Image(T), dst: Imag
 }
 
 fn fused3Chunk(comptime T: type, comptime kind: Kind, s: Image(T), d: Image(f32), o: CornerOptions, k: f32, k0: f32, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
-    const band = 1024;
+    const band = 128;
     const w: usize = s.width;
     const h: usize = s.height;
     const bs: usize = o.block_size;
