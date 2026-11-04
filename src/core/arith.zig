@@ -196,7 +196,7 @@ pub fn addWeighted(exec: Exec, a: anytype, alpha: f64, b: @TypeOf(a), beta: f64,
                 const d = c.d.row(y);
                 var i: usize = 0;
                 if (comptime vecConvertible(T)) {
-                    const n = 32;
+                    const n = 64;
                     const F = @Vector(n, f32);
                     const al: F = @splat(c.al);
                     const be: F = @splat(c.be);
