@@ -719,15 +719,10 @@ fn up2HCubic(comptime cn: usize, s: []const u8, out: Planar(f32), we: [4]i32, wo
 
 /// Rounds half to even and saturates to u8, like OpenCV's v_round + packs.
 inline fn roundU8(v: @Vector(16, f32)) vec.V16 {
-    const I = @Vector(16, i32);
-    const q: I = if (use_asm and avx512f)
-        asm ("vcvtps2dq %[v], %[ret]"
-            : [ret] "=v" (-> I),
-            : [v] "v" (v),
-        )
-    else
-        @intFromFloat(@min(@max(sat.rint(v), @as(@Vector(16, f32), @splat(-1.0))), @as(@Vector(16, f32), @splat(256.0))));
-    return simd.narrow(u8, @min(@max(q, @as(I, @splat(0))), @as(I, @splat(255))));
+    // OpenCV's saturate_cast<uchar>(float): round half to even and clamp,
+    // which simd.satF32 does with one conversion per register (cvtps2dq /
+    // fcvtns) and saturating unsigned narrows.
+    return simd.satF32(u8, 16, v);
 }
 
 fn up2VCubic(comptime R: usize, comptime cn: usize, r: [4]Planar(f32), b: [R][4]i32, d: [R][]u8) void {
