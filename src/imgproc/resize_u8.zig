@@ -452,20 +452,15 @@ fn vlinear(r0: []const i16, r1: []const i16, b: [2]i32, d: []u8) void {
     const b0: V = @splat(@intCast(b[0]));
     const b1: V = @splat(@intCast(b[1]));
     var x: usize = 0;
-    const Blk = struct {
-        inline fn f(p0: []const i16, p1: []const i16, q0: V, q1: V, o: []u8, i: usize) void {
-            const a: V = p0[i..][0..N].*;
-            const c: V = p1[i..][0..N].*;
-            const t = (mulhi(a, q0) + mulhi(c, q1) + @as(V, @splat(2))) >> @splat(2);
-            const cl = @max(@min(t, @as(V, @splat(255))), @as(V, @splat(0)));
-            o[i..][0..N].* = simd.narrow(u8, cl);
-        }
-    };
-    while (x + 2 * N <= d.len) : (x += 2 * N) {
-        Blk.f(r0, r1, b0, b1, d, x);
-        Blk.f(r0, r1, b0, b1, d, x + N);
+    while (x + N <= d.len) : (x += N) {
+        const a: V = r0[x..][0..N].*;
+        const c: V = r1[x..][0..N].*;
+        const m0 = mulhi(a, b0);
+        const m1 = mulhi(c, b1);
+        const t = (m0 + m1 + @as(V, @splat(2))) >> @splat(2);
+        const cl = @max(@min(t, @as(V, @splat(255))), @as(V, @splat(0)));
+        d[x..][0..N].* = simd.narrow(u8, cl);
     }
-    while (x + N <= d.len) : (x += N) Blk.f(r0, r1, b0, b1, d, x);
     while (x < d.len) : (x += 1) {
         const t = ((@as(i32, r0[x]) * b[0]) >> 16) + ((@as(i32, r1[x]) * b[1]) >> 16);
         d[x] = sat.cast(u8, (t + 2) >> 2);
