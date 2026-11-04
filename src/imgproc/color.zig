@@ -208,6 +208,13 @@ inline fn convertRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d
     }
 }
 
+/// Rounding high multiply (a * b + 2^14) >> 15 in one instruction: AVX2
+/// vpmulhrsw (inline asm), NEON sqrdmulh (LLVM intrinsic, not on Windows).
+const rhm_x86 = @import("builtin").zig_backend == .stage2_llvm and @import("builtin").cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(@import("builtin").cpu.features, .avx2);
+const rhm_arm = core.simd.llvm_intrinsics and @import("builtin").cpu.arch == .aarch64;
+extern fn @"llvm.aarch64.neon.sqrdmulh.v8i16"(@Vector(8, i16), @Vector(8, i16)) @Vector(8, i16);
+
 /// 16 pixels at a time for u8; returns how many pixels it handled.
 inline fn ycrcbU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [*]T, width: usize) usize {
     if (T != u8) return 0;
@@ -215,6 +222,50 @@ inline fn ycrcbU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
     const half: I = @splat(1 << (shift - 1));
     const delta: I = @splat(128 << shift);
     var x: usize = 0;
+    // 16-bit lanes, exact: Y with byte-split coefficients (c = 256 hi + lo,
+    // (256 H + L + 2^13) >> 14 == (H + (L >> 8) + 32) >> 6), and
+    // (d * c + 2^13) >> 14 == (d * 2c + 2^14) >> 15, a rounding high
+    // multiply (pmulhrsw / sqrdmulh) with 2c < 2^15.
+    const W = @Vector(16, u16);
+    const S = @Vector(16, i16);
+    const rhm = struct {
+        inline fn f(v: @Vector(16, i16), comptime c2: i32) @Vector(16, i16) {
+            const cv: @Vector(16, i16) = @splat(c2);
+            if (comptime rhm_x86) return asm ("vpmulhrsw %[b], %[a], %[r]"
+                : [r] "=x" (-> @Vector(16, i16)),
+                : [a] "x" (v),
+                  [b] "x" (cv),
+            );
+            if (comptime rhm_arm) {
+                const va: [16]i16 = v;
+                const ca: [16]i16 = cv;
+                const lo = @"llvm.aarch64.neon.sqrdmulh.v8i16"(va[0..8].*, ca[0..8].*);
+                const hi = @"llvm.aarch64.neon.sqrdmulh.v8i16"(va[8..16].*, ca[8..16].*);
+                return std.simd.join(lo, hi);
+            }
+            const V32 = @Vector(16, i32);
+            return @truncate((@as(V32, v) * @as(V32, cv) + @as(V32, @splat(1 << 14))) >> @splat(15));
+        }
+    }.f;
+    while (x + 16 <= width) : (x += 16) {
+        const ch = vec.load(3, s + x * 3);
+        const b: W = ch[inf.sb];
+        const g: W = ch[1];
+        const r: W = ch[2 - inf.sb];
+        const hs = b * @as(W, @splat(B2Y >> 8)) + g * @as(W, @splat(G2Y >> 8)) + r * @as(W, @splat(R2Y >> 8));
+        const ls = b * @as(W, @splat(B2Y & 0xff)) + g * @as(W, @splat(G2Y & 0xff)) + r * @as(W, @splat(R2Y & 0xff));
+        const y_ = (hs + (ls >> @splat(8)) + @as(W, @splat(32))) >> @splat(6);
+        const ys: S = @bitCast(y_);
+        const cr = rhm(@as(S, @bitCast(r)) - ys, 2 * 11682) + @as(S, @splat(128));
+        const cb = rhm(@as(S, @bitCast(b)) - ys, 2 * 9241) + @as(S, @splat(128));
+        const lo: S = @splat(0);
+        const hi: S = @splat(255);
+        vec.store(3, .{
+            @as(vec.V16, @truncate(y_)),
+            core.simd.narrow(u8, @min(@max(cr, lo), hi)),
+            core.simd.narrow(u8, @min(@max(cb, lo), hi)),
+        }, d + x * 3);
+    }
     while (x + 16 <= width) : (x += 16) {
         const ch = vec.load(3, s + x * 3);
         const b: I = ch[inf.sb];
@@ -594,5 +645,32 @@ test "vector BGR/BGRA -> gray matches the scalar formula" {
             const want = (@as(u32, px[sb]) * B2G + @as(u32, px[1]) * G2G + @as(u32, px[2 - sb]) * R2G + (1 << 14)) >> 15;
             try std.testing.expectEqual(@as(u8, @intCast(want)), dst.slice()[p]);
         }
+    }
+}
+
+test "vector BGR -> YCrCb matches OpenCV's fixed-point formula" {
+    const gpa = std.testing.allocator;
+    const n: u32 = 52 * 52 * 52;
+    var src = try Image(u8).init(gpa, n, 1, 3);
+    defer src.deinit(gpa);
+    var dst = try Image(u8).init(gpa, n, 1, 3);
+    defer dst.deinit(gpa);
+    var i: usize = 0;
+    for (0..52) |b| for (0..52) |g| for (0..52) |r| {
+        src.slice()[i * 3 ..][0..3].* = .{ @intCast(@min(255, b * 5)), @intCast(@min(255, g * 5)), @intCast(@min(255, r * 5)) };
+        i += 1;
+    };
+    try cvtColor(.serial, src, dst, .bgr2ycrcb);
+    for (0..n) |p| {
+        const px = src.slice()[p * 3 ..][0..3];
+        const b: i32 = px[0];
+        const g: i32 = px[1];
+        const r: i32 = px[2];
+        const half = 1 << (shift - 1);
+        const y = (b * B2Y + g * G2Y + r * R2Y + half) >> shift;
+        const cr = ((r - y) * 11682 + (128 << shift) + half) >> shift;
+        const cb = ((b - y) * 9241 + (128 << shift) + half) >> shift;
+        const want = [3]u8{ @intCast(std.math.clamp(y, 0, 255)), @intCast(std.math.clamp(cr, 0, 255)), @intCast(std.math.clamp(cb, 0, 255)) };
+        try std.testing.expectEqualSlices(u8, &want, dst.slice()[p * 3 ..][0..3]);
     }
 }
