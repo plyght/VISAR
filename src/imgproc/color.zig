@@ -212,6 +212,7 @@ inline fn convertRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d
 /// vpmulhrsw (inline asm), NEON sqrdmulh (LLVM intrinsic, not on Windows).
 const rhm_x86 = @import("builtin").zig_backend == .stage2_llvm and @import("builtin").cpu.arch == .x86_64 and
     std.Target.x86.featureSetHas(@import("builtin").cpu.features, .avx2);
+const ycc_i32 = @import("builtin").cpu.arch == .x86_64 and std.Target.x86.featureSetHas(@import("builtin").cpu.features, .avx512bw);
 const rhm_arm = core.simd.llvm_intrinsics and @import("builtin").cpu.arch == .aarch64;
 extern fn @"llvm.aarch64.neon.sqrdmulh.v8i16"(@Vector(8, i16), @Vector(8, i16)) @Vector(8, i16);
 
@@ -247,7 +248,10 @@ inline fn ycrcbU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
             return @truncate((@as(V32, v) * @as(V32, cv) + @as(V32, @splat(1 << 14))) >> @splat(15));
         }
     }.f;
-    while (x + 16 <= width) : (x += 16) {
+    // AVX-512 fills a whole register with the i32 form below; elsewhere
+    // the 16-bit form wins (A/B: Apple Silicon 1.53x, AVX2 1.33x, AVX-512
+    // 0.95x).
+    if (comptime !ycc_i32) while (x + 16 <= width) : (x += 16) {
         const ch = vec.load(3, s + x * 3);
         const b: W = ch[inf.sb];
         const g: W = ch[1];
@@ -265,7 +269,7 @@ inline fn ycrcbU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
             core.simd.narrow(u8, @min(@max(cr, lo), hi)),
             core.simd.narrow(u8, @min(@max(cb, lo), hi)),
         }, d + x * 3);
-    }
+    };
     while (x + 16 <= width) : (x += 16) {
         const ch = vec.load(3, s + x * 3);
         const b: I = ch[inf.sb];
