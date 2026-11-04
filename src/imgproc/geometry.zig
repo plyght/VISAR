@@ -408,7 +408,7 @@ pub fn warpAffine(exec: Exec, src: anytype, dst: @TypeOf(src), m: [6]f64, interp
     }.run);
 }
 
-const WN = 16;
+const WN = 32;
 const VF = @Vector(WN, f32);
 
 /// `kcn` is the channel count when known at compile time, else 0.

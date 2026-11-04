@@ -266,7 +266,7 @@ fn mapErr(e: filter.Error) Error {
 /// Lanes per step: at least 32 bytes of the accumulator.
 fn lanes(comptime A: type) comptime_int {
     const native = std.simd.suggestVectorLength(A) orelse 4;
-    return @max(native, 64 / @sizeOf(A));
+    return @max(native, 32 / @sizeOf(A));
 }
 
 /// Box sums of the tensor entries (running column sums, like the box
