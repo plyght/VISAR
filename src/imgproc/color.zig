@@ -434,21 +434,6 @@ inline fn hsvU8(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [*]
             vec.store64(3, hsvBlock(64, ch[inf.sb], ch[1], ch[2 - inf.sb]), d + x * 3);
         }
     }
-    // 32 pixels per step: two deinterleaving loads, one wide block.
-    while (x + 32 <= width) : (x += 32) {
-        const c0 = vec.load(3, s + x * 3);
-        const c1 = vec.load(3, s + (x + 16) * 3);
-        const r = hsvBlock(32, std.simd.join(c0[inf.sb], c1[inf.sb]), std.simd.join(c0[1], c1[1]), std.simd.join(c0[2 - inf.sb], c1[2 - inf.sb]));
-        var lo: [3]vec.V16 = undefined;
-        var hi: [3]vec.V16 = undefined;
-        inline for (0..3) |k| {
-            const a: [32]u8 = r[k];
-            lo[k] = a[0..16].*;
-            hi[k] = a[16..32].*;
-        }
-        vec.store(3, lo, d + x * 3);
-        vec.store(3, hi, d + (x + 16) * 3);
-    }
     while (x + 16 <= width) : (x += 16) {
         const ch = vec.load(3, s + x * 3);
         vec.store(3, hsvBlock(16, ch[inf.sb], ch[1], ch[2 - inf.sb]), d + x * 3);
