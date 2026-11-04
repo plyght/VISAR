@@ -605,7 +605,7 @@ test "nearest: 2x fast path and row reuse match the naive mapping" {
     inline for (.{ 1, 2, 3, 4 }) |cn| {
         var src = try Image(u8).init(gpa, 37, 11, cn);
         defer src.deinit(gpa);
-        for (src.slice(), 0..) |*v, i| v.* = @truncate(i *% 2654435761 >> 7);
+        for (src.slice(), 0..) |*v, i| v.* = @truncate((i *% 2654435761) >> 7);
         for ([_][2]u32{ .{ 74, 22 }, .{ 74, 31 }, .{ 100, 40 }, .{ 20, 5 } }) |sz| {
             var dst = try Image(u8).init(gpa, sz[0], sz[1], cn);
             defer dst.deinit(gpa);

@@ -24,6 +24,19 @@ METHODS = [(cv2.CHAIN_APPROX_NONE, "NONE"), (cv2.CHAIN_APPROX_SIMPLE, "SIMPLE"),
            (cv2.CHAIN_APPROX_TC89_L1, "L1"), (cv2.CHAIN_APPROX_TC89_KCOS, "KCOS")]
 
 
+# OpenCV's arm64 builds let the compiler fuse multiply-adds (clang's default
+# -ffp-contract=on), so its float geometry (minAreaRect, minEnclosingCircle)
+# rounds slightly differently from its x86 builds; VISAR rounds the same on
+# both. On ARM those results get a relative allowance of 2e-5 (observed
+# differences: up to 8e-6 on coordinates below 64). x86 stays exact.
+import platform
+ARM = platform.machine().lower() in ("arm64", "aarch64")
+
+
+def fma_tol(ref):
+    return 2e-5 * max(1.0, float(np.max(np.abs(ref)))) if ARM else 0.0
+
+
 def compare(name, ours, ref, tol=0.0, pct=100.0):
     ours = np.asarray(ours)
     ref = np.asarray(ref)
@@ -200,13 +213,13 @@ def shape_tests():
             (c, s, a) = vs.min_area_rect(p)
             (rc, rs, ra) = cv2.minAreaRect(p)
             return np.array([*c, *s, a]), np.array([*rc, *rs, ra])
-        run(f"minAreaRect {nm}", mar)
+        run(f"minAreaRect {nm}", mar, fma_tol(np.array([*cv2.minAreaRect(p)[0], *cv2.minAreaRect(p)[1], cv2.minAreaRect(p)[2]])))
         run(f"boxPoints {nm}", lambda: (vs.box_points(cv2.minAreaRect(p)), cv2.boxPoints(cv2.minAreaRect(p))))
         def mec():
             (c, r) = vs.min_enclosing_circle(p)
             (rc, rr) = cv2.minEnclosingCircle(p)
             return np.array([*c, r]), np.array([*rc, rr])
-        run(f"minEnclosingCircle {nm}", mec)
+        run(f"minEnclosingCircle {nm}", mec, fma_tol(np.array([*cv2.minEnclosingCircle(p)[0], cv2.minEnclosingCircle(p)[1]])))
         for eps in (0.5, 1.0, 3.0, 10.0):
             for closed in (True, False):
                 run(f"approxPolyDP eps{eps} closed{int(closed)} {nm}",
