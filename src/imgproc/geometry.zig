@@ -408,7 +408,7 @@ pub fn warpAffine(exec: Exec, src: anytype, dst: @TypeOf(src), m: [6]f64, interp
     }.run);
 }
 
-const WN = 16;
+const WN = 32;
 const VF = @Vector(WN, f32);
 
 /// `kcn` is the channel count when known at compile time, else 0.
@@ -550,9 +550,17 @@ inline fn warpLinear16(comptime cn: usize, s: Image(u8), fx: VF, fy: VF, ax: VF,
         outs[ch] = core.simd.narrow(u8, cl);
     }
     if (cn == 1) {
-        d[0..16].* = outs[0];
+        d[0..WN].* = outs[0];
     } else {
-        core.vec.store(cn, outs, d.ptr);
+        // Interleave 16 pixels at a time.
+        inline for (0..WN / 16) |h| {
+            var part: [cn]core.vec.V16 = undefined;
+            inline for (0..cn) |ch| {
+                const a: [WN]u8 = outs[ch];
+                part[ch] = a[h * 16 ..][0..16].*;
+            }
+            core.vec.store(cn, part, d.ptr + h * 16 * cn);
+        }
     }
 }
 
