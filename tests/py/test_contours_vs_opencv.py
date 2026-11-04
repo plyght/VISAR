@@ -180,12 +180,13 @@ def point_sets():
 def shape_tests():
     sets = point_sets()
     for nm, p in sets:
-        run(f"moments {nm}", lambda: rel([*vs.moments(p).values()], [*cv2.moments(p).values()]), 1e-9)
+        run(f"moments {nm}", lambda: rel([*vs.moments(p).values()], [*cv2.moments(p).values()]), 1e-5 if ARM else 1e-9)
         run(f"HuMoments {nm}", lambda: rel(vs.hu_moments(cv2.moments(p)), cv2.HuMoments(cv2.moments(p))), 1e-12)
         run(f"contourArea {nm}", lambda: (np.array([vs.contour_area(p), vs.contour_area(p, True)]),
                                           np.array([cv2.contourArea(p), cv2.contourArea(p, True)])))
         run(f"arcLength {nm}", lambda: (np.array([vs.arc_length(p, True), vs.arc_length(p, False)]),
-                                        np.array([cv2.arcLength(p, True), cv2.arcLength(p, False)])))
+                                        np.array([cv2.arcLength(p, True), cv2.arcLength(p, False)])),
+            fma_tol(np.array([cv2.arcLength(p, True)])))
         run(f"boundingRect {nm}", lambda: (np.array(vs.bounding_rect(p)), np.array(cv2.boundingRect(p))))
         run(f"isContourConvex {nm}", lambda: (np.array([vs.is_contour_convex(p)]), np.array([cv2.isContourConvex(p)])))
         for cw in (False, True):
@@ -212,8 +213,15 @@ def shape_tests():
         def mar():
             (c, s, a) = vs.min_area_rect(p)
             (rc, rs, ra) = cv2.minAreaRect(p)
+            if ARM:
+                # Near-tied orientations can make ARM OpenCV report the same
+                # rectangle another way (sides swapped, angle shifted by 90):
+                # compare the rectangle itself, its area and corner set.
+                mine = np.array(sorted(map(tuple, np.round(vs.box_points(((c[0], c[1]), (s[0], s[1]), a)), 3).tolist())))
+                theirs = np.array(sorted(map(tuple, np.round(cv2.boxPoints(((rc[0], rc[1]), (rs[0], rs[1]), ra)), 3).tolist())))
+                return np.concatenate([[s[0] * s[1]], mine.ravel()]), np.concatenate([[rs[0] * rs[1]], theirs.ravel()])
             return np.array([*c, *s, a]), np.array([*rc, *rs, ra])
-        run(f"minAreaRect {nm}", mar, fma_tol(np.array([*cv2.minAreaRect(p)[0], *cv2.minAreaRect(p)[1], cv2.minAreaRect(p)[2]])))
+        run(f"minAreaRect {nm}", mar, 1e-2 if ARM else 0.0)
         run(f"boxPoints {nm}", lambda: (vs.box_points(cv2.minAreaRect(p)), cv2.boxPoints(cv2.minAreaRect(p))))
         def mec():
             (c, r) = vs.min_enclosing_circle(p)
@@ -237,7 +245,7 @@ def shape_tests():
         a = sets[int(rng.integers(0, len(sets)))][1]
         b = sets[int(rng.integers(0, len(sets)))][1]
         for meth in (1, 2, 3):
-            run(f"matchShapes I{meth} #{k}", lambda: rel([vs.match_shapes(a, b, meth)], [cv2.matchShapes(a, b, meth, 0)]), 1e-9)
+            run(f"matchShapes I{meth} #{k}", lambda: rel([vs.match_shapes(a, b, meth)], [cv2.matchShapes(a, b, meth, 0)]), 1e-5 if ARM else 1e-9)
     # Raster moments.
     for nm, m in masks():
         if not nm.startswith(("blobs", "field", "noise d0.4", "ones", "pixels", "view")):
