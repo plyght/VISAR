@@ -132,9 +132,9 @@ pub fn contourMoments(pts: anytype) Moments {
     var a21: f64 = 0;
     var a12: f64 = 0;
     var a03: f64 = 0;
-    // Four points per step in f64 lanes (each point with its predecessor),
+    // Eight points per step in f64 lanes (each point with its predecessor),
     // reduced at the end; the scalar loop below finishes the tail.
-    const L = 4;
+    const L = 8;
     const VD = @Vector(L, f64);
     var v: [10]VD = @splat(@splat(0));
     var start: usize = 0;
