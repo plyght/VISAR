@@ -1185,6 +1185,162 @@ pub fn minEnclosingCircle(gpa: Allocator, pts_in: anytype) Allocator.Error!Circl
 
 /// approxPolyDP (Ramer-Douglas-Peucker as OpenCV implements it). Writes
 /// the result to `out` (at least pts.len entries) and returns its length.
+/// Farthest point of pts[lo..hi) from `start_pt` (squared distance in
+/// f64 of the coordinate differences): updates `best`/`best_idx` like a
+/// strict-greater scalar scan.
+fn farScan(comptime P: type, pts: []const P, lo: usize, hi: usize, start_pt: P, best: *f64, best_idx: *usize) void {
+    const C = @TypeOf(start_pt.x);
+    const L = 4;
+    const VC = @Vector(L, C);
+    const VD = @Vector(L, f64);
+    const VI = @Vector(L, u32);
+    const isf = C == f32;
+    var lane_max: VD = @splat(-std.math.inf(f64));
+    var lane_idx: VI = @splat(0);
+    const sx: VC = @splat(start_pt.x);
+    const sy: VC = @splat(start_pt.y);
+    const iota: VI = .{ 0, 1, 2, 3 };
+    var i = lo;
+    while (i + L <= hi) : (i += L) {
+        var xa: [L]C = undefined;
+        var ya: [L]C = undefined;
+        inline for (0..L) |k| {
+            xa[k] = pts[i + k].x;
+            ya[k] = pts[i + k].y;
+        }
+        const ddx: VC = if (isf) @as(VC, xa) - sx else @as(VC, xa) -% sx;
+        const ddy: VC = if (isf) @as(VC, ya) - sy else @as(VC, ya) -% sy;
+        const fx: VD = if (isf) @floatCast(ddx) else @floatFromInt(ddx);
+        const fy: VD = if (isf) @floatCast(ddy) else @floatFromInt(ddy);
+        const d = fx * fx + fy * fy;
+        const gt = d > lane_max;
+        lane_max = @select(f64, gt, d, lane_max);
+        lane_idx = @select(u32, gt, @as(VI, @splat(@intCast(i))) + iota, lane_idx);
+    }
+    const m = @reduce(.Max, lane_max);
+    var idx: u32 = std.math.maxInt(u32);
+    const ma: [L]f64 = lane_max;
+    const ia: [L]u32 = lane_idx;
+    inline for (0..L) |k| {
+        if (ma[k] == m and ia[k] < idx) idx = ia[k];
+    }
+    var cur_max = m;
+    var cur_idx: usize = idx;
+    while (i < hi) : (i += 1) {
+        const dx = toD(sub(pts[i].x, start_pt.x));
+        const dy = toD(sub(pts[i].y, start_pt.y));
+        const d = dx * dx + dy * dy;
+        if (d > cur_max) {
+            cur_max = d;
+            cur_idx = i;
+        }
+    }
+    if (cur_max > best.*) {
+        best.* = cur_max;
+        best_idx.* = cur_idx;
+    }
+}
+
+/// Douglas-Peucker distance scan of pts[lo..hi): if the largest distance
+/// measure exceeds `best`, sets `best` and `best_idx` to it and its first
+/// index (the scalar loop's strict `>` order). Four points per step with
+/// the scalar formulas lane by lane, so the values are identical.
+fn dpScan(comptime P: type, pts: []const P, lo: usize, hi: usize, start_pt: P, end_pt: P, dx: f64, dy: f64, seg2: f64, best: *f64, best_idx: *usize) void {
+    const C = @TypeOf(start_pt.x);
+    const L = 4;
+    const VC = @Vector(L, C);
+    const VD = @Vector(L, f64);
+    const VI = @Vector(L, u32);
+    const isf = C == f32;
+    const vs = struct {
+        inline fn sub_(a: VC, b: VC) VC {
+            return if (isf) a - b else a -% b;
+        }
+        inline fn mul_(a: VC, b: VC) VC {
+            return if (isf) a * b else a *% b;
+        }
+        inline fn add_(a: VC, b: VC) VC {
+            return if (isf) a + b else a +% b;
+        }
+        inline fn d(a: VC) VD {
+            return if (isf) @floatCast(a) else @floatFromInt(a);
+        }
+    };
+    var lane_max: VD = @splat(-std.math.inf(f64));
+    var lane_idx: VI = @splat(0);
+    const sx: VC = @splat(start_pt.x);
+    const sy: VC = @splat(start_pt.y);
+    const ex0: VC = @splat(end_pt.x);
+    const ey0: VC = @splat(end_pt.y);
+    const vdx: VD = @splat(dx);
+    const vdy: VD = @splat(dy);
+    const vseg: VD = @splat(seg2);
+    const iota: VI = .{ 0, 1, 2, 3 };
+    var i = lo;
+    while (i + L <= hi) : (i += L) {
+        var xa: [L]C = undefined;
+        var ya: [L]C = undefined;
+        inline for (0..L) |k| {
+            xa[k] = pts[i + k].x;
+            ya[k] = pts[i + k].y;
+        }
+        const px: VC = xa;
+        const py: VC = ya;
+        const ddx = vs.sub_(px, sx);
+        const ddy = vs.sub_(py, sy);
+        const fdx = vs.d(ddx);
+        const fdy = vs.d(ddy);
+        const projection = fdx * vdx + fdy * vdy;
+        const d_start = vs.d(vs.add_(vs.mul_(ddx, ddx), vs.mul_(ddy, ddy))) * vseg;
+        const ex = vs.sub_(px, ex0);
+        const ey = vs.sub_(py, ey0);
+        const d_end = vs.d(vs.add_(vs.mul_(ex, ex), vs.mul_(ey, ey))) * vseg;
+        const dist = fdy * vdx - fdx * vdy;
+        const d_line = dist * dist;
+        const zero: VD = @splat(0);
+        const d2 = @select(f64, projection < zero, d_start, @select(f64, projection > vseg, d_end, d_line));
+        const gt = d2 > lane_max;
+        lane_max = @select(f64, gt, d2, lane_max);
+        lane_idx = @select(u32, gt, @as(VI, @splat(@intCast(i))) + iota, lane_idx);
+    }
+    // Earliest index of the range maximum.
+    const m = @reduce(.Max, lane_max);
+    var idx: u32 = std.math.maxInt(u32);
+    const ma: [L]f64 = lane_max;
+    const ia: [L]u32 = lane_idx;
+    inline for (0..L) |k| {
+        if (ma[k] == m and ia[k] < idx) idx = ia[k];
+    }
+    var cur_max = m;
+    var cur_idx: usize = idx;
+    // Tail, scalar, continuing the strict-greater scan.
+    while (i < hi) : (i += 1) {
+        const pt = pts[i];
+        const ddx = sub(pt.x, start_pt.x);
+        const ddy = sub(pt.y, start_pt.y);
+        const projection = toD(ddx) * dx + toD(ddy) * dy;
+        var d2: f64 = undefined;
+        if (projection < 0) {
+            d2 = toD(add(mul(ddx, ddx), mul(ddy, ddy))) * seg2;
+        } else if (projection > seg2) {
+            const ex = sub(pt.x, end_pt.x);
+            const ey = sub(pt.y, end_pt.y);
+            d2 = toD(add(mul(ex, ex), mul(ey, ey))) * seg2;
+        } else {
+            const dist = toD(ddy) * dx - toD(ddx) * dy;
+            d2 = dist * dist;
+        }
+        if (d2 > cur_max) {
+            cur_max = d2;
+            cur_idx = i;
+        }
+    }
+    if (cur_max > best.*) {
+        best.* = cur_max;
+        best_idx.* = cur_idx;
+    }
+}
+
 pub fn approxPolyDP(gpa: Allocator, pts: anytype, out: []std.meta.Elem(@TypeOf(pts)), epsilon_in: f64, closed: bool) (Allocator.Error || error{InvalidArgument})!usize {
     const P = std.meta.Elem(@TypeOf(pts));
     if (epsilon_in < 0 or !(epsilon_in < 1e30)) return error.InvalidArgument;
@@ -1229,18 +1385,20 @@ pub fn approxPolyDP(gpa: Allocator, pts: anytype, out: []std.meta.Elem(@TypeOf(p
             start_pt = pts[pos];
             pos += 1;
             if (pos >= count) pos = 0;
-            for (1..count) |j| {
-                pt = pts[pos];
-                pos += 1;
-                if (pos >= count) pos = 0;
-                const dx = toD(sub(pt.x, start_pt.x));
-                const dy = toD(sub(pt.y, start_pt.y));
-                const dist = dx * dx + dy * dy;
-                if (dist > max_dist) {
-                    max_dist = dist;
-                    right_slice.start = j;
-                }
+            // Scan positions pos, pos+1, ... (count - 1 points, wrapping)
+            // for the farthest point; j is its 1-based scan step.
+            var done: usize = 0;
+            var p = pos;
+            while (done < count - 1) {
+                const len = @min(count - p, count - 1 - done);
+                var best_idx: usize = 0;
+                const before = max_dist;
+                farScan(P, pts, p, p + len, start_pt, &max_dist, &best_idx);
+                if (max_dist > before) right_slice.start = done + 1 + (best_idx - p);
+                done += len;
+                p = (p + len) % count;
             }
+            pos = p;
             le_eps = max_dist <= eps;
         }
         if (!le_eps) {
@@ -1268,6 +1426,15 @@ pub fn approxPolyDP(gpa: Allocator, pts: anytype, out: []std.meta.Elem(@TypeOf(p
             const dx = toD(sub(end_pt.x, start_pt.x));
             const dy = toD(sub(end_pt.y, start_pt.y));
             const seg2 = dx * dx + dy * dy;
+            // The scan as up to two linear segments (it may wrap), each a
+            // vectorised arg-max; same per-point arithmetic as below.
+            var p = pos;
+            while (p != slice.end) {
+                const seg_end = if (slice.end > p) slice.end else count;
+                dpScan(P, pts, p, seg_end, start_pt, end_pt, dx, dy, seg2, &max_d, &right_slice.start);
+                p = seg_end % count;
+            }
+            pos = slice.end;
             while (pos != slice.end) {
                 pt = pts[pos];
                 pos += 1;
