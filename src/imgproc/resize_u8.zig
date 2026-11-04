@@ -719,9 +719,18 @@ fn up2HCubic(comptime cn: usize, s: []const u8, out: Planar(f32), we: [4]i32, wo
 
 /// Rounds half to even and saturates to u8, like OpenCV's v_round + packs.
 inline fn roundU8(v: @Vector(16, f32)) vec.V16 {
-    // OpenCV's saturate_cast<uchar>(float): round half to even and clamp,
-    // which simd.satF32 does with one conversion per register (cvtps2dq /
-    // fcvtns) and saturating unsigned narrows.
+    // OpenCV's saturate_cast<uchar>(float): round half to even and clamp.
+    // AVX-512: one zmm conversion. Elsewhere simd.satF32 (cvtps2dq /
+    // fcvtns and saturating narrows; A/B: Apple Silicon 1.24x, AVX2 1.16x
+    // over the magic-number rint).
+    if (use_asm and avx512f) {
+        const I = @Vector(16, i32);
+        const q: I = asm ("vcvtps2dq %[v], %[ret]"
+            : [ret] "=v" (-> I),
+            : [v] "v" (v),
+        );
+        return simd.narrow(u8, @min(@max(q, @as(I, @splat(0))), @as(I, @splat(255))));
+    }
     return simd.satF32(u8, 16, v);
 }
 
