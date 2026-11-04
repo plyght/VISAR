@@ -447,7 +447,7 @@ inline fn mulhi(a: @Vector(32, i16), b: @Vector(32, i16)) @Vector(32, i16) {
 /// OpenCV's VResizeLinearVec_32s8u: rows hold (sum >> 4) as i16, each is
 /// scaled with a 16-bit high multiply by its weight, then (+2) >> 2.
 fn vlinear(r0: []const i16, r1: []const i16, b: [2]i32, d: []u8) void {
-    const N = 64;
+    const N = 32;
     const V = @Vector(N, i16);
     const b0: V = @splat(@intCast(b[0]));
     const b1: V = @splat(@intCast(b[1]));
