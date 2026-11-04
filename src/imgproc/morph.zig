@@ -344,7 +344,7 @@ fn edgeRun(comptime op: Op, comptime T: type, o: []T, s: []const T, cn: usize, a
 
 /// Bytes of preprocessed rows a band keeps live; wider rows are processed
 /// in column strips so the ring stays in L2.
-const ring_budget = 64 * 1024;
+const ring_budget = 512 * 1024;
 
 /// Output rows [y0, y1) of one pass, with a ring of `el.h` preprocessed
 /// source rows.
