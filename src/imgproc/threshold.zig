@@ -166,7 +166,9 @@ pub fn histogram8Exec(exec: Exec, src: Image(u8), hist: *[256]u32) void {
 fn histRows(src: Image(u8), y0: usize, y1: usize, hist: *[256]u32) void {
     // Sub-histograms hide store-to-load dependencies on repeated values
     // (common in natural images, where neighbours are often equal).
-    var h: [8][256]u32 = @splat(@splat(0));
+    // Pixel i of each 16 goes to sub-histogram i: equal neighbours (common
+    // in natural images) only meet the same counters 16 pixels apart.
+    var h: [16][256]u32 = @splat(@splat(0));
     for (y0..y1) |y| {
         const r = src.row(y);
         var i: usize = 0;
@@ -175,7 +177,7 @@ fn histRows(src: Image(u8), y0: usize, y1: usize, hist: *[256]u32) void {
             const b = std.mem.readInt(u64, r[i + 8 ..][0..8], .little);
             inline for (0..8) |j| {
                 h[j][@as(u8, @truncate(a >> (8 * j)))] += 1;
-                h[(j + 4) % 8][@as(u8, @truncate(b >> (8 * j)))] += 1;
+                h[8 + j][@as(u8, @truncate(b >> (8 * j)))] += 1;
             }
         }
         while (i < r.len) : (i += 1) h[0][r[i]] += 1;
