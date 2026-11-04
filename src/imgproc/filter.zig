@@ -138,7 +138,7 @@ fn separable(comptime P: type, exec: Exec, gpa: Allocator, src: Image(P.S), dst:
 /// such as Apple's busy and lets NEON use its paired widening instructions.
 fn lanes(comptime T: type) comptime_int {
     const native = @max(4, std.simd.suggestVectorLength(T) orelse 4);
-    return if (native * @sizeOf(T) < 32) native * 2 else native;
+    return @max(native, 64 / @sizeOf(T));
 }
 
 /// Converts a vector of S to a vector of A (int widening, int->float, ...).
