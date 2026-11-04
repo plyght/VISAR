@@ -95,6 +95,7 @@ pub fn pyrDown(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), bord
 /// compile time (1-4), else 0.
 fn downChunk(comptime T: type, comptime ccn: usize, s: Image(T), d: Image(T), border: Border, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
     if (T == u8 and (ccn == 3 or ccn == 4)) return downChunkPlanar(ccn, s, d, border, gpa, y0, y1);
+    if (T == f32 and (ccn == 3 or ccn == 4)) return downChunkPlanarF(ccn, s, d, border, gpa, y0, y1);
     const A = Acc(T);
     const N = comptime lanes(A);
     const cn: usize = if (ccn != 0) ccn else s.channels;
@@ -217,6 +218,124 @@ fn downChunkPlanar(comptime cn: usize, s: Image(u8), d: Image(u8), border: Borde
                 const pl = planes[c];
                 const q = 2 * ox;
                 out[ox * cn + c] = finishS(u8, 8, (pl[q] + pl[q + 4]) + (pl[q + 1] + pl[q + 3]) * 4 + pl[q + 2] * 6);
+            }
+        }
+    }
+}
+
+const neon_st = core.simd.llvm_intrinsics and @import("builtin").cpu.arch == .aarch64;
+const neon = struct {
+    extern fn @"llvm.aarch64.neon.st3.v4f32.p0"(@Vector(4, f32), @Vector(4, f32), @Vector(4, f32), [*]f32) void;
+    extern fn @"llvm.aarch64.neon.st4.v4f32.p0"(@Vector(4, f32), @Vector(4, f32), @Vector(4, f32), @Vector(4, f32), [*]f32) void;
+};
+
+/// downChunkPlanar for f32: deinterleave/interleave through stride
+/// shuffles (ld3/st3 .4s on NEON), same plane layout and pass structure.
+fn downChunkPlanarF(comptime cn: usize, s: Image(f32), d: Image(f32), border: Border, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
+    const w: usize = s.width;
+    const N = 8;
+    const V = @Vector(N, f32);
+    const plen = w + 4 + 2 * N + 8;
+    const buf = try gpa.alloc(f32, cn * plen);
+    defer gpa.free(buf);
+    @memset(buf, 0);
+    var planes: [cn][]f32 = undefined;
+    inline for (0..cn) |c| planes[c] = buf[c * plen ..][0..plen];
+    var lmap: [2]usize = undefined;
+    var rmap: [2]usize = undefined;
+    for (0..2) |i| {
+        lmap[i] = border_mod.map(@as(isize, @intCast(i)) - 2, w, border).?;
+        rmap[i] = border_mod.map(@intCast(w + i), w, border).?;
+    }
+    const split = comptime blk: {
+        var m: [cn][N]i32 = undefined;
+        for (0..cn) |c| for (0..N) |i| {
+            m[c][i] = @intCast(i * cn + c);
+        };
+        break :blk m;
+    };
+    const ev = comptime blk: {
+        var m: [N]i32 = undefined;
+        for (0..N) |i| m[i] = @intCast(2 * i);
+        break :blk m;
+    };
+    const od = comptime blk: {
+        var m: [N]i32 = undefined;
+        for (0..N) |i| m[i] = @intCast(2 * i + 1);
+        break :blk m;
+    };
+    const dw: usize = d.width;
+    for (y0..y1) |y| {
+        var rows: [5][*]const f32 = undefined;
+        for (0..5) |k| {
+            const sy = border_mod.map(@as(isize, @intCast(2 * y + k)) - 2, s.height, border).?;
+            rows[k] = s.row(sy).ptr;
+        }
+        var x: usize = 0;
+        while (x + N <= w) : (x += N) {
+            var t: [5][cn]V = undefined;
+            inline for (0..5) |k| {
+                const wv: @Vector(N * cn, f32) = rows[k][x * cn ..][0 .. N * cn].*;
+                inline for (0..cn) |c| t[k][c] = @shuffle(f32, wv, undefined, split[c]);
+            }
+            inline for (0..cn) |c| planes[c][2 + x ..][0..N].* = (t[0][c] + t[4][c]) + (t[1][c] + t[3][c]) * @as(V, @splat(4)) + t[2][c] * @as(V, @splat(6));
+        }
+        while (x < w) : (x += 1) {
+            inline for (0..cn) |c| {
+                const i = x * cn + c;
+                planes[c][2 + x] = (rows[0][i] + rows[4][i]) + (rows[1][i] + rows[3][i]) * 4 + rows[2][i] * 6;
+            }
+        }
+        inline for (0..cn) |c| {
+            const pl = planes[c];
+            for (0..2) |i| {
+                pl[i] = pl[2 + lmap[i]];
+                pl[2 + w + i] = pl[2 + rmap[i]];
+            }
+        }
+        const out = d.row(y);
+        const join = comptime blk: {
+            var m: [N * cn]i32 = undefined;
+            for (0..N) |i| for (0..cn) |c| {
+                m[i * cn + c] = @intCast(c * N + i);
+            };
+            break :blk m;
+        };
+        var ox: usize = 0;
+        while (ox + N <= dw) : (ox += N) {
+            var res: [cn * N]f32 = undefined;
+            inline for (0..cn) |c| {
+                const pl = planes[c];
+                const w0: @Vector(2 * N, f32) = pl[2 * ox ..][0 .. 2 * N].*;
+                const w1: @Vector(2 * N, f32) = pl[2 * ox + 2 ..][0 .. 2 * N].*;
+                const w2: @Vector(2 * N, f32) = pl[2 * ox + 4 ..][0 .. 2 * N].*;
+                const e0: V = @shuffle(f32, w0, undefined, ev);
+                const o0: V = @shuffle(f32, w0, undefined, od);
+                const e1: V = @shuffle(f32, w1, undefined, ev);
+                const o1: V = @shuffle(f32, w1, undefined, od);
+                const e2: V = @shuffle(f32, w2, undefined, ev);
+                const v = (e0 + e2) + (o0 + o1) * @as(V, @splat(4)) + e1 * @as(V, @splat(6));
+                res[c * N ..][0..N].* = finishV(f32, 8, N, v);
+            }
+            if (comptime neon_st) {
+                // LLVM does not match the interleaving shuffle to st3/st4.
+                const F4 = @Vector(4, f32);
+                inline for (0..N / 4) |h| {
+                    var q: [cn]F4 = undefined;
+                    inline for (0..cn) |c| q[c] = res[c * N + h * 4 ..][0..4].*;
+                    const dst = out.ptr + (ox + h * 4) * cn;
+                    if (cn == 3) neon.@"llvm.aarch64.neon.st3.v4f32.p0"(q[0], q[1], q[2], dst) else neon.@"llvm.aarch64.neon.st4.v4f32.p0"(q[0], q[1], q[2], q[3], dst);
+                }
+            } else {
+                const all: @Vector(cn * N, f32) = res;
+                out[ox * cn ..][0 .. N * cn].* = @shuffle(f32, all, undefined, join);
+            }
+        }
+        while (ox < dw) : (ox += 1) {
+            inline for (0..cn) |c| {
+                const pl = planes[c];
+                const q = 2 * ox;
+                out[ox * cn + c] = finishS(f32, 8, (pl[q] + pl[q + 4]) + (pl[q + 1] + pl[q + 3]) * 4 + pl[q + 2] * 6);
             }
         }
     }
