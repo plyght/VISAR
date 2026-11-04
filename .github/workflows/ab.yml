@@ -1,0 +1,53 @@
+name: ab
+
+# Manual A/B timing of two commits on a real runner (default: Apple
+# Silicon), interleaved call by call. Used to check that an optimisation
+# helps on hardware the developer does not have locally.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "A: commit, branch or tag"
+        default: "main~1"
+      head:
+        description: "B: commit, branch or tag"
+        default: "main"
+      filter:
+        description: "comma-separated case-name substrings (empty = all)"
+        default: ""
+      threads:
+        description: "threads"
+        default: "1"
+      runner:
+        description: "runner label"
+        default: "macos-latest"
+
+jobs:
+  ab:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install numpy "opencv-python-headless==5.0.0.*"
+      - name: Build A and B
+        run: |
+          set -eu
+          for side in A:${{ inputs.base }} B:${{ inputs.head }}; do
+            tag="${side%%:*}"; ref="${side#*:}"
+            git worktree add "../src-$tag" "$ref"
+            (cd "../src-$tag" && zig build -Doptimize=ReleaseFast --prefix "$GITHUB_WORKSPACE/../out-$tag")
+          done
+      - name: Time
+        run: |
+          ext=so; [ "$RUNNER_OS" = macOS ] && ext=dylib
+          python3 bench/ab.py "../out-A/lib/libvisar.$ext" "../out-B/lib/libvisar.$ext" \
+            --filter "${{ inputs.filter }}" --threads "${{ inputs.threads }}" --md ab.md
+          { echo "### A = \`${{ inputs.base }}\`, B = \`${{ inputs.head }}\` on ${{ inputs.runner }}"; echo; cat ab.md; } >> "$GITHUB_STEP_SUMMARY"
