@@ -94,7 +94,6 @@ pub fn pyrDown(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), bord
 /// Rows [y0, y1) of pyrDown. `ccn` is the channel count when known at
 /// compile time (1-4), else 0.
 fn downChunk(comptime T: type, comptime ccn: usize, s: Image(T), d: Image(T), border: Border, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
-    if (T == u8 and (ccn == 3 or ccn == 4)) return downChunkPlanar(ccn, s, d, border, gpa, y0, y1);
     if (T == f32 and (ccn == 3 or ccn == 4)) return downChunkPlanarF(ccn, s, d, border, gpa, y0, y1);
     const A = Acc(T);
     const N = comptime lanes(A);
@@ -126,100 +125,6 @@ fn downChunk(comptime T: type, comptime ccn: usize, s: Image(T), d: Image(T), bo
         }
         const out = d.row(y);
         if (ccn != 0) hdown(T, A, ccn, p, out) else hdownGeneric(T, A, cn, p, out);
-    }
-}
-
-/// pyrDown rows for 3- and 4-channel u8 images through per-channel planes:
-/// the vertical pass deinterleaves the source (ldN on NEON) into one u16
-/// row per channel, each plane gets the even-outputs-only horizontal pass
-/// of the 1-channel case, and the u8 results are interleaved again (stN).
-fn downChunkPlanar(comptime cn: usize, s: Image(u8), d: Image(u8), border: Border, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
-    const w: usize = s.width;
-    const N = 16;
-    // Plane c: [2 left pixels][w pixels][2 right pixels][slack].
-    const plen = w + 4 + 2 * N + 8;
-    const buf = try gpa.alloc(u16, cn * plen);
-    defer gpa.free(buf);
-    @memset(buf, 0);
-    var planes: [cn][]u16 = undefined;
-    inline for (0..cn) |c| planes[c] = buf[c * plen ..][0..plen];
-    var lmap: [2]usize = undefined;
-    var rmap: [2]usize = undefined;
-    for (0..2) |i| {
-        lmap[i] = border_mod.map(@as(isize, @intCast(i)) - 2, w, border).?;
-        rmap[i] = border_mod.map(@intCast(w + i), w, border).?;
-    }
-    const V = @Vector(N, u16);
-    const dw: usize = d.width;
-    for (y0..y1) |y| {
-        var rows: [5][*]const u8 = undefined;
-        for (0..5) |k| {
-            const sy = border_mod.map(@as(isize, @intCast(2 * y + k)) - 2, s.height, border).?;
-            rows[k] = s.row(sy).ptr;
-        }
-        // Vertical: planes[c][2 + x] = r0 + 4 r1 + 6 r2 + 4 r3 + r4.
-        var x: usize = 0;
-        while (x + N <= w) : (x += N) {
-            var ch: [5][cn]core.vec.V16 = undefined;
-            inline for (0..5) |k| ch[k] = core.vec.load(cn, rows[k] + x * cn);
-            inline for (0..cn) |c| {
-                const a: V = ch[0][c];
-                const b: V = ch[1][c];
-                const m: V = ch[2][c];
-                const e: V = ch[3][c];
-                const f: V = ch[4][c];
-                planes[c][2 + x ..][0..N].* = (a + f) + (b + e) * @as(V, @splat(4)) + m * @as(V, @splat(6));
-            }
-        }
-        while (x < w) : (x += 1) {
-            inline for (0..cn) |c| {
-                const i = x * cn + c;
-                planes[c][2 + x] = (@as(u16, rows[0][i]) + rows[4][i]) + (@as(u16, rows[1][i]) + rows[3][i]) * 4 + @as(u16, rows[2][i]) * 6;
-            }
-        }
-        inline for (0..cn) |c| {
-            const pl = planes[c];
-            for (0..2) |i| {
-                pl[i] = pl[2 + lmap[i]];
-                pl[2 + w + i] = pl[2 + rmap[i]];
-            }
-        }
-        // Horizontal, even outputs only, then interleave.
-        const out = d.row(y);
-        const ev = comptime blk: {
-            var m: [N]i32 = undefined;
-            for (0..N) |i| m[i] = @intCast(2 * i);
-            break :blk m;
-        };
-        const od = comptime blk: {
-            var m: [N]i32 = undefined;
-            for (0..N) |i| m[i] = @intCast(2 * i + 1);
-            break :blk m;
-        };
-        var ox: usize = 0;
-        while (ox + N <= dw) : (ox += N) {
-            var res: [cn]core.vec.V16 = undefined;
-            inline for (0..cn) |c| {
-                const pl = planes[c];
-                const w0: @Vector(2 * N, u16) = pl[2 * ox ..][0 .. 2 * N].*;
-                const w1: @Vector(2 * N, u16) = pl[2 * ox + 2 ..][0 .. 2 * N].*;
-                const w2: @Vector(2 * N, u16) = pl[2 * ox + 4 ..][0 .. 2 * N].*;
-                const e0: V = @shuffle(u16, w0, undefined, ev);
-                const o0: V = @shuffle(u16, w0, undefined, od);
-                const e1: V = @shuffle(u16, w1, undefined, ev);
-                const o1: V = @shuffle(u16, w1, undefined, od);
-                const e2: V = @shuffle(u16, w2, undefined, ev);
-                res[c] = finishV(u8, 8, N, (e0 + e2) + (o0 + o1) * @as(V, @splat(4)) + e1 * @as(V, @splat(6)));
-            }
-            core.vec.store(cn, res, out.ptr + ox * cn);
-        }
-        while (ox < dw) : (ox += 1) {
-            inline for (0..cn) |c| {
-                const pl = planes[c];
-                const q = 2 * ox;
-                out[ox * cn + c] = finishS(u8, 8, (pl[q] + pl[q + 4]) + (pl[q + 1] + pl[q + 3]) * 4 + pl[q + 2] * 6);
-            }
-        }
     }
 }
 
@@ -394,33 +299,6 @@ fn hdown(comptime T: type, comptime A: type, comptime cn: usize, p: []const A, o
     };
     const step = (N / cn) * cn;
     var x: usize = 0;
-    if (cn == 1) {
-        // Only the even outputs: with e/o the even/odd samples (a plain
-        // wide load plus stride shuffle, i.e. ld2 on NEON),
-        // out[x] = e[x] + 4 o[x] + 6 e[x+1] + 4 o[x+1] + e[x+2].
-        const V = @Vector(N, A);
-        const ev = comptime blk: {
-            var m: [N]i32 = undefined;
-            for (0..N) |i| m[i] = @intCast(2 * i);
-            break :blk m;
-        };
-        const od = comptime blk: {
-            var m: [N]i32 = undefined;
-            for (0..N) |i| m[i] = @intCast(2 * i + 1);
-            break :blk m;
-        };
-        while (x + N <= out.len) : (x += N) {
-            const w0: @Vector(2 * N, A) = p[2 * x ..][0 .. 2 * N].*;
-            const w1: @Vector(2 * N, A) = p[2 * x + 2 ..][0 .. 2 * N].*;
-            const w2: @Vector(2 * N, A) = p[2 * x + 4 ..][0 .. 2 * N].*;
-            const e0: V = @shuffle(A, w0, undefined, ev);
-            const o0: V = @shuffle(A, w0, undefined, od);
-            const e1: V = @shuffle(A, w1, undefined, ev);
-            const o1: V = @shuffle(A, w1, undefined, od);
-            const e2: V = @shuffle(A, w2, undefined, ev);
-            out[x..][0..N].* = finishV(T, 8, N, (e0 + e2) + (o0 + o1) * splat(A, N, 4) + e1 * splat(A, N, 6));
-        }
-    }
     while (x + N <= out.len) : (x += step) {
         const lo = h5(A, N, p, 2 * x, cn);
         const hi = h5(A, N, p, 2 * x + N, cn);
