@@ -658,6 +658,68 @@ fn sklansky(comptime T: type, pts: anytype, order: []const u32, start: i32, end_
 /// OpenCV's order and orientation. `return_points` selects OpenCV's
 /// returnPoints mode, which skips the index-monotonicity fix-up; take
 /// `pts[i]` for each index to get the hull points. Caller frees.
+/// Orders integer points by (x, y, index) with an LSD radix sort on the
+/// key (x - min x) << bits(y) | (y - min y), 11 bits per pass; stability
+/// keeps equal points in index order. Returns false (order untouched)
+/// when the key would need more than 44 bits.
+fn radixOrder(gpa: Allocator, pts: anytype, order: []u32) Allocator.Error!bool {
+    const n = pts.len;
+    if (n < 64) return false;
+    var minx: i64 = pts[0].x;
+    var maxx: i64 = pts[0].x;
+    var miny: i64 = pts[0].y;
+    var maxy: i64 = pts[0].y;
+    for (pts) |p| {
+        minx = @min(minx, p.x);
+        maxx = @max(maxx, p.x);
+        miny = @min(miny, p.y);
+        maxy = @max(maxy, p.y);
+    }
+    const bits = struct {
+        fn f(range: u64) u6 {
+            return if (range == 0) 0 else @intCast(64 - @clz(range));
+        }
+    }.f;
+    const by = bits(@intCast(maxy - miny));
+    const bx = bits(@intCast(maxx - minx));
+    const total_bits: u32 = @as(u32, bx) + by;
+    if (total_bits > 44) return false;
+    const keys = try gpa.alloc(u64, 2 * n);
+    defer gpa.free(keys);
+    const idx2 = try gpa.alloc(u32, n);
+    defer gpa.free(idx2);
+    var ka = keys[0..n];
+    var kb = keys[n..];
+    var ia = order;
+    var ib = idx2;
+    for (pts, 0..) |p, i| {
+        ka[i] = (@as(u64, @intCast(p.x - minx)) << by) | @as(u64, @intCast(p.y - miny));
+        ia[i] = @intCast(i);
+    }
+    const digit = 11;
+    var shift: u32 = 0;
+    while (shift < total_bits) : (shift += digit) {
+        var count: [1 << digit]u32 = @splat(0);
+        for (ka) |k| count[@intCast((k >> @intCast(shift)) & ((1 << digit) - 1))] += 1;
+        var sum: u32 = 0;
+        for (&count) |*c| {
+            const t = c.*;
+            c.* = sum;
+            sum += t;
+        }
+        for (ka, ia) |k, i| {
+            const dgt: usize = @intCast((k >> @intCast(shift)) & ((1 << digit) - 1));
+            kb[count[dgt]] = k;
+            ib[count[dgt]] = i;
+            count[dgt] += 1;
+        }
+        std.mem.swap([]u64, &ka, &kb);
+        std.mem.swap([]u32, &ia, &ib);
+    }
+    if (ia.ptr != order.ptr) @memcpy(order, ia);
+    return true;
+}
+
 pub fn convexHull(gpa: Allocator, pts: anytype, clockwise: bool, return_points: bool) Allocator.Error![]u32 {
     const T = Coord(@TypeOf(pts));
     const total = pts.len;
@@ -674,7 +736,9 @@ pub fn convexHull(gpa: Allocator, pts: anytype, clockwise: bool, return_points: 
             return a < b;
         }
     };
-    if (T == i32) {
+    if (T == i32 and try radixOrder(gpa, pts, order)) {
+        // Sorted by a stable radix sort on the compacted (x, y) key.
+    } else if (T == i32) {
         // (x, y, index) packed into one integer key: same order, cheaper
         // comparisons.
         const keys = try gpa.alloc(u128, total);
