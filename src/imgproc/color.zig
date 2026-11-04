@@ -301,24 +301,16 @@ inline fn grayRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
                         return @splat(c & 0xff);
                     }
                 }.f;
-                const Blk = struct {
-                    inline fn f(src: [*]const T, dst: [*]T) void {
-                        const ch = vec.load(inf.scn, src);
-                        const b: W = ch[bi];
-                        const g: W = ch[1];
-                        const r: W = ch[ri];
-                        const hs = b * hi(B2G) + g * hi(G2G) + r * hi(R2G);
-                        const ls = b * lo(B2G) + g * lo(G2G) + r * lo(R2G);
-                        const t = hs + (ls >> @splat(8));
-                        dst[0..16].* = @as(vec.V16, @truncate((t + @as(W, @splat(64))) >> @splat(7)));
-                    }
-                };
-                // Two blocks per iteration: independent ldN chains overlap.
-                while (x + 32 <= width) : (x += 32) {
-                    Blk.f(s + x * inf.scn, d + x);
-                    Blk.f(s + (x + 16) * inf.scn, d + x + 16);
+                while (x + 16 <= width) : (x += 16) {
+                    const ch = vec.load(inf.scn, s + x * inf.scn);
+                    const b: W = ch[bi];
+                    const g: W = ch[1];
+                    const r: W = ch[ri];
+                    const hs = b * hi(B2G) + g * hi(G2G) + r * hi(R2G);
+                    const ls = b * lo(B2G) + g * lo(G2G) + r * lo(R2G);
+                    const t = hs + (ls >> @splat(8));
+                    d[x..][0..16].* = @as(vec.V16, @truncate((t + @as(W, @splat(64))) >> @splat(7)));
                 }
-                while (x + 16 <= width) : (x += 16) Blk.f(s + x * inf.scn, d + x);
             }
             while (x + 16 <= width) : (x += 16) {
                 const ch = vec.load(inf.scn, s + x * inf.scn);
