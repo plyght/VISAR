@@ -132,11 +132,76 @@ pub fn contourMoments(pts: anytype) Moments {
     var a21: f64 = 0;
     var a12: f64 = 0;
     var a03: f64 = 0;
-    var xi_1 = toD(pts[n - 1].x);
-    var yi_1 = toD(pts[n - 1].y);
+    // Four points per step in f64 lanes (each point with its predecessor),
+    // reduced at the end; the scalar loop below finishes the tail.
+    const L = 4;
+    const VD = @Vector(L, f64);
+    var v: [10]VD = @splat(@splat(0));
+    var start: usize = 0;
+    if (n >= L + 1) {
+        var i: usize = 1;
+        while (i + L <= n) : (i += L) {
+            var xa: [L]f64 = undefined;
+            var ya: [L]f64 = undefined;
+            var xpa: [L]f64 = undefined;
+            var ypa: [L]f64 = undefined;
+            inline for (0..L) |k| {
+                xa[k] = toD(pts[i + k].x);
+                ya[k] = toD(pts[i + k].y);
+                xpa[k] = toD(pts[i + k - 1].x);
+                ypa[k] = toD(pts[i + k - 1].y);
+            }
+            const xi: VD = xa;
+            const yi: VD = ya;
+            const xp: VD = xpa;
+            const yp: VD = ypa;
+            const xi2 = xi * xi;
+            const yi2 = yi * yi;
+            const xp2 = xp * xp;
+            const yp2 = yp * yp;
+            const dxy = xp * yi - xi * yp;
+            const xs = xp + xi;
+            const ys = yp + yi;
+            const two: VD = @splat(2);
+            const three: VD = @splat(3);
+            v[0] += dxy;
+            v[1] += dxy * xs;
+            v[2] += dxy * ys;
+            v[3] += dxy * (xp * xs + xi2);
+            v[4] += dxy * (xp * (ys + yp) + xi * (ys + yi));
+            v[5] += dxy * (yp * ys + yi2);
+            v[6] += dxy * xs * (xp2 + xi2);
+            v[7] += dxy * (xp2 * (three * yp + yi) + two * xi * xp * ys + xi2 * (yp + three * yi));
+            v[8] += dxy * (yp2 * (three * xp + xi) + two * yi * yp * xs + yi2 * (xp + three * xi));
+            v[9] += dxy * ys * (yp2 + yi2);
+        }
+        start = i;
+        a00 = @reduce(.Add, v[0]);
+        a10 = @reduce(.Add, v[1]);
+        a01 = @reduce(.Add, v[2]);
+        a20 = @reduce(.Add, v[3]);
+        a11 = @reduce(.Add, v[4]);
+        a02 = @reduce(.Add, v[5]);
+        a30 = @reduce(.Add, v[6]);
+        a21 = @reduce(.Add, v[7]);
+        a12 = @reduce(.Add, v[8]);
+        a03 = @reduce(.Add, v[9]);
+    }
+    // Remaining points (and point 0, whose predecessor is the last point).
+    var xi_1 = toD(pts[if (start == 0) n - 1 else start - 1].x);
+    var yi_1 = toD(pts[if (start == 0) n - 1 else start - 1].y);
     var xi_12 = xi_1 * xi_1;
     var yi_12 = yi_1 * yi_1;
-    for (pts) |p| {
+    const rest_end = if (start == 0) n else n + 1;
+    for (start..rest_end) |ri| {
+        const p = pts[ri % n];
+        if (start != 0 and ri == n) {
+            // Point 0 with its predecessor, the last point.
+            xi_1 = toD(pts[n - 1].x);
+            yi_1 = toD(pts[n - 1].y);
+            xi_12 = xi_1 * xi_1;
+            yi_12 = yi_1 * yi_1;
+        }
         const xi = toD(p.x);
         const yi = toD(p.y);
         const xi2 = xi * xi;
