@@ -35,7 +35,7 @@ fn Acc(comptime T: type) type {
 /// Lanes per step: at least 32 bytes of the accumulator.
 fn lanes(comptime A: type) comptime_int {
     const native = std.simd.suggestVectorLength(A) orelse 4;
-    return @max(native, 64 / @sizeOf(A));
+    return @max(native, 32 / @sizeOf(A));
 }
 
 inline fn widen(comptime A: type, comptime N: usize, v: anytype) @Vector(N, A) {

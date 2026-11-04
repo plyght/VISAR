@@ -617,7 +617,7 @@ test "erode/dilate rect vs general" {
 
 /// Morphology vectors are 32 bytes: nearly every load is unaligned (shifted
 /// by whole pixels), and 64-byte ones always split a cache line.
-const morph_vec_bytes = 64;
+const morph_vec_bytes = 128;
 fn lanesM(comptime T: type) comptime_int {
     return @max(1, morph_vec_bytes / @sizeOf(T));
 }
