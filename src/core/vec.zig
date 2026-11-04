@@ -273,23 +273,6 @@ pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map:
     // AArch64: ldN + stN do the whole reorder in two instructions per 16
     // pixels (measured faster than single-register tbl groups for BGR <->
     // RGB on Apple cores), two blocks per iteration.
-    if (comptime is_arm and scn == 3 and dcn == 3) {
-        // Same-size swap: a fixed permutation of each 48-byte block
-        // (three-register tbl lookups).
-        const mask48 = comptime blk: {
-            var m: [48]i32 = undefined;
-            for (0..16) |p| for (0..3) |c| {
-                m[p * 3 + c] = @intCast(p * 3 + map[c].?);
-            };
-            break :blk m;
-        };
-        var x: usize = 0;
-        while (x + 16 <= n) : (x += 16) {
-            const v: @Vector(48, u8) = s[x * 3 ..][0..48].*;
-            d[x * 3 ..][0..48].* = @shuffle(u8, v, undefined, mask48);
-        }
-        return x;
-    }
     if (comptime is_arm) {
         const f: V16 = @splat(fill);
         var x: usize = 0;
