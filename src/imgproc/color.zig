@@ -284,7 +284,7 @@ inline fn grayRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
                     d[x..][0..64].* = @as(vec.V64, @intCast(y_));
                 }
             }
-            if (vec.is_arm) {
+            if (true) {
                 // Coefficients split into bytes, c = 256 * hi + lo: both
                 // partial sums fit u16 and come from 8-bit multiply-
                 // accumulates (umull/umlal), and
