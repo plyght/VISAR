@@ -30,6 +30,8 @@ pub const Options = struct {
     score_threshold: f32 = 0.9,
     nms_threshold: f32 = 0.3,
     top_k: i32 = 5000,
+    /// Which backend runs the network (see `Net.Options.backend`).
+    backend: net_mod.Backend = .auto,
 };
 
 const divisor = 32;
@@ -55,6 +57,7 @@ pub const FaceDetector = struct {
         var heads: [12]usize = undefined;
         for (head_names, &heads) |name, *h| h.* = net.outputIndex(name) orelse return error.InvalidModel;
         if (net.inputCount() != 1) return error.InvalidModel;
+        net.opts.backend = opts.backend;
         var d: FaceDetector = .{ .gpa = gpa, .net = net, .opts = opts, .heads = heads };
         try d.setInputSize(opts.width, opts.height);
         return d;
@@ -76,6 +79,18 @@ pub const FaceDetector = struct {
         d.pad_w = ((width - 1) / divisor + 1) * divisor;
         d.pad_h = ((height - 1) / divisor + 1) * divisor;
         try d.net.plan(&.{&.{ 1, 3, d.pad_h, d.pad_w }});
+    }
+
+    /// Changes the backend and re-plans for the current size.
+    pub fn setBackend(d: *FaceDetector, b: net_mod.Backend) !void {
+        d.opts.backend = b;
+        d.net.opts.backend = b;
+        try d.setInputSize(d.opts.width, d.opts.height);
+    }
+
+    /// The backend the network runs on.
+    pub fn device(d: *const FaceDetector) net_mod.Device {
+        return d.net.device().?;
     }
 
     const PrepCtx = struct { img: Image(u8), blob: []f32, pw: usize, ph: usize };
@@ -118,7 +133,7 @@ pub const FaceDetector = struct {
                 }
             }
         }.f);
-        d.net.run(exec);
+        try d.net.tryRun(exec);
         return d.postProcess();
     }
 

@@ -910,7 +910,8 @@ export fn visar_dnn_net_free(h: ?*CNet) void {
 
 /// Plans the (single-input) network for an input of `rank` dims.
 export fn visar_dnn_net_plan(h: *CNet, shape: [*]const usize, rank: usize) c_int {
-    return run(h.net.plan(&.{shape[0..rank]}));
+    h.net.plan(&.{shape[0..rank]}) catch |e| return failDnn(e);
+    return 0;
 }
 
 /// The planned input buffer (plain NCHW f32) and its element count.
@@ -923,8 +924,66 @@ export fn visar_dnn_net_input(h: *CNet, count: *usize) ?[*]f32 {
 
 export fn visar_dnn_net_run(h: *CNet) c_int {
     if (h.net.compiled == null) return fail(error.InvalidArgument);
-    h.net.run(exec());
+    h.net.tryRun(exec()) catch |e| return failDnn(e);
     return 0;
+}
+
+/// Like `fail`, with the Metal backend's explanation appended to the
+/// message for its errors.
+fn failDnn(err: anyerror) c_int {
+    const rc = fail(err);
+    const detail = switch (err) {
+        error.GpuFailed => dnn.metal.lastGpuError(),
+        error.BackendUnavailable => dnn.metal.unavailableReason(),
+        else => return rc,
+    };
+    const n = std.mem.indexOfScalar(u8, &last_error, 0) orelse last_error.len;
+    const msg = std.fmt.bufPrint(last_error[n .. last_error.len - 1], ": {s}", .{detail}) catch last_error[n .. last_error.len - 1];
+    last_error[n + msg.len] = 0;
+    return rc;
+}
+
+fn backendOf(code: c_int) ?dnn.Backend {
+    return switch (code) {
+        0 => .auto,
+        1 => .cpu,
+        2 => .metal,
+        else => null,
+    };
+}
+
+fn deviceCode(d: ?dnn.Device) c_int {
+    return switch (d orelse return 0) {
+        .cpu => 1,
+        .metal => 2,
+    };
+}
+
+/// 1 when the Metal backend can run here (macOS with a usable GPU).
+export fn visar_dnn_metal_available() c_int {
+    return @intFromBool(dnn.metal.available());
+}
+
+var metal_name: [129:0]u8 = @splat(0);
+
+/// The Metal device's name, or why Metal is unavailable.
+export fn visar_dnn_metal_device() [*:0]const u8 {
+    const s = if (dnn.metal.available()) dnn.metal.deviceName() else dnn.metal.unavailableReason();
+    const n = @min(s.len, metal_name.len);
+    @memcpy(metal_name[0..n], s[0..n]);
+    metal_name[n] = 0;
+    return &metal_name;
+}
+
+/// Backend for the next plan: 0 auto (default), 1 CPU, 2 Metal.
+export fn visar_dnn_net_set_backend(h: *CNet, backend: c_int) c_int {
+    h.net.opts.backend = backendOf(backend) orelse return fail(error.InvalidArgument);
+    return 0;
+}
+
+/// Backend of the current plan: 1 CPU, 2 Metal (0 before planning).
+export fn visar_dnn_net_backend(h: *CNet) c_int {
+    return deviceCode(h.net.device());
 }
 
 export fn visar_dnn_net_output_count(h: *CNet) usize {
@@ -981,6 +1040,17 @@ export fn visar_face_detector_set_input_size(h: *CFaceDetector, width: c_int, he
     return run(h.det.setInputSize(@intCast(width), @intCast(height)));
 }
 
+/// Switches the backend (0 auto, 1 CPU, 2 Metal) and re-plans.
+export fn visar_face_detector_set_backend(h: *CFaceDetector, backend: c_int) c_int {
+    h.det.setBackend(backendOf(backend) orelse return fail(error.InvalidArgument)) catch |e| return failDnn(e);
+    return 0;
+}
+
+/// The detector's backend: 1 CPU, 2 Metal.
+export fn visar_face_detector_backend(h: *CFaceDetector) c_int {
+    return deviceCode(h.det.device());
+}
+
 export fn visar_face_detector_set_thresholds(h: *CFaceDetector, score_threshold: f32, nms_threshold: f32, top_k: c_int) void {
     h.det.opts.score_threshold = score_threshold;
     h.det.opts.nms_threshold = nms_threshold;
@@ -993,7 +1063,7 @@ export fn visar_face_detector_set_thresholds(h: *CFaceDetector, score_threshold:
 export fn visar_face_detector_detect(h: *CFaceDetector, img: *const CImage, out: ?[*]f32, cap: usize, count: *usize) c_int {
     count.* = 0;
     const src = typed(u8, img) catch |e| return fail(e);
-    const faces = h.det.detect(exec(), src) catch |e| return fail(e);
+    const faces = h.det.detect(exec(), src) catch |e| return failDnn(e);
     count.* = faces.len;
     if (out) |o| {
         const n = @min(cap, faces.len);

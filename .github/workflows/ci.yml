@@ -70,6 +70,46 @@ jobs:
           echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
       - run: zig build difftest -Doptimize=ReleaseSafe
 
+  # The Metal dnn backend on the runner's GPU (macos-latest exposes an
+  # "Apple Paravirtual device" with unified memory): the whole YuNet plan on
+  # Metal against the CPU backend (raw heads within 1e-4 relative) and
+  # against cv2.FaceDetectorYN, with a missing device being a failure
+  # (VISAR_REQUIRE_METAL). The timing table is information only.
+  metal:
+    runs-on: macos-latest
+    env:
+      VISAR_REQUIRE_METAL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install numpy opencv-python-headless==5.0.0.*
+      - name: Download models
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/models"
+          zoo=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/face_detection_yunet_2023mar.onnx" "$zoo/face_detection_yunet_2023mar.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg" || true
+          echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
+      # Every kernel (an in-memory model covering them all) and YuNet, Metal
+      # vs CPU, in Debug and ReleaseSafe.
+      - name: Zig tests, Metal vs CPU
+        run: |
+          zig build test -Dtest-filter=Metal -Dtest-filter=backend --summary all
+          zig build test -Doptimize=ReleaseSafe -Dtest-filter=Metal -Dtest-filter=backend --summary all
+      - run: zig build -Doptimize=ReleaseSafe
+      - name: Metal vs CPU and OpenCV (YuNet heads and faces), with timings
+        run: python3 tests/py/dnn_metal_check.py --lib zig-out/lib/libvisar.dylib
+      - name: dnn difftest with the Metal backend forced
+        env:
+          VISAR_DNN_BACKEND: metal
+        run: python3 tests/py/test_dnn_vs_opencv.py --lib zig-out/lib/libvisar.dylib
+
   cross:
     runs-on: ubuntu-latest
     strategy:
