@@ -139,6 +139,14 @@ const CompEnc = struct {
     /// exactly for every |x| < 2^17 (checked exhaustively).
     recip: [64]f32,
     bias: [64]f32,
+    /// 16-bit quantisation (NEON): with d = 8q, l = ceil(log2 d) and
+    /// m = ceil(2^(15+l) / d) < 2^16, ((n m) >> 16) >> (l - 1) is
+    /// floor(n / d) for every n < 2^15 (the error m d - 2^(15+l) is below
+    /// d <= 2^l), and n = |x| + 4q stays below 2^15 since |x| <= 16384 + 2
+    /// for 8-bit samples.
+    qm: [64]u16 = undefined,
+    qadd: [64]u16 = undefined,
+    qsh: [64]i16 = undefined,
     dc: *const HuffEnc,
     ac: *const HuffEnc,
     pred: i32 = 0,
@@ -149,6 +157,10 @@ fn makeRecip(q: *const [64]u16, c: *CompEnc) void {
         const d: u32 = @as(u32, q[i]) * 8;
         c.recip[i] = 1.0 / @as(f32, @floatFromInt(d));
         c.bias[i] = @as(f32, @floatFromInt(d / 2)) + 0.5;
+        const l: u5 = @intCast(32 - @clz(d - 1));
+        c.qm[i] = @intCast(((@as(u64, 1) << (15 + l)) + d - 1) / d);
+        c.qadd[i] = @intCast(d / 2);
+        c.qsh[i] = -@as(i16, l - 1);
     }
 }
 
@@ -175,13 +187,30 @@ const Pairer = struct {
 /// FDCT and quantize two blocks at once, then Huffman-code them in order
 /// (the second only when `both`).
 fn encodePair(o: *Out, a: Pending, b: Pending, both: bool) void {
+    if (comptime dct.arm_neon) {
+        var q: [64]i16 align(64) = undefined;
+        quant16(a.c, dct.fdct16(a.px, a.stride), &q);
+        huffBlock(o, a.c, &q);
+        if (both) {
+            quant16(b.c, dct.fdct16(b.px, b.stride), &q);
+            huffBlock(o, b.c, &q);
+        }
+        return;
+    }
+    var qa: [64]i16 align(64) = undefined;
+    var qb: [64]i16 align(64) = undefined;
+    fdctQuant2(a, b, &qa, &qb);
+    huffBlock(o, a.c, &qa);
+    if (both) huffBlock(o, b.c, &qb);
+}
+
+/// FDCT and quantisation of two blocks in 16 lanes of i32 and f32.
+inline fn fdctQuant2(a: Pending, b: Pending, qa: *[64]i16, qb: *[64]i16) void {
     var co: [8]@Vector(16, i32) = undefined;
     dct.fdct2(a.px, a.stride, b.px, b.stride, &co);
     // Quantize: round half away from zero of coef / (8q), as libjpeg does.
     const F = @Vector(16, f32);
     const I = @Vector(16, i32);
-    var qa: [64]i16 align(64) = undefined;
-    var qb: [64]i16 align(64) = undefined;
     inline for (0..8) |r| {
         const v = co[r];
         const h: F = cat(a.c.bias[r * 8 ..][0..8].*, b.c.bias[r * 8 ..][0..8].*);
@@ -191,8 +220,34 @@ fn encodePair(o: *Out, a: Pending, b: Pending, both: bool) void {
         qa[r * 8 ..][0..8].* = q[0..8].*;
         qb[r * 8 ..][0..8].* = q[8..16].*;
     }
-    huffBlock(o, a.c, &qa);
-    if (both) huffBlock(o, b.c, &qb);
+}
+
+extern fn @"llvm.aarch64.neon.ushl.v8i16"(@Vector(8, u16), @Vector(8, i16)) @Vector(8, u16);
+
+/// Quantises one block of 16-bit coefficient rows (see CompEnc.qm): the
+/// same values as encodePair's f32 path.
+inline fn quant16(c: *const CompEnc, co: [8]dct.H16, out: *[64]i16) void {
+    const U = @Vector(8, u16);
+    const U32 = @Vector(8, u32);
+    inline for (0..8) |r| {
+        const x = co[r];
+        const n: U = @abs(x) +% @as(U, c.qadd[r * 8 ..][0..8].*);
+        const p = @as(U32, n) * @as(U32, @as(U, c.qm[r * 8 ..][0..8].*));
+        const hi: U = @truncate(p >> @splat(16));
+        const q: dct.H16 = @bitCast(shrU16(hi, c.qsh[r * 8 ..][0..8].*));
+        const sg = x >> @splat(15);
+        out[r * 8 ..][0..8].* = (q ^ sg) -% sg;
+    }
+}
+
+/// x >> -s per lane (s <= 0).
+inline fn shrU16(x: @Vector(8, u16), s: @Vector(8, i16)) @Vector(8, u16) {
+    if (comptime dct.arm_neon) return @"llvm.aarch64.neon.ushl.v8i16"(x, s);
+    const a: [8]u16 = x;
+    const b: [8]i16 = s;
+    var r: [8]u16 = undefined;
+    for (&r, a, b) |*o, v, k| o.* = v >> @intCast(-k);
+    return r;
 }
 
 inline fn cat(x: @Vector(8, f32), y: @Vector(8, f32)) @Vector(16, f32) {
@@ -480,4 +535,59 @@ pub fn encodeWith(gpa: Allocator, img: common.AnyImage, opts: common.EncodeOptio
     try o.flushBits();
     try o.bytes(&.{ 0xff, 0xd9 });
     return gpa.realloc(o.buf, o.len);
+}
+
+test "jpeg 16-bit FDCT and quantisation match the i32/f32 path" {
+    const dc = HuffEnc.init(tables.std_dc_luma);
+    const ac = HuffEnc.init(tables.std_ac_luma);
+    // Every table value 1..255 at every position across the qualities.
+    var seed: u32 = 99;
+    for ([_]u8{ 1, 5, 10, 25, 50, 75, 90, 95, 98, 100 }) |quality| {
+        for ([2]*const [64]u16{ &tables.std_luma_quant, &tables.std_chroma_quant }) |base| {
+            const qt = scaleQuant(base, quality);
+            var c: CompEnc = .{ .recip = undefined, .bias = undefined, .dc = &dc, .ac = &ac };
+            makeRecip(&qt, &c);
+            for (0..400) |it| {
+                var px: [2][64]u8 = undefined;
+                for (0..2) |k| for (&px[k], 0..) |*v, i| {
+                    seed = seed *% 1664525 +% 1013904223;
+                    v.* = switch ((it + k) % 5) {
+                        0 => if ((seed >> 24) & 1 == 0) 0 else 255,
+                        1 => if (((i >> 3) ^ i) & 1 == 0) 0 else 255,
+                        2 => @truncate((i * 4 + (seed >> 28)) & 255),
+                        else => @truncate(seed >> 24),
+                    };
+                };
+                const pa: Pending = .{ .c = &c, .px = &px[0], .stride = 8 };
+                const pb: Pending = .{ .c = &c, .px = &px[1], .stride = 8 };
+                var want: [2][64]i16 = undefined;
+                fdctQuant2(pa, pb, &want[0], &want[1]);
+                for (0..2) |k| {
+                    var got: [64]i16 = undefined;
+                    quant16(&c, dct.fdct16(&px[k], 8), &got);
+                    try std.testing.expectEqualSlices(i16, &want[k], &got);
+                }
+            }
+        }
+    }
+    // The division itself for every divisor and every reachable |x|.
+    for (1..256) |q| {
+        const t: [64]u16 = @splat(@intCast(q));
+        var c: CompEnc = .{ .recip = undefined, .bias = undefined, .dc = &dc, .ac = &ac };
+        makeRecip(&t, &c);
+        var x: i32 = -16600;
+        while (x <= 16600) : (x += 8) {
+            var row: [8]i16 = undefined;
+            for (&row, 0..) |*e, l| e.* = @intCast(x + @as(i32, @intCast(l)));
+            const rows: [8]dct.H16 = @splat(row);
+            var got: [64]i16 = undefined;
+            quant16(&c, rows, &got);
+            for (0..8) |l| {
+                const v = x + @as(i32, @intCast(l));
+                const d: i32 = @intCast(8 * q);
+                const m = @divFloor(@as(i32, @intCast(@abs(v))) + @divFloor(d, 2), d);
+                try std.testing.expectEqual(if (v < 0) -m else m, got[l]);
+            }
+        }
+    }
 }

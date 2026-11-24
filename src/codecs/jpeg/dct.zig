@@ -261,6 +261,171 @@ inline fn fdct1d(comptime T: type, d: [8]T, comptime first: bool) [8]T {
     return o;
 }
 
+// ------------------------------------------------------------------------
+// 16-bit forward DCT (libjpeg-turbo's NEON layout): one block, a row per
+// 8-lane i16 vector, additions in i16 and products widened to i32. Same
+// integer values as fdct1d: for 8-bit samples every i16 intermediate is
+// bounded by 32768 in magnitude (pass-1 outputs by 4096, and each pass-2
+// sum is a +-1 combination of at most eight of them, the column-0 extremes
+// being -32768 and 32640), the products and their sums are exact in i32,
+// and the descales round the same way.
+
+pub const H16 = @Vector(8, i16);
+const W32 = @Vector(8, i32);
+pub const arm_neon = simd.llvm_intrinsics and @import("builtin").cpu.arch == .aarch64;
+
+const neon = struct {
+    extern fn @"llvm.aarch64.neon.rshrn.v4i16"(@Vector(4, i32), i32) @Vector(4, i16);
+    extern fn @"llvm.aarch64.neon.srshl.v8i16"(H16, H16) H16;
+};
+
+/// (x + 2^(s-1)) >> s, narrowed to i16 (the result fits).
+inline fn descale(x: W32, comptime s: u5) H16 {
+    if (comptime arm_neon) {
+        const a: [8]i32 = x;
+        return std.simd.join(neon.@"llvm.aarch64.neon.rshrn.v4i16"(a[0..4].*, s), neon.@"llvm.aarch64.neon.rshrn.v4i16"(a[4..8].*, s));
+    }
+    return @truncate((x +% kv(W32, 1 << (s - 1))) >> @splat(s));
+}
+
+/// (x + 2) >> 2 in i16 without overflow of the addition.
+inline fn rshr2(x: H16) H16 {
+    if (comptime arm_neon) return neon.@"llvm.aarch64.neon.srshl.v8i16"(x, @splat(-2));
+    return @truncate((@as(W32, x) + kv(W32, 2)) >> @splat(2));
+}
+
+inline fn wide(x: H16) W32 {
+    return x;
+}
+
+inline fn fdct1d16(d: [8]H16, comptime first: bool) [8]H16 {
+    const tmp0 = d[0] +% d[7];
+    const tmp7 = d[0] -% d[7];
+    const tmp1 = d[1] +% d[6];
+    const tmp6 = d[1] -% d[6];
+    const tmp2 = d[2] +% d[5];
+    const tmp5 = d[2] -% d[5];
+    const tmp3 = d[3] +% d[4];
+    const tmp4 = d[3] -% d[4];
+
+    const tmp10 = tmp0 +% tmp3;
+    const tmp13 = tmp0 -% tmp3;
+    const tmp11 = tmp1 +% tmp2;
+    const tmp12 = tmp1 -% tmp2;
+
+    const sh: u5 = if (first) const_bits - pass1_bits else const_bits + pass1_bits;
+    var o: [8]H16 = undefined;
+    if (first) {
+        o[0] = (tmp10 +% tmp11) << @splat(pass1_bits);
+        o[4] = (tmp10 -% tmp11) << @splat(pass1_bits);
+    } else {
+        o[0] = rshr2(tmp10 +% tmp11);
+        o[4] = rshr2(tmp10 -% tmp11);
+    }
+    const z1 = wide(tmp12 +% tmp13) * kv(W32, fix_0_541196100);
+    o[2] = descale(z1 + wide(tmp13) * kv(W32, fix_0_765366865), sh);
+    o[6] = descale(z1 + wide(tmp12) * kv(W32, -fix_1_847759065), sh);
+
+    const z5 = wide(tmp4 +% tmp6 +% tmp5 +% tmp7) * kv(W32, fix_1_175875602);
+    const q1 = wide(tmp4 +% tmp7) * kv(W32, -fix_0_899976223);
+    const q2 = wide(tmp5 +% tmp6) * kv(W32, -fix_2_562915447);
+    const q3 = wide(tmp4 +% tmp6) * kv(W32, -fix_1_961570560) + z5;
+    const q4 = wide(tmp5 +% tmp7) * kv(W32, -fix_0_390180644) + z5;
+    o[7] = descale(wide(tmp4) * kv(W32, fix_0_298631336) + q1 + q3, sh);
+    o[5] = descale(wide(tmp5) * kv(W32, fix_2_053119869) + q2 + q4, sh);
+    o[3] = descale(wide(tmp6) * kv(W32, fix_3_072711026) + q2 + q3, sh);
+    o[1] = descale(wide(tmp7) * kv(W32, fix_1_501321110) + q1 + q4, sh);
+    return o;
+}
+
+inline fn trnMask(comptime n: usize, comptime odd: usize) [n]i32 {
+    var m: [n]i32 = undefined;
+    for (0..n / 2) |i| {
+        m[2 * i] = @intCast(2 * i + odd);
+        m[2 * i + 1] = ~@as(i32, @intCast(2 * i + odd));
+    }
+    return m;
+}
+
+/// trn1 / trn2 on elements of `E` (16, 32 or 64 bits).
+inline fn trn(comptime E: type, a: H16, b: H16, comptime odd: usize) H16 {
+    const n = 128 / @bitSizeOf(E);
+    const T = @Vector(n, E);
+    const x: T = @bitCast(a);
+    const y: T = @bitCast(b);
+    return @bitCast(@shuffle(E, x, y, trnMask(n, odd)));
+}
+
+/// 8x8 i16 transpose: trn at 16, 32 and 64 bits.
+pub inline fn transpose16(r: *[8]H16) void {
+    var x: [8]H16 = undefined;
+    inline for (0..4) |i| {
+        x[2 * i] = trn(i16, r[2 * i], r[2 * i + 1], 0);
+        x[2 * i + 1] = trn(i16, r[2 * i], r[2 * i + 1], 1);
+    }
+    var y: [8]H16 = undefined;
+    inline for (0..2) |h| inline for (0..2) |k| {
+        y[4 * h + k] = trn(i32, x[4 * h + k], x[4 * h + k + 2], 0);
+        y[4 * h + k + 2] = trn(i32, x[4 * h + k], x[4 * h + k + 2], 1);
+    };
+    inline for (0..4) |k| {
+        r[k] = trn(i64, y[k], y[k + 4], 0);
+        r[k + 4] = trn(i64, y[k], y[k + 4], 1);
+    }
+}
+
+/// Forward ISLOW DCT of one block of samples (8 rows `stride` bytes
+/// apart), level shift included: coefficient rows in natural order, the
+/// same values as fdct.
+pub inline fn fdct16(p: [*]const u8, stride: usize) [8]H16 {
+    var c: [8]H16 = undefined;
+    inline for (0..8) |i| {
+        const r: @Vector(8, u8) = p[i * stride ..][0..8].*;
+        c[i] = @as(H16, @intCast(@as(@Vector(8, u16), r))) -% @as(H16, @splat(128));
+    }
+    transpose16(&c);
+    var o = fdct1d16(c, true);
+    transpose16(&o);
+    return fdct1d16(o, false);
+}
+
+test "jpeg fdct16 matches fdct" {
+    var seed: u32 = 7;
+    for (0..3000) |it| {
+        var px: [64]u8 = undefined;
+        for (&px, 0..) |*v, i| {
+            seed = seed *% 1664525 +% 1013904223;
+            v.* = switch (it % 6) {
+                0 => 0,
+                1 => 255,
+                2 => if ((i + i / 8) % 2 == 0) 0 else 255, // checkerboard
+                3 => if ((seed >> 24) & 1 == 0) 0 else 255,
+                else => @truncate(seed >> 24),
+            };
+        }
+        var in: [64]i32 = undefined;
+        for (&in, px) |*v, s| v.* = @as(i32, s) - 128;
+        var want: [64]i32 = undefined;
+        fdct(&in, &want);
+        const got = fdct16(&px, 8);
+        for (0..8) |r| for (0..8) |k| try std.testing.expectEqual(want[r * 8 + k], @as(i32, @as([8]i16, got[r])[k]));
+    }
+    // Extreme sign patterns: every row and column of +-1 signs.
+    for (0..256) |a| for (0..256) |b| {
+        var px: [64]u8 = undefined;
+        for (0..8) |y| for (0..8) |x| {
+            const s = ((a >> @intCast(y)) ^ (b >> @intCast(x))) & 1;
+            px[y * 8 + x] = if (s == 0) 0 else 255;
+        };
+        var in: [64]i32 = undefined;
+        for (&in, px) |*v, s| v.* = @as(i32, s) - 128;
+        var want: [64]i32 = undefined;
+        fdct(&in, &want);
+        const got = fdct16(&px, 8);
+        for (0..8) |r| for (0..8) |k| try std.testing.expectEqual(want[r * 8 + k], @as(i32, @as([8]i16, got[r])[k]));
+    };
+}
+
 test "jpeg dct transpose" {
     var r: [8]V = undefined;
     for (0..8) |i| {
