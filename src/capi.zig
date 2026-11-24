@@ -365,6 +365,89 @@ export fn visar_calc_optical_flow_pyr_lk(prev: *const CImage, next: *const CImag
     return run(visar.video.calcOpticalFlowPyrLK(exec(), gpa, a, b, pp[0..n], np[0..n], status[0..n], if (err) |e| e[0..n] else null, o));
 }
 
+/// MOSSE correlation tracker on 8-bit gray frames (opaque handle).
+/// `box` is x, y, w, h; `scale` != 0 searches three scales per frame.
+export fn visar_mosse_create(frame: *const CImage, box: *const [4]f32, scale: c_int, out: **visar.video.Mosse) c_int {
+    const f = typed(u8, frame) catch |e| return fail(e);
+    const t = gpa.create(visar.video.Mosse) catch |e| return fail(e);
+    t.* = visar.video.Mosse.init(gpa, f, .{ .x = box[0], .y = box[1], .w = box[2], .h = box[3] }, .{ .scale = scale != 0 }) catch |e| {
+        gpa.destroy(t);
+        return fail(e);
+    };
+    out.* = t;
+    return 0;
+}
+
+/// Writes the new box (x, y, w, h), the peak-to-sidelobe ratio and
+/// whether the target was found (psr and ok may be null).
+export fn visar_mosse_update(t: *visar.video.Mosse, frame: *const CImage, box: *[4]f32, psr: ?*f32, ok: ?*c_int) c_int {
+    const f = typed(u8, frame) catch |e| return fail(e);
+    const r = t.update(f) catch |e| return fail(e);
+    box.* = .{ r.box.x, r.box.y, r.box.w, r.box.h };
+    if (psr) |p| p.* = r.psr;
+    if (ok) |o| o.* = @intFromBool(r.ok);
+    return 0;
+}
+
+export fn visar_mosse_free(t: ?*visar.video.Mosse) void {
+    const p = t orelse return;
+    p.deinit();
+    gpa.destroy(p);
+}
+
+/// Running-average background model (video.Background); learning rate
+/// 1 / 2^shift per frame.
+export fn visar_background_create(width: u32, height: u32, shift: c_int, out: **visar.video.Background) c_int {
+    if (shift < 0 or shift > 15) return fail(error.InvalidArgument);
+    const b = gpa.create(visar.video.Background) catch |e| return fail(e);
+    b.* = visar.video.Background.init(gpa, width, height, @intCast(shift)) catch |e| {
+        gpa.destroy(b);
+        return fail(e);
+    };
+    out.* = b;
+    return 0;
+}
+
+/// Writes 255 to `mask` (8U, frame size) where the gray `frame` differs
+/// from the background by more than `threshold`, then updates the model.
+export fn visar_background_apply(b: *visar.video.Background, frame: *const CImage, mask: *const CImage, threshold: c_int) c_int {
+    const f = typed(u8, frame) catch |e| return fail(e);
+    const m = typed(u8, mask) catch |e| return fail(e);
+    return run(b.apply(exec(), f, m, @intCast(std.math.clamp(threshold, 0, 255))));
+}
+
+export fn visar_background_free(b: ?*visar.video.Background) void {
+    const p = b orelse return;
+    p.deinit(gpa);
+    gpa.destroy(p);
+}
+
+/// Multi-object tracker (video.Tracker). `gate` is the association
+/// distance in pixels.
+export fn visar_tracker_create(gate: f32, out: **visar.video.Tracker) c_int {
+    const t = gpa.create(visar.video.Tracker) catch |e| return fail(e);
+    t.* = visar.video.Tracker.init(gpa);
+    t.gate = gate;
+    out.* = t;
+    return 0;
+}
+
+/// Feeds one frame's detections (`n` boxes of x, y, w, h); writes the
+/// number of live tracks to `tracks`.
+export fn visar_tracker_update(t: *visar.video.Tracker, boxes: ?[*]const f32, n: usize, tracks: ?*usize) c_int {
+    const B = visar.video.Box;
+    const d: []const B = if (boxes) |p| @as([*]const B, @ptrCast(@alignCast(p)))[0..n] else &.{};
+    t.update(d) catch |e| return fail(e);
+    if (tracks) |c| c.* = t.tracks.items.len;
+    return 0;
+}
+
+export fn visar_tracker_free(t: ?*visar.video.Tracker) void {
+    const p = t orelse return;
+    p.deinit();
+    gpa.destroy(p);
+}
+
 // ------------------------------------------------------------------ core
 
 /// op: 0 add, 1 subtract, 2 absdiff, 3 multiply, 4 divide, 5 min, 6 max,
@@ -405,7 +488,7 @@ export fn visar_connected_components(src: *const CImage, labels: *const CImage, 
     const s = typed(u8, src) catch |e| return fail(e);
     const l = typed(i32, labels) catch |e| return fail(e);
     const conn: ip.components.Connectivity = if (connectivity == 4) .four else .eight;
-    var r = ip.connectedComponentsWithStats(gpa, s, l, conn) catch |e| return fail(e);
+    var r = ip.connectedComponentsWithStats(exec(), gpa, s, l, conn) catch |e| return fail(e);
     defer r.deinit(gpa);
     count.* = r.count;
     for (r.stats[0..@min(max, r.stats.len)], 0..) |st, i| {

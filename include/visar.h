@@ -131,6 +131,22 @@ int visar_match_shapes(const void *a, size_t na, int depth_a, const void *b, siz
 int visar_calc_optical_flow_pyr_lk(const visar_image *prev, const visar_image *next, const float *prev_pts, float *next_pts,
                                    uint8_t *status, float *err, size_t n, int win_w, int win_h, int max_level,
                                    int criteria_type, int max_count, double epsilon, int flags, double min_eig_threshold);
+/* video: MOSSE correlation tracker on VISAR_8U gray frames. box: x, y, w, h; scale != 0 searches three
+   scales per frame. psr and ok may be NULL; ok is 0 when the target is lost (the filter is not updated). */
+typedef struct visar_mosse visar_mosse;
+int visar_mosse_create(const visar_image *frame, const float box[4], int scale, visar_mosse **out);
+int visar_mosse_update(visar_mosse *t, const visar_image *frame, float box[4], float *psr, int *ok);
+void visar_mosse_free(visar_mosse *t);
+/* video: running-average background model (learning rate 1 / 2^shift); mask: VISAR_8U, frame size */
+typedef struct visar_background visar_background;
+int visar_background_create(uint32_t width, uint32_t height, int shift, visar_background **out);
+int visar_background_apply(visar_background *b, const visar_image *frame, const visar_image *mask, int threshold);
+void visar_background_free(visar_background *b);
+/* video: multi-object tracker; boxes: n (x, y, w, h) floats; tracks (may be NULL) receives the live track count */
+typedef struct visar_tracker visar_tracker;
+int visar_tracker_create(float gate, visar_tracker **out);
+int visar_tracker_update(visar_tracker *t, const float *boxes, size_t n, size_t *tracks);
+void visar_tracker_free(visar_tracker *t);
 
 /* core: op 0 add, 1 subtract, 2 absdiff, 3 multiply, 4 divide, 5 min, 6 max, 7 and, 8 or, 9 xor */
 int visar_arith(int op, const visar_image *a, const visar_image *b, const visar_image *dst);

@@ -183,6 +183,72 @@ def calc_optical_flow_pyr_lk(prev, nxt, prev_pts, next_pts=None, win_size=(21, 2
     return npts, st, err
 
 
+# Older libraries (e.g. an A/B baseline) may predate these.
+for _fn in ("visar_mosse_free", "visar_background_free", "visar_tracker_free"):
+    if hasattr(lib, _fn):
+        getattr(lib, _fn).argtypes = [ctypes.c_void_p]
+
+
+class Mosse:
+    """MOSSE tracker on gray uint8 frames; box is (x, y, w, h). update()
+    returns ((x, y, w, h), psr, ok)."""
+
+    def __init__(self, frame, box, scale=True):
+        self._h = ctypes.c_void_p()
+        b = (ctypes.c_float * 4)(*box)
+        _check(lib.visar_mosse_create(ctypes.byref(desc(frame)), b, int(scale), ctypes.byref(self._h)))
+        self._box = (ctypes.c_float * 4)()
+        self._psr = ctypes.c_float()
+        self._ok = ctypes.c_int()
+
+    def update(self, frame):
+        _check(lib.visar_mosse_update(self._h, ctypes.byref(desc(frame)), self._box, ctypes.byref(self._psr), ctypes.byref(self._ok)))
+        return tuple(self._box), self._psr.value, bool(self._ok.value)
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib.visar_mosse_free(self._h)
+            self._h = None
+
+
+class Background:
+    """Running-average background model; apply() writes the motion mask."""
+
+    def __init__(self, width, height, shift=4):
+        self._h = ctypes.c_void_p()
+        _check(lib.visar_background_create(ctypes.c_uint32(width), ctypes.c_uint32(height), shift, ctypes.byref(self._h)))
+
+    def apply(self, frame, mask, threshold=28):
+        _check(lib.visar_background_apply(self._h, ctypes.byref(desc(frame)), ctypes.byref(desc(mask)), threshold))
+        return mask
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib.visar_background_free(self._h)
+            self._h = None
+
+
+class Tracker:
+    """Multi-object tracker; update() takes an (n, 4) float32 array of boxes
+    and returns the number of live tracks."""
+
+    def __init__(self, gate=60.0):
+        self._h = ctypes.c_void_p()
+        _check(lib.visar_tracker_create(ctypes.c_float(gate), ctypes.byref(self._h)))
+        self._n = ctypes.c_size_t()
+
+    def update(self, boxes):
+        b = np.ascontiguousarray(boxes, np.float32).reshape(-1, 4)
+        _check(lib.visar_tracker_update(self._h, b.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), ctypes.c_size_t(len(b)),
+                                        ctypes.byref(self._n)))
+        return self._n.value
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib.visar_tracker_free(self._h)
+            self._h = None
+
+
 def threshold(a, thresh, maxval, kind, dst=None):
     dst = np.empty_like(a) if dst is None else dst
     used = ctypes.c_double(0)

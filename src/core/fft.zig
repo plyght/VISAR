@@ -34,6 +34,10 @@ pub const Plan = struct {
         gpa.free(self.rev);
     }
 
+    fn columns(self: Plan, f: [*]f32, n: usize, inverse: bool) void {
+        columnsImpl(self, f, n, inverse);
+    }
+
     /// In-place transform of `x` (length n, elements `stride` apart).
     /// `inverse` uses conjugate twiddles and scales by 1/n.
     pub fn run(self: Plan, x: [*]Complex, stride: usize, inverse: bool) void {
@@ -97,10 +101,96 @@ pub const Plan2D = struct {
         const w = self.rows.n;
         const h = self.cols.n;
         std.debug.assert(x.len == w * h);
+        if (packed_complex and w == h and w % lanes == 0) {
+            // Square grid: transform the columns with whole-row vector
+            // butterflies, transpose, again, and transpose back.
+            const f: [*]f32 = @ptrCast(x.ptr);
+            self.cols.columns(f, w, inv);
+            transpose(x, w);
+            self.cols.columns(f, w, inv);
+            transpose(x, w);
+            if (inv) {
+                const sv: V = @splat(1.0 / @as(f32, @floatFromInt(w * h)));
+                var i: usize = 0;
+                while (i < 2 * w * h) : (i += 2 * lanes) f[i..][0 .. 2 * lanes].* = @as(V, f[i..][0 .. 2 * lanes].*) * sv;
+            }
+            return;
+        }
         for (0..h) |y| self.rows.run(x.ptr + y * w, 1, inv);
         for (0..w) |c| self.cols.run(x.ptr + c, w, inv);
     }
 };
+
+/// Complex values per vector in the square fast path.
+const lanes = 8;
+const V = @Vector(2 * lanes, f32);
+/// The fast path views Complex(f32) as interleaved (re, im) pairs.
+const packed_complex = @sizeOf(Complex) == 8 and @offsetOf(Complex, "re") == 0 and @offsetOf(Complex, "im") == 4;
+
+/// t = b * w for every complex pair in `b` (interleaved re, im).
+inline fn mulScalar(b: V, wr: V, wi_alt: V) V {
+    const swapped = @shuffle(f32, b, undefined, blk: {
+        var m: [2 * lanes]i32 = undefined;
+        for (0..lanes) |i| {
+            m[2 * i] = 2 * i + 1;
+            m[2 * i + 1] = 2 * i;
+        }
+        break :blk m;
+    });
+    return b * wr + swapped * wi_alt;
+}
+
+fn transpose(x: []Complex, n: usize) void {
+    for (0..n) |i| for (i + 1..n) |j| std.mem.swap(Complex, &x[i * n + j], &x[j * n + i]);
+}
+
+/// Unscaled 1-D transforms of every column of an n x n grid (`f`:
+/// interleaved complex, row-major). Butterflies combine whole rows, so
+/// the work is vector-wide across columns.
+fn columnsImpl(self: Plan, f: [*]f32, n: usize, inverse: bool) void {
+    const row = 2 * n;
+    for (0..n) |i| {
+        const j = self.rev[i];
+        if (j > i) for (0..row / (2 * lanes)) |c| {
+            const a = f[i * row + c * 2 * lanes ..][0 .. 2 * lanes];
+            const b = f[j * row + c * 2 * lanes ..][0 .. 2 * lanes];
+            const t: V = a.*;
+            a.* = b.*;
+            b.* = t;
+        };
+    }
+    const sign: f32 = if (inverse) -1 else 1;
+    const alt: V = comptime blk: {
+        var m: [2 * lanes]f32 = undefined;
+        for (0..lanes) |i| {
+            m[2 * i] = -1;
+            m[2 * i + 1] = 1;
+        }
+        break :blk m;
+    };
+    var len: usize = 2;
+    while (len <= n) : (len <<= 1) {
+        const half = len / 2;
+        const step = n / len;
+        var start: usize = 0;
+        while (start < n) : (start += len) {
+            for (0..half) |k| {
+                const tw = self.tw[k * step];
+                const wr: V = @splat(tw.re);
+                const wi_alt = alt * @as(V, @splat(sign * tw.im));
+                const pa = f + (start + k) * row;
+                const pb = f + (start + k + half) * row;
+                var c: usize = 0;
+                while (c < row) : (c += 2 * lanes) {
+                    const va: V = pa[c..][0 .. 2 * lanes].*;
+                    const t = mulScalar(pb[c..][0 .. 2 * lanes].*, wr, wi_alt);
+                    pa[c..][0 .. 2 * lanes].* = va + t;
+                    pb[c..][0 .. 2 * lanes].* = va - t;
+                }
+            }
+        }
+    }
+}
 
 test "fft matches a direct DFT and inverts" {
     const gpa = std.testing.allocator;
@@ -123,6 +213,33 @@ test "fft matches a direct DFT and inverts" {
     for (orig, x) |a, b| {
         try std.testing.expectApproxEqAbs(a.re, b.re, 1e-4);
         try std.testing.expectApproxEqAbs(a.im, b.im, 1e-4);
+    }
+}
+
+test "square fast path matches the scalar transform" {
+    const gpa = std.testing.allocator;
+    for ([_]usize{ 8, 16, 64 }) |n| {
+        var p = try Plan2D.init(gpa, n, n);
+        defer p.deinit(gpa);
+        const x = try gpa.alloc(Complex, n * n);
+        defer gpa.free(x);
+        const y = try gpa.alloc(Complex, n * n);
+        defer gpa.free(y);
+        for (x, 0..) |*v, i| v.* = .{ .re = @floatFromInt((i * 7) % 13), .im = @floatFromInt((i * 5) % 11) };
+        @memcpy(y, x);
+        p.forward(x);
+        // Reference: scalar rows then columns.
+        for (0..n) |r| p.rows.run(y.ptr + r * n, 1, false);
+        for (0..n) |c| p.cols.run(y.ptr + c, n, false);
+        for (x, y) |a, b| {
+            try std.testing.expectApproxEqAbs(b.re, a.re, 1e-2);
+            try std.testing.expectApproxEqAbs(b.im, a.im, 1e-2);
+        }
+        p.inverse(x);
+        for (x, 0..) |v, i| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt((i * 7) % 13)), v.re, 1e-3);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt((i * 5) % 11)), v.im, 1e-3);
+        }
     }
 }
 

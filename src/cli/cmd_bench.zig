@@ -155,7 +155,7 @@ const kernels = [_]Kernel{
     }.f),
     k("components/8-connected", .mask, struct {
         fn f(b: *Bench) !void {
-            var cc = try ip.connectedComponentsWithStats(b.gpa, b.mask, b.labels, .eight);
+            var cc = try ip.connectedComponentsWithStats(b.exec, b.gpa, b.mask, b.labels, .eight);
             cc.deinit(b.gpa);
         }
     }.f),
