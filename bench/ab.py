@@ -41,26 +41,29 @@ def main():
     cv2.setNumThreads(args.threads)
     ca = {n: f for n, f, _ in A.cases(1080, 1920)}
     cb = {n: f for n, f, _ in B.cases(1080, 1920)}
+    cc = {n: g for n, _, g in B.cases(1080, 1920)}
     keys = [k.strip().lower() for k in args.filter.split(",") if k.strip()]
     rows = []
     for name, fa in ca.items():
         fb = cb.get(name)
         if fb is None or (keys and not any(k in name.lower() for k in keys)):
             continue
-        ta = tb = float("inf")
+        ta = tb = tc = float("inf")
+        fc = cc[name]
         t0 = time.perf_counter()
         n = 0
         while (time.perf_counter() - t0 < 2.0 or n < 10) and n < 500:
             s = time.perf_counter(); fa(); ta = min(ta, time.perf_counter() - s)
             s = time.perf_counter(); fb(); tb = min(tb, time.perf_counter() - s)
+            s = time.perf_counter(); fc(); tc = min(tc, time.perf_counter() - s)
             n += 1
-        rows.append((name, ta, tb))
-        print(f"  {name:<28} A {ta * 1e3:8.3f} ms   B {tb * 1e3:8.3f} ms   B vs A {ta / tb:5.2f}x", flush=True)
+        rows.append((name, ta, tb, tc))
+        print(f"  {name:<28} A {ta * 1e3:8.3f} ms   B {tb * 1e3:8.3f} ms   CV {tc * 1e3:8.3f} ms  B vs A {ta / tb:5.2f}x  A vs CV {tc / ta:5.2f}x  B vs CV {tc / tb:5.2f}x", flush=True)
     if args.md:
         with open(args.md, "w") as fh:
-            fh.write(f"A/B, {args.threads} thread(s)\n\n| Case | A (ms) | B (ms) | B vs A |\n| --- | ---: | ---: | ---: |\n")
-            for name, ta, tb in rows:
-                fh.write(f"| {name} | {ta * 1e3:.3f} | {tb * 1e3:.3f} | {ta / tb:.2f}x |\n")
+            fh.write(f"A/B, {args.threads} thread(s)\n\n| Case | A (ms) | B (ms) | CV (ms) | B vs A | A vs CV | B vs CV |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+            for name, ta, tb, tc in rows:
+                fh.write(f"| {name} | {ta * 1e3:.3f} | {tb * 1e3:.3f} | {tc * 1e3:.3f} | {ta / tb:.2f}x | {tc / ta:.2f}x | {tc / tb:.2f}x |\n")
 
 
 if __name__ == "__main__":
