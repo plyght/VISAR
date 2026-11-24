@@ -28,6 +28,15 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install numpy opencv-python-headless==5.0.0.*
+      # OpenCV Model Zoo files for the model benchmarks (not in the repository).
+      - name: Download models
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/models"
+          zoo=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/face_detection_yunet_2023mar.onnx" "$zoo/face_detection_yunet_2023mar.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg" || true
+          echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
 
       - name: Runner
         run: |
@@ -97,7 +106,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      # Whether this runner exposes a Metal GPU (decides how the GPU backend
+      # can be tested in CI).
+      - name: Metal probe
+        continue-on-error: true
+        run: |
+          system_profiler SPDisplaysDataType | head -20 || true
+          printf 'import Metal\nif let d = MTLCreateSystemDefaultDevice() { print("Metal device:", d.name, "unified:", d.hasUnifiedMemory) } else { print("Metal device: none") }\n' > probe.swift
+          swift probe.swift || true
       - run: pip install numpy opencv-python-headless==5.0.0.*
+      # OpenCV Model Zoo files for the model benchmarks (not in the repository).
+      - name: Download models
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/models"
+          zoo=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/face_detection_yunet_2023mar.onnx" "$zoo/face_detection_yunet_2023mar.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg" || true
+          echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
       - name: Tracking demo (synthetic scene)
         run: |
           zig build -Doptimize=ReleaseFast
