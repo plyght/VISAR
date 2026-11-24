@@ -267,6 +267,12 @@ pub const Depthwise = struct {
     epi: Epilogue,
     /// 3x3, stride 1, pad 1, dilation 1.
     fast3: bool,
+    /// 3x3, stride 2, pad 1, dilation 1.
+    fast3s2: bool,
+    /// One input row of zeros: the fast paths read it for a kernel row
+    /// outside the input (adding exact zeros), so the first and last rows
+    /// need no checked path.
+    zero: []align(64) f32,
 
     pub fn init(arena: Allocator, g: Geom, io: Io, c: ir.Conv, w: []const f32, bias: ?[]const f32) Allocator.Error!Depthwise {
         const kk = g.kh * g.kw;
@@ -277,7 +283,10 @@ pub const Depthwise = struct {
             for (0..kk) |t| wp[((ch / B) * kk + t) * B + ch % B] = w[ch * kk + t];
         }
         const fast3 = g.kh == 3 and g.kw == 3 and g.sh == 1 and g.sw == 1 and g.pt == 1 and g.pl == 1 and g.dh == 1 and g.dw == 1 and g.oh == g.h and g.ow == g.w;
-        return .{ .g = g, .io = io, .w = wp, .bias = try packBias(arena, bias, g.cout), .epi = .init(c, g.cout), .fast3 = fast3 };
+        const fast3s2 = g.kh == 3 and g.kw == 3 and g.sh == 2 and g.sw == 2 and g.pt == 1 and g.pl == 1 and g.dh == 1 and g.dw == 1;
+        const zero = try arena.alignedAlloc(f32, .@"64", if (fast3 or fast3s2) g.w * B else 0);
+        @memset(zero, 0);
+        return .{ .g = g, .io = io, .w = wp, .bias = try packBias(arena, bias, g.cout), .epi = .init(c, g.cout), .fast3 = fast3, .fast3s2 = fast3s2, .zero = zero };
     }
 
     const Ctx = struct { k: *const Depthwise, base: [*]f32 };
@@ -308,17 +317,22 @@ pub const Depthwise = struct {
     }
 
     fn row(k: *const Depthwise, comptime ak: ActKind, src: Rows, dst: Rows, res_rows: ?Rows, cb: usize, oy: usize) void {
+        @setEvalBranchQuota(10000);
         const g = k.g;
         const out = dst.at(cb, oy);
         const res: ?[*]const f32 = if (res_rows) |r| r.at(cb, oy) else null;
         const kk = g.kh * g.kw;
         const w = k.w.ptr + cb * kk * B;
         const bias = vec.load(k.bias.ptr + cb * B);
-        if (k.fast3 and oy > 0 and oy + 1 < g.oh and g.ow >= 3) {
+        if (k.fast3 and g.ow >= 3) {
             var wv: [9]V = undefined;
             inline for (0..9) |t| wv[t] = vec.load(w + t * B);
-            const rows = [3][*]const f32{ src.at(cb, oy - 1), src.at(cb, oy), src.at(cb, oy + 1) };
-            k.pixel(ak, src, out, res, w, bias, cb, oy, 0);
+            const rows = [3][*]const f32{
+                if (oy > 0) src.at(cb, oy - 1) else k.zero.ptr,
+                src.at(cb, oy),
+                if (oy + 1 < g.h) src.at(cb, oy + 1) else k.zero.ptr,
+            };
+            k.edge3(ak, rows, &wv, bias, 1, 3, 0, out, res, cb, 0);
             var ox: usize = 1;
             while (ox + 4 < g.ow) : (ox += 4) {
                 var acc: [4]V = @splat(bias);
@@ -344,10 +358,64 @@ pub const Depthwise = struct {
                 const rp: ?[*]const f32 = if (res) |rr| rr + ox * B else null;
                 vec.store(out + ox * B, k.epi.apply(ak, acc, rp, cb));
             }
-            k.pixel(ak, src, out, res, w, bias, cb, oy, g.ow - 1);
+            k.edge3(ak, rows, &wv, bias, 0, 2, g.w - 2, out, res, cb, g.ow - 1);
+            return;
+        }
+        if (k.fast3s2 and 2 * oy < g.h and g.w >= 2) {
+            // Columns 1 .. while 2*ox+1 < w have all three inside.
+            var wv: [9]V = undefined;
+            inline for (0..9) |t| wv[t] = vec.load(w + t * B);
+            const rows = [3][*]const f32{
+                if (oy > 0) src.at(cb, 2 * oy - 1) else k.zero.ptr,
+                src.at(cb, 2 * oy),
+                if (2 * oy + 1 < g.h) src.at(cb, 2 * oy + 1) else k.zero.ptr,
+            };
+            const ox_hi = @min(g.ow, g.w / 2);
+            k.edge3(ak, rows, &wv, bias, 1, 3, 0, out, res, cb, 0);
+            var ox: usize = 1;
+            while (ox + 4 <= ox_hi) : (ox += 4) {
+                var acc: [4]V = @splat(bias);
+                inline for (0..3) |ky| {
+                    const rp = rows[ky] + (2 * ox - 1) * B;
+                    var v: [9]V = undefined;
+                    inline for (0..9) |i| v[i] = vec.load(rp + i * B);
+                    inline for (0..4) |i| {
+                        inline for (0..3) |kx| acc[i] = fma(v[2 * i + kx], wv[ky * 3 + kx], acc[i]);
+                    }
+                }
+                inline for (0..4) |i| {
+                    const rp: ?[*]const f32 = if (res) |rr| rr + (ox + i) * B else null;
+                    vec.store(out + (ox + i) * B, k.epi.apply(ak, acc[i], rp, cb));
+                }
+            }
+            while (ox < ox_hi) : (ox += 1) {
+                var acc = bias;
+                inline for (0..3) |ky| {
+                    const rp = rows[ky] + (2 * ox - 1) * B;
+                    inline for (0..3) |kx| acc = fma(vec.load(rp + kx * B), wv[ky * 3 + kx], acc);
+                }
+                const rp: ?[*]const f32 = if (res) |rr| rr + ox * B else null;
+                vec.store(out + ox * B, k.epi.apply(ak, acc, rp, cb));
+            }
+            while (ox < g.ow) : (ox += 1) {
+                if (2 * ox < g.w) k.edge3(ak, rows, &wv, bias, 0, 2, 2 * ox - 1, out, res, cb, ox) else k.pixel(ak, src, out, res, w, bias, cb, oy, ox);
+            }
             return;
         }
         for (0..g.ow) |ox| k.pixel(ak, src, out, res, w, bias, cb, oy, ox);
+    }
+
+    /// Output pixel `ox` of a 3x3 fast path whose kernel columns
+    /// [kx_lo, kx_hi) lie inside the input, the first at input column `c`
+    /// (the same sums in the same order as `pixel`, plus exact zeros for a
+    /// zero row).
+    inline fn edge3(k: *const Depthwise, comptime ak: ActKind, rows: [3][*]const f32, wv: *const [9]V, bias: V, comptime kx_lo: usize, comptime kx_hi: usize, c: usize, out: [*]f32, res: ?[*]const f32, cb: usize, ox: usize) void {
+        var acc = bias;
+        inline for (0..3) |ky| {
+            inline for (kx_lo..kx_hi) |kx| acc = fma(vec.load(rows[ky] + (c + kx - kx_lo) * B), wv[ky * 3 + kx], acc);
+        }
+        const rp: ?[*]const f32 = if (res) |rr| rr + ox * B else null;
+        vec.store(out + ox * B, k.epi.apply(ak, acc, rp, cb));
     }
 
     /// One output pixel with bounds checks (any kernel, stride, dilation).
