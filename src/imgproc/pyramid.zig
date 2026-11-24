@@ -94,7 +94,7 @@ pub fn pyrDown(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), bord
 /// Rows [y0, y1) of pyrDown. `ccn` is the channel count when known at
 /// compile time (1-4), else 0.
 fn downChunk(comptime T: type, comptime ccn: usize, s: Image(T), d: Image(T), border: Border, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
-    if (T == f32 and (ccn == 3 or ccn == 4)) return downChunkPlanarF(ccn, s, d, border, gpa, y0, y1);
+    if (T == f32 and (ccn == 3 or ccn == 4)) return downChunkParityF(ccn, s, d, border, gpa, y0, y1);
     const A = Acc(T);
     const N = comptime lanes(A);
     const cn: usize = if (ccn != 0) ccn else s.channels;
@@ -128,122 +128,106 @@ fn downChunk(comptime T: type, comptime ccn: usize, s: Image(T), d: Image(T), bo
     }
 }
 
-const neon_st = core.simd.llvm_intrinsics and @import("builtin").cpu.arch == .aarch64;
-const neon = struct {
-    extern fn @"llvm.aarch64.neon.st3.v4f32.p0"(@Vector(4, f32), @Vector(4, f32), @Vector(4, f32), [*]f32) void;
-    extern fn @"llvm.aarch64.neon.st4.v4f32.p0"(@Vector(4, f32), @Vector(4, f32), @Vector(4, f32), @Vector(4, f32), [*]f32) void;
-};
-
-/// downChunkPlanar for f32: deinterleave/interleave through stride
-/// shuffles (ld3/st3 .4s on NEON), same plane layout and pass structure.
-fn downChunkPlanarF(comptime cn: usize, s: Image(f32), d: Image(f32), border: Border, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
+/// downChunk for 3- and 4-channel f32. Each vertical sum row is split by
+/// pixel parity into an even-pixel and an odd-pixel row, both still
+/// channel-interleaved: then every horizontal tap of an output element is a
+/// plain contiguous load at offset 0, cn or 2cn, and the output is stored
+/// as is. The sums and their order are those of the scalar formula.
+fn downChunkParityF(comptime cn: usize, s: Image(f32), d: Image(f32), border: Border, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
     const w: usize = s.width;
-    const N = 8;
-    const V = @Vector(N, f32);
-    const plen = w + 4 + 2 * N + 8;
-    const buf = try gpa.alloc(f32, cn * plen);
+    const dw: usize = d.width;
+    // Pixels per split step; the sums of 2P pixels are split at a time.
+    const P = 16;
+    const L = 2 * P * cn;
+    const VL = @Vector(L, f32);
+    const NV = comptime lanes(f32);
+    // er[q] is padded pixel 2q, or[q] padded pixel 2q + 1 (padded pixel p is
+    // source pixel p - 2), cn samples each.
+    const rlen = (dw + 3) * cn + NV;
+    const buf = try gpa.alloc(f32, 2 * rlen);
     defer gpa.free(buf);
     @memset(buf, 0);
-    var planes: [cn][]f32 = undefined;
-    inline for (0..cn) |c| planes[c] = buf[c * plen ..][0..plen];
+    const er = buf[0..rlen];
+    const orr = buf[rlen..][0..rlen];
     var lmap: [2]usize = undefined;
     var rmap: [2]usize = undefined;
     for (0..2) |i| {
         lmap[i] = border_mod.map(@as(isize, @intCast(i)) - 2, w, border).?;
         rmap[i] = border_mod.map(@intCast(w + i), w, border).?;
     }
-    const split = comptime blk: {
-        var m: [cn][N]i32 = undefined;
-        for (0..cn) |c| for (0..N) |i| {
-            m[c][i] = @intCast(i * cn + c);
+    const pick = comptime blk: {
+        var m: [2][P * cn]i32 = undefined;
+        for (0..2) |par| for (0..P * cn) |i| {
+            m[par][i] = @intCast((2 * (i / cn) + par) * cn + i % cn);
         };
         break :blk m;
     };
-    const ev = comptime blk: {
-        var m: [N]i32 = undefined;
-        for (0..N) |i| m[i] = @intCast(2 * i);
-        break :blk m;
+    const Px = struct {
+        fn at(e: []f32, o: []f32, p: usize) []f32 {
+            return (if (p % 2 == 0) e else o)[(p / 2) * cn ..][0..cn];
+        }
     };
-    const od = comptime blk: {
-        var m: [N]i32 = undefined;
-        for (0..N) |i| m[i] = @intCast(2 * i + 1);
-        break :blk m;
-    };
-    const dw: usize = d.width;
+    const n_out = dw * cn;
     for (y0..y1) |y| {
         var rows: [5][*]const f32 = undefined;
         for (0..5) |k| {
             const sy = border_mod.map(@as(isize, @intCast(2 * y + k)) - 2, s.height, border).?;
             rows[k] = s.row(sy).ptr;
         }
+        const out = d.row(y);
+        // Source pixel x + i is padded pixel x + 2 + i: with x even, even i
+        // go to er[(x / 2 + 1 + i / 2) * cn ..]. The horizontal pass trails
+        // the vertical one block by block, so it overlaps the row loads.
+        // Output pixel ox takes padded pixels 2ox .. 2ox + 4: er[ox],
+        // or[ox], er[ox + 1], or[ox + 1], er[ox + 2]. Output 0 waits for
+        // the left border.
+        var j: usize = cn;
         var x: usize = 0;
-        while (x + N <= w) : (x += N) {
-            var t: [5][cn]V = undefined;
-            inline for (0..5) |k| {
-                const wv: @Vector(N * cn, f32) = rows[k][x * cn ..][0 .. N * cn].*;
-                inline for (0..cn) |c| t[k][c] = @shuffle(f32, wv, undefined, split[c]);
-            }
-            inline for (0..cn) |c| planes[c][2 + x ..][0..N].* = (t[0][c] + t[4][c]) + (t[1][c] + t[3][c]) * @as(V, @splat(4)) + t[2][c] * @as(V, @splat(6));
+        while (x + 2 * P <= w) : (x += 2 * P) {
+            const o = x * cn;
+            const a: VL = rows[0][o..][0..L].*;
+            const b: VL = rows[1][o..][0..L].*;
+            const c: VL = rows[2][o..][0..L].*;
+            const e: VL = rows[3][o..][0..L].*;
+            const f: VL = rows[4][o..][0..L].*;
+            const sum = (a + f) + (b + e) * @as(VL, @splat(4)) + c * @as(VL, @splat(6));
+            const q = (x / 2 + 1) * cn;
+            er[q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[0]);
+            orr[q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[1]);
+            // Padded pixels below x + 2 + 2P are summed: outputs below
+            // x / 2 + P - 1 are ready.
+            const ready = @min(n_out, (x / 2 + P - 1) * cn);
+            while (j + NV <= ready) : (j += NV) hstep(cn, NV, er, orr, out, j);
         }
         while (x < w) : (x += 1) {
-            inline for (0..cn) |c| {
-                const i = x * cn + c;
-                planes[c][2 + x] = (rows[0][i] + rows[4][i]) + (rows[1][i] + rows[3][i]) * 4 + rows[2][i] * 6;
+            const dst = Px.at(er, orr, x + 2);
+            inline for (0..cn) |ch| {
+                const i = x * cn + ch;
+                dst[ch] = (rows[0][i] + rows[4][i]) + (rows[1][i] + rows[3][i]) * 4 + rows[2][i] * 6;
             }
         }
-        inline for (0..cn) |c| {
-            const pl = planes[c];
-            for (0..2) |i| {
-                pl[i] = pl[2 + lmap[i]];
-                pl[2 + w + i] = pl[2 + rmap[i]];
-            }
+        for (0..2) |i| {
+            @memcpy(Px.at(er, orr, i), Px.at(er, orr, lmap[i] + 2));
+            @memcpy(Px.at(er, orr, w + 2 + i), Px.at(er, orr, rmap[i] + 2));
         }
-        const out = d.row(y);
-        const join = comptime blk: {
-            var m: [N * cn]i32 = undefined;
-            for (0..N) |i| for (0..cn) |c| {
-                m[i * cn + c] = @intCast(c * N + i);
-            };
-            break :blk m;
-        };
-        var ox: usize = 0;
-        while (ox + N <= dw) : (ox += N) {
-            var res: [cn * N]f32 = undefined;
-            inline for (0..cn) |c| {
-                const pl = planes[c];
-                const w0: @Vector(2 * N, f32) = pl[2 * ox ..][0 .. 2 * N].*;
-                const w1: @Vector(2 * N, f32) = pl[2 * ox + 2 ..][0 .. 2 * N].*;
-                const w2: @Vector(2 * N, f32) = pl[2 * ox + 4 ..][0 .. 2 * N].*;
-                const e0: V = @shuffle(f32, w0, undefined, ev);
-                const o0: V = @shuffle(f32, w0, undefined, od);
-                const e1: V = @shuffle(f32, w1, undefined, ev);
-                const o1: V = @shuffle(f32, w1, undefined, od);
-                const e2: V = @shuffle(f32, w2, undefined, ev);
-                const v = (e0 + e2) + (o0 + o1) * @as(V, @splat(4)) + e1 * @as(V, @splat(6));
-                res[c * N ..][0..N].* = finishV(f32, 8, N, v);
-            }
-            if (comptime neon_st) {
-                // LLVM does not match the interleaving shuffle to st3/st4.
-                const F4 = @Vector(4, f32);
-                inline for (0..N / 4) |h| {
-                    var q: [cn]F4 = undefined;
-                    inline for (0..cn) |c| q[c] = res[c * N + h * 4 ..][0..4].*;
-                    const dst = out.ptr + (ox + h * 4) * cn;
-                    if (cn == 3) neon.@"llvm.aarch64.neon.st3.v4f32.p0"(q[0], q[1], q[2], dst) else neon.@"llvm.aarch64.neon.st4.v4f32.p0"(q[0], q[1], q[2], q[3], dst);
-                }
-            } else {
-                const all: @Vector(cn * N, f32) = res;
-                out[ox * cn ..][0 .. N * cn].* = @shuffle(f32, all, undefined, join);
-            }
-        }
-        while (ox < dw) : (ox += 1) {
-            inline for (0..cn) |c| {
-                const pl = planes[c];
-                const q = 2 * ox;
-                out[ox * cn + c] = finishS(f32, 8, (pl[q] + pl[q + 4]) + (pl[q + 1] + pl[q + 3]) * 4 + pl[q + 2] * 6);
-            }
-        }
+        while (j + NV <= n_out) : (j += NV) hstep(cn, NV, er, orr, out, j);
+        while (j < n_out) : (j += 1) hscalar(cn, er, orr, out, j);
+        for (0..cn) |i| hscalar(cn, er, orr, out, i);
     }
+}
+
+inline fn hstep(comptime cn: usize, comptime NV: usize, er: []const f32, orr: []const f32, out: []f32, j: usize) void {
+    const V = @Vector(NV, f32);
+    const e0: V = er[j..][0..NV].*;
+    const e1: V = er[j + cn ..][0..NV].*;
+    const e2: V = er[j + 2 * cn ..][0..NV].*;
+    const o0: V = orr[j..][0..NV].*;
+    const o1: V = orr[j + cn ..][0..NV].*;
+    out[j..][0..NV].* = finishV(f32, 8, NV, (e0 + e2) + (o0 + o1) * @as(V, @splat(4)) + e1 * @as(V, @splat(6)));
+}
+
+inline fn hscalar(comptime cn: usize, er: []const f32, orr: []const f32, out: []f32, j: usize) void {
+    out[j] = finishS(f32, 8, (er[j] + er[j + 2 * cn]) + (orr[j] + orr[j + cn]) * 4 + er[j + cn] * 6);
 }
 
 /// out = r0 + 4 r1 + 6 r2 + 4 r3 + r4, widened to A.
