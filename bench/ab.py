@@ -41,26 +41,58 @@ def main():
     cv2.setNumThreads(args.threads)
     ca = {n: f for n, f, _ in A.cases(1080, 1920)}
     cb = {n: f for n, f, _ in B.cases(1080, 1920)}
+    cc = {n: g for n, _, g in B.cases(1080, 1920)}
     keys = [k.strip().lower() for k in args.filter.split(",") if k.strip()]
     rows = []
     for name, fa in ca.items():
         fb = cb.get(name)
         if fb is None or (keys and not any(k in name.lower() for k in keys)):
             continue
-        ta = tb = float("inf")
+        ta = tb = tc = float("inf")
+        fc = cc[name]
         t0 = time.perf_counter()
         n = 0
         while (time.perf_counter() - t0 < 2.0 or n < 10) and n < 500:
             s = time.perf_counter(); fa(); ta = min(ta, time.perf_counter() - s)
             s = time.perf_counter(); fb(); tb = min(tb, time.perf_counter() - s)
+            s = time.perf_counter(); fc(); tc = min(tc, time.perf_counter() - s)
             n += 1
-        rows.append((name, ta, tb))
-        print(f"  {name:<28} A {ta * 1e3:8.3f} ms   B {tb * 1e3:8.3f} ms   B vs A {ta / tb:5.2f}x", flush=True)
+        rows.append((name, ta, tb, tc))
+        print(f"  {name:<28} A {ta * 1e3:8.3f} ms   B {tb * 1e3:8.3f} ms   CV {tc * 1e3:8.3f} ms  B vs A {ta / tb:5.2f}x  A vs CV {tc / ta:5.2f}x  B vs CV {tc / tb:5.2f}x", flush=True)
+
+    # Throwaway LK probes: setup vs iteration cost.
+    import numpy as np
+    from test_core_vs_opencv import natural
+    gray = natural(1080, 1920, 1)
+    a = cv2.GaussianBlur(gray, (3, 3), 0)
+    b = cv2.warpAffine(a, np.float32([[1, 0, 3.4], [0, 1, -2.1]]), (1920, 1080), borderMode=cv2.BORDER_REFLECT101)
+    pts = cv2.goodFeaturesToTrack(a, 1000, 0.01, 8).reshape(-1, 2)
+    probes = [
+        ("1pt", dict(p=pts[:1])),
+        ("lvl0", dict(max_level=0)),
+        ("iter1", dict(criteria=(3, 1, 0.01))),
+        ("iter2", dict(criteria=(3, 2, 0.01))),
+        ("win11", dict(win_size=(11, 11))),
+    ]
+    for pname, kw in probes:
+        p = kw.pop("p", pts)
+        crit = kw.get("criteria", (3, 30, 0.01))
+        ws = kw.get("win_size", (21, 21))
+        ml = kw.get("max_level", 3)
+        fa = lambda: A.vs.calc_optical_flow_pyr_lk(a, b, p, **kw)
+        fb = lambda: B.vs.calc_optical_flow_pyr_lk(a, b, p, **kw)
+        fc = lambda: cv2.calcOpticalFlowPyrLK(a, b, p.reshape(-1, 1, 2), None, winSize=ws, maxLevel=ml, criteria=crit)
+        ta = tb = tc = float("inf")
+        for _ in range(60):
+            s = time.perf_counter(); fa(); ta = min(ta, time.perf_counter() - s)
+            s = time.perf_counter(); fb(); tb = min(tb, time.perf_counter() - s)
+            s = time.perf_counter(); fc(); tc = min(tc, time.perf_counter() - s)
+        print(f"  probe {pname:<10} A {ta * 1e3:8.3f} ms   B {tb * 1e3:8.3f} ms   CV {tc * 1e3:8.3f} ms", flush=True)
     if args.md:
         with open(args.md, "w") as fh:
-            fh.write(f"A/B, {args.threads} thread(s)\n\n| Case | A (ms) | B (ms) | B vs A |\n| --- | ---: | ---: | ---: |\n")
-            for name, ta, tb in rows:
-                fh.write(f"| {name} | {ta * 1e3:.3f} | {tb * 1e3:.3f} | {ta / tb:.2f}x |\n")
+            fh.write(f"A/B, {args.threads} thread(s)\n\n| Case | A (ms) | B (ms) | CV (ms) | B vs A | A vs CV | B vs CV |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+            for name, ta, tb, tc in rows:
+                fh.write(f"| {name} | {ta * 1e3:.3f} | {tb * 1e3:.3f} | {tc * 1e3:.3f} | {ta / tb:.2f}x | {tc / ta:.2f}x | {tc / tb:.2f}x |\n")
 
 
 if __name__ == "__main__":
