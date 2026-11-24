@@ -142,6 +142,27 @@ pub const Resize = struct {
 
 pub const Binary = enum { add, sub, mul, div, max, min, pow };
 
+/// A strided window of a tensor: output index i of axis a reads input
+/// index start[a] + i * step[a]; the output has `len` elements per axis.
+pub const Strided = struct {
+    start: [max_rank]usize = @splat(0),
+    step: [max_rank]usize = @splat(1),
+    len: [max_rank]usize = @splat(0),
+};
+
+/// Output `index` of an ONNX Split into `count` parts along `axis`
+/// (`sizes` from the opset < 13 attribute; else the second input, else
+/// equal parts). Resolved to a slice at shape inference.
+pub const Split = struct {
+    axis: i64,
+    index: u32,
+    count: u32,
+    sizes: ?[]const i64,
+};
+
+/// One output channel of a channel gather: input `input`, channel `channel`.
+pub const ChannelSrc = struct { input: u32, channel: u32 };
+
 pub const Op = union(enum) {
     /// inputs: x, w, [b], [residual]
     conv: Conv,
@@ -166,6 +187,14 @@ pub const Op = union(enum) {
     softmax: i64,
     /// Channels [start, end) of a rank-4 NCHW tensor (made by the passes).
     channel_slice: [2]usize,
+    /// Rank-4 NCHW inputs of equal N, H, W -> output channel k is
+    /// `map[k]` (concatenations, channel shuffles and channel slices of
+    /// them, composed by the passes).
+    channel_gather: []const ChannelSrc,
+    /// A strided slice evaluated at run time (from Slice and Split).
+    strided_slice: Strided,
+    /// Resolved at shape inference into a slice.
+    split: Split,
     identity,
     // Evaluated by constant folding only.
     shape,
@@ -435,6 +464,20 @@ pub fn import(arena: Allocator, model: onnx.Model) Error!Imported {
         try input_dims.append(arena, dims);
     }
     for (og.nodes) |n| {
+        if (std.mem.eql(u8, n.op_type, "Split") and (n.domain.len == 0 or std.mem.eql(u8, n.domain, "ai.onnx"))) {
+            // One node per output, each resolved to a slice later.
+            const ins = try arena.alloc(ValueId, n.inputs.len);
+            for (n.inputs, ins) |name, *o| o.* = if (name.len == 0) none else names.get(name) orelse return error.InvalidModel;
+            if (ins.len == 0 or ins[0] == none) return error.InvalidModel;
+            const sizes: ?[]const i64 = if (n.ints("split")) |sz| try arena.dupe(i64, sz) else null;
+            for (n.outputs, 0..) |oname, k| {
+                const out = try g.addValue(arena, .{ .name = oname });
+                if (oname.len > 0) try names.put(arena, oname, out);
+                const op: Op = .{ .split = .{ .axis = n.int("axis", 0), .index = @intCast(k), .count = @intCast(n.outputs.len), .sizes = sizes } };
+                try g.nodes.append(arena, .{ .name = n.name, .op = op, .inputs = try arena.dupe(ValueId, ins), .outputs = try arena.dupe(ValueId, &.{out}) });
+            }
+            continue;
+        }
         const op = try importNode(arena, n, model.opset) orelse {
             // Constant: becomes a constant value.
             if (n.outputs.len != 1) return error.InvalidModel;
@@ -549,6 +592,11 @@ fn inShape(g: *Graph, n: *const Node, i: usize) Error!Shape {
     const v = g.value(n.inputs[i]);
     if (!v.shaped) return error.InvalidModel;
     return v.shape;
+}
+
+fn optInput(n: *const Node, i: usize) Error!ValueId {
+    if (i >= n.inputs.len or n.inputs[i] == none) return error.InvalidModel;
+    return n.inputs[i];
 }
 
 fn allConst(g: *Graph, n: *const Node) bool {
@@ -752,7 +800,76 @@ fn inferNode(g: *Graph, arena: Allocator, n: *Node) Error!void {
             if (!allConst(g, n)) return error.Unsupported;
         },
         .slice => {
-            if (!allConst(g, n)) return error.Unsupported;
+            if (!allConst(g, n)) {
+                // Constant bounds on a runtime tensor: a strided slice.
+                var st: Strided = .{};
+                for (0..x.rank) |a| st.len[a] = x.d[a];
+                const starts = try constI64(g, n.inputs[1]);
+                const ends = try constI64(g, try optInput(n, 2));
+                const axes: ?[]const i64 = if (n.inputs.len > 3 and n.inputs[3] != none) try constI64(g, n.inputs[3]) else null;
+                const steps: ?[]const i64 = if (n.inputs.len > 4 and n.inputs[4] != none) try constI64(g, n.inputs[4]) else null;
+                if (ends.len != starts.len) return error.InvalidModel;
+                for (starts, 0..) |s0, i| {
+                    const a = if (axes) |ax| try normAxis(ax[i], x.rank) else i;
+                    const step = if (steps) |sp| sp[i] else 1;
+                    if (step <= 0) return error.Unsupported;
+                    const dim: i64 = @intCast(x.d[a]);
+                    const lo = std.math.clamp(if (s0 < 0) s0 + dim else s0, 0, dim);
+                    const e0 = ends[i];
+                    const hi = std.math.clamp(if (e0 < 0) e0 + dim else e0, 0, dim);
+                    st.start[a] = @intCast(lo);
+                    st.step[a] = @intCast(step);
+                    st.len[a] = if (hi > lo) @intCast(@divFloor(hi - lo + step - 1, step)) else 0;
+                }
+                n.op = .{ .strided_slice = st };
+                n.inputs = n.inputs[0..1];
+                return inferNode(g, arena, n);
+            }
+        },
+        .split => |sp| {
+            const a = try normAxis(sp.axis, x.rank);
+            var sizes: ?[]const i64 = sp.sizes;
+            if (n.inputs.len > 1 and n.inputs[1] != none) sizes = try constI64(g, n.inputs[1]);
+            var start: usize = 0;
+            var len: usize = 0;
+            if (sizes) |sz| {
+                if (sz.len != sp.count) return error.InvalidModel;
+                for (sz[0..sp.index]) |v| start += @intCast(@max(v, 0));
+                len = @intCast(@max(sz[sp.index], 0));
+                if (start + len > x.d[a]) return error.ShapeMismatch;
+            } else {
+                if (x.d[a] % sp.count != 0) return error.Unsupported;
+                len = x.d[a] / sp.count;
+                start = len * sp.index;
+            }
+            n.inputs = n.inputs[0..1];
+            if (x.rank == 4 and a == 1 and len > 0) {
+                n.op = .{ .channel_slice = .{ start, start + len } };
+            } else {
+                var st: Strided = .{};
+                for (0..x.rank) |i| st.len[i] = x.d[i];
+                st.start[a] = start;
+                st.len[a] = len;
+                n.op = .{ .strided_slice = st };
+            }
+            return inferNode(g, arena, n);
+        },
+        .strided_slice => |st| {
+            for (0..x.rank) |a| {
+                if (st.step[a] == 0 or (st.len[a] > 0 and st.start[a] + (st.len[a] - 1) * st.step[a] >= x.d[a])) return error.InvalidModel;
+                s.d[a] = st.len[a];
+            }
+        },
+        .channel_gather => |map| {
+            if (x.rank != 4) return error.InvalidModel;
+            for (0..n.inputs.len) |i| {
+                const si = try inShape(g, n, i);
+                if (si.rank != 4 or si.d[0] != x.d[0] or si.d[2] != x.d[2] or si.d[3] != x.d[3]) return error.ShapeMismatch;
+            }
+            for (map) |m| {
+                if (m.input >= n.inputs.len or m.channel >= g.value(n.inputs[m.input]).shape.d[1]) return error.InvalidModel;
+            }
+            s.d[1] = map.len;
         },
     }
     out.shape = s;

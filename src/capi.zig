@@ -1073,6 +1073,77 @@ export fn visar_face_detector_detect(h: *CFaceDetector, img: *const CImage, out:
     return 0;
 }
 
+const CObjectDetector = struct {
+    bytes: []u8,
+    det: dnn.ObjectDetector,
+};
+
+/// Loads a NanoDet or YOLOX model from the OpenCV Model Zoo. `arch`: -1
+/// detect from the model, 0 NanoDet, 1 YOLOX. A negative threshold picks
+/// the zoo demo's default.
+export fn visar_object_detector_create(bytes: [*]const u8, len: usize, arch: c_int, score_threshold: f32, nms_threshold: f32, out: *?*CObjectDetector) c_int {
+    out.* = null;
+    if (arch < -1 or arch > 1) return fail(error.InvalidArgument);
+    const h = gpa.create(CObjectDetector) catch |e| return fail(e);
+    h.bytes = gpa.dupe(u8, bytes[0..len]) catch |e| {
+        gpa.destroy(h);
+        return fail(e);
+    };
+    h.det = dnn.ObjectDetector.create(gpa, h.bytes, .{
+        .arch = if (arch < 0) null else @fromBackingInt(@intCast(arch)),
+        .score_threshold = if (score_threshold < 0) null else score_threshold,
+        .nms_threshold = if (nms_threshold < 0) null else nms_threshold,
+    }) catch |e| {
+        gpa.free(h.bytes);
+        gpa.destroy(h);
+        return fail(e);
+    };
+    out.* = h;
+    return 0;
+}
+
+export fn visar_object_detector_free(h: ?*CObjectDetector) void {
+    const d = h orelse return;
+    d.det.deinit();
+    gpa.free(d.bytes);
+    gpa.destroy(d);
+}
+
+/// 0 NanoDet, 1 YOLOX.
+export fn visar_object_detector_arch(h: *CObjectDetector) c_int {
+    return @backingInt(h.det.arch);
+}
+
+export fn visar_object_detector_set_thresholds(h: *CObjectDetector, score_threshold: f32, nms_threshold: f32) void {
+    h.det.score_threshold = score_threshold;
+    h.det.nms_threshold = nms_threshold;
+}
+
+/// Detects objects in a BGR VISAR_8U image of any size. Writes up to `cap`
+/// detections (box x, y, w, h in image pixels, score, COCO class id) in
+/// decreasing score order; `count` receives the number found.
+export fn visar_object_detector_detect(h: *CObjectDetector, img: *const CImage, out: ?[*]dnn.Detection, cap: usize, count: *usize) c_int {
+    count.* = 0;
+    const src = typed(u8, img) catch |e| return fail(e);
+    const dets = h.det.detect(exec(), src) catch |e| return fail(e);
+    count.* = dets.len;
+    if (out) |o| {
+        const n = @min(cap, dets.len);
+        @memcpy(o[0..n], dets[0..n]);
+    }
+    return 0;
+}
+
+/// COCO class name `i` (0..79), or "" when out of range.
+export fn visar_coco_class_name(i: c_int) [*:0]const u8 {
+    const names = comptime blk: {
+        var a: [80][*:0]const u8 = undefined;
+        for (&a, dnn.detect.coco_classes) |*o, n| o.* = (n ++ "")[0..n.len :0];
+        break :blk a;
+    };
+    return if (i >= 0 and i < 80) names[@intCast(i)] else "";
+}
+
 comptime {
     _ = builtin;
 }

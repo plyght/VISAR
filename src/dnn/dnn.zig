@@ -9,7 +9,8 @@
 //! whole plan on an Apple GPU, one command buffer per inference; macOS).
 //!
 //! `Net` ties the stages together; `FaceDetector` runs YuNet the way
-//! OpenCV's FaceDetectorYN does.
+//! OpenCV's FaceDetectorYN does; `ObjectDetector` runs the Model Zoo's
+//! NanoDet and YOLOX detectors the way its Python demos do.
 
 const std = @import("std");
 
@@ -22,6 +23,7 @@ pub const cpu = @import("cpu/backend.zig");
 pub const metal = @import("metal/metal.zig");
 pub const net = @import("net.zig");
 pub const face = @import("face.zig");
+pub const detect = @import("detect.zig");
 
 pub const Net = net.Net;
 pub const Tensor = net.Tensor;
@@ -29,6 +31,8 @@ pub const Backend = net.Backend;
 pub const Device = net.Device;
 pub const FaceDetector = face.FaceDetector;
 pub const Face = face.Face;
+pub const ObjectDetector = detect.ObjectDetector;
+pub const Detection = detect.Detection;
 
 test {
     std.testing.refAllDecls(@This());
@@ -39,6 +43,7 @@ test {
     _ = net;
     _ = face;
     _ = metal;
+    _ = detect;
     _ = @import("tests.zig");
     _ = @import("metal/tests.zig");
     _ = @import("cpu/vec.zig");

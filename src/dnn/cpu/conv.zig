@@ -521,6 +521,219 @@ pub const Direct = struct {
     }
 };
 
+// ---------------------------------------------------------------- blocked
+
+/// Single-group convolution of a blocked input with any kernel, stride and
+/// dilation (the big 3x3 layers of detection backbones): a GEMM-class
+/// kernel cache-blocked over input channels.
+///
+/// For one input-channel block at a time, the weights of an `NB`-wide group
+/// of output blocks (kh*kw*B*B*NB floats) stay in L1 while every register
+/// tile of a band of output rows runs over them; partial sums go back to
+/// the output and are reloaded for the next input block (2 accesses per
+/// kh*kw*B FMAs per accumulator), the epilogue applies after the last.
+/// The register tile is `R` pixels x `NB` output blocks, fed per input
+/// lane by `NB` weight vectors and `R` broadcasts (from memory on x86,
+/// lanes of a loaded vector on NEON).
+pub const Blocked = struct {
+    g: Geom,
+    io: Io,
+    /// [coutb][cinb][kh*kw][B ci][B co]
+    w: []align(64) f32,
+    bias: []align(64) f32,
+    epi: Epilogue,
+    /// Output columns whose taps all lie inside the input.
+    ox_lo: usize,
+    ox_hi: usize,
+    /// Output rows per band (one unit of work per band and block group).
+    band: usize,
+
+    pub fn init(arena: Allocator, g: Geom, io: Io, c: ir.Conv, w: []const f32, bias: ?[]const f32) Allocator.Error!Blocked {
+        const kk = g.kh * g.kw;
+        const cinb = g.cinb();
+        const wp = try arena.alignedAlloc(f32, .@"64", g.coutb() * cinb * kk * B * B);
+        @memset(wp, 0);
+        for (0..g.cout) |o| for (0..g.cin) |i| for (0..kk) |t| {
+            wp[((((o / B) * cinb + i / B) * kk + t) * B + i % B) * B + o % B] = w[(o * g.cin + i) * kk + t];
+        };
+        const xr = Direct.interior(g.pl, g.w, g.kw, g.sw, g.dw, g.ow);
+        return .{
+            .g = g,
+            .io = io,
+            .w = wp,
+            .bias = try packBias(arena, bias, g.cout),
+            .epi = .init(c, g.cout),
+            .ox_lo = xr[0],
+            .ox_hi = xr[1],
+            .band = @max(1, @min(g.oh, (256 + g.ow - 1) / g.ow)),
+        };
+    }
+
+    const Ctx = struct { k: *const Blocked, base: [*]f32, band: usize };
+
+    fn groups(k: *const Blocked) usize {
+        return (k.g.coutb() + vec.max_nb - 1) / vec.max_nb;
+    }
+
+    pub fn run(k: *const Blocked, exec: anytype, base: [*]f32) void {
+        // Bands short enough that every thread gets several units.
+        var band = k.band;
+        while (band > 1 and k.g.n * k.groups() * ((k.g.oh + band - 1) / band) < 4 * exec.threads()) band = (band + 1) / 2;
+        const bands = (k.g.oh + band - 1) / band;
+        const units = k.g.n * k.groups() * bands;
+        const ctx: Ctx = .{ .k = k, .base = base, .band = band };
+        switch (vec.actKind(k.epi.act)) {
+            inline else => |ak| exec.parallelFor(units, 1, ctx, struct {
+                fn f(c: Ctx, s: usize, e: usize) void {
+                    const g = c.k.g;
+                    const nbands = (g.oh + c.band - 1) / c.band;
+                    for (s..e) |u| {
+                        const bi = u % nbands;
+                        const grp = (u / nbands) % c.k.groups();
+                        const img = u / nbands / c.k.groups();
+                        const dst = Rows.tensor(c.base, c.k.io.out, img, g.coutb(), g.oh, g.ow);
+                        const res: ?Rows = if (c.k.io.res != no_res) Rows.tensor(c.base, c.k.io.res, img, g.coutb(), g.oh, g.ow) else null;
+                        const y0 = bi * c.band;
+                        c.k.rows(ak, c.base, img, dst, res, grp, y0, @min(g.oh, y0 + c.band));
+                    }
+                }
+            }.f),
+        }
+    }
+
+    /// One output row of a streamed chain (image 0; reads the input tensor).
+    pub fn streamRow(k: *const Blocked, comptime ak: ActKind, base: [*]f32, dst: Rows, res: ?Rows, y: usize) void {
+        for (0..k.groups()) |grp| k.rows(ak, base, 0, dst, res, grp, y, y + 1);
+    }
+
+    /// Output rows [y0, y1) of output-block group `grp`.
+    fn rows(k: *const Blocked, comptime ak: ActKind, base: [*]f32, img: usize, dst: Rows, res: ?Rows, grp: usize, y0: usize, y1: usize) void {
+        const coutb = k.g.coutb();
+        const cob = grp * vec.max_nb;
+        switch (@min(vec.max_nb, coutb - cob)) {
+            inline 1...vec.max_nb => |NB| k.rowsNB(NB, ak, base, img, dst, res, cob, y0, y1),
+            else => unreachable,
+        }
+    }
+
+    fn rowsNB(k: *const Blocked, comptime NB: usize, comptime ak: ActKind, base: [*]f32, img: usize, dst: Rows, res_rows: ?Rows, cob: usize, y0: usize, y1: usize) void {
+        const g = k.g;
+        const R = comptime vec.tileR(NB);
+        const cinb = g.cinb();
+        const kk = g.kh * g.kw;
+        const plane = g.h * g.w * B;
+        const x = base + k.io.x + img * cinb * plane;
+        for (0..cinb) |cib| {
+            const ph: Phase = .{ .first = cib == 0, .last = cib + 1 == cinb };
+            const xb = x + cib * plane;
+            const wb = k.w.ptr + (cob * cinb + cib) * kk * B * B;
+            for (y0..y1) |oy| {
+                // Kernel rows inside the input for this output row.
+                const top = @as(isize, @intCast(oy * g.sh)) - @as(isize, @intCast(g.pt));
+                var ky_lo: usize = 0;
+                while (ky_lo < g.kh and top + @as(isize, @intCast(ky_lo * g.dh)) < 0) ky_lo += 1;
+                var ky_hi: usize = g.kh;
+                while (ky_hi > ky_lo and top + @as(isize, @intCast((ky_hi - 1) * g.dh)) >= @as(isize, @intCast(g.h))) ky_hi -= 1;
+                const t: TileArgs = .{
+                    .xb = xb,
+                    .wb = wb,
+                    .out = dst.at(cob, oy),
+                    .os = dst.cb_stride,
+                    .res = if (res_rows) |r| r.at(cob, oy) else null,
+                    .rs = if (res_rows) |r| r.cb_stride else 0,
+                    .top = top,
+                    .ky_lo = ky_lo,
+                    .ky_hi = ky_hi,
+                    .cob = cob,
+                };
+                var ox: usize = 0;
+                while (ox < k.ox_lo) : (ox += 1) k.tile(1, NB, ak, true, ph, t, ox);
+                while (ox + R <= k.ox_hi) : (ox += R) k.tile(R, NB, ak, false, ph, t, ox);
+                inline for (.{ 8, 4, 2, 1 }) |T| {
+                    if (T < R and ox + T <= k.ox_hi) {
+                        k.tile(T, NB, ak, false, ph, t, ox);
+                        ox += T;
+                    }
+                }
+                while (ox < k.ox_hi) : (ox += 1) k.tile(1, NB, ak, false, ph, t, ox);
+                while (ox < g.ow) : (ox += 1) k.tile(1, NB, ak, true, ph, t, ox);
+            }
+        }
+    }
+
+    const Phase = struct { first: bool, last: bool };
+
+    const TileArgs = struct {
+        /// Input channel block (image plane base) and its weights.
+        xb: [*]const f32,
+        wb: [*]const f32,
+        /// Output row of block `cob`, distance between output blocks.
+        out: [*]f32,
+        os: usize,
+        res: ?[*]const f32,
+        rs: usize,
+        /// Input row of kernel row 0 (may be negative) and the kernel rows
+        /// inside the input.
+        top: isize,
+        ky_lo: usize,
+        ky_hi: usize,
+        cob: usize,
+    };
+
+    /// `R` output pixels from column `ox`, blocks [cob, cob+NB), one input
+    /// channel block. Unchecked tiles have every column tap inside.
+    inline fn tile(k: *const Blocked, comptime R: usize, comptime NB: usize, comptime ak: ActKind, comptime checked: bool, ph: Phase, t: TileArgs, ox: usize) void {
+        @setEvalBranchQuota(100000);
+        const g = k.g;
+        const kk = g.kh * g.kw;
+        const wcs = g.cinb() * kk * B * B;
+        const step = g.sw * B;
+        var acc: [R][NB]V = undefined;
+        if (ph.first) {
+            inline for (0..NB) |nb| {
+                const bv = vec.load(k.bias.ptr + (t.cob + nb) * B);
+                inline for (0..R) |r| acc[r][nb] = bv;
+            }
+        } else {
+            inline for (0..NB) |nb| {
+                inline for (0..R) |r| acc[r][nb] = vec.load(t.out + nb * t.os + (ox + r) * B);
+            }
+        }
+        const left = @as(isize, @intCast(ox * g.sw)) - @as(isize, @intCast(g.pl));
+        for (t.ky_lo..t.ky_hi) |ky| {
+            const iy: usize = @intCast(t.top + @as(isize, @intCast(ky * g.dh)));
+            const row = t.xb + iy * g.w * B;
+            for (0..g.kw) |kx| {
+                const ix = left + @as(isize, @intCast(kx * g.dw));
+                if (checked and (ix < 0 or ix >= @as(isize, @intCast(g.w)))) continue;
+                const xp = row + @as(usize, @intCast(ix)) * B;
+                const wt = t.wb + (ky * g.kw + kx) * B * B;
+                var xv: [R]V = undefined;
+                if (vec.lane_broadcast) {
+                    inline for (0..R) |r| xv[r] = vec.load(xp + r * step);
+                }
+                inline for (0..B) |j| {
+                    var wv: [NB]V = undefined;
+                    inline for (0..NB) |nb| wv[nb] = vec.load(wt + nb * wcs + j * B);
+                    inline for (0..R) |r| {
+                        const bc: V = if (vec.lane_broadcast) @shuffle(f32, xv[r], undefined, @as(@Vector(B, i32), @splat(j))) else @splat(xp[r * step + j]);
+                        inline for (0..NB) |nb| acc[r][nb] = fma(bc, wv[nb], acc[r][nb]);
+                    }
+                }
+            }
+        }
+        inline for (0..NB) |nb| {
+            const o = t.out + nb * t.os + ox * B;
+            inline for (0..R) |r| {
+                if (ph.last) {
+                    const rp: ?[*]const f32 = if (t.res) |rr| rr + nb * t.rs + (ox + r) * B else null;
+                    vec.store(o + r * B, k.epi.apply(ak, acc[r][nb], rp, t.cob + nb));
+                } else vec.store(o + r * B, acc[r][nb]);
+            }
+        }
+    }
+};
+
 // ------------------------------------------------------------- reference
 
 /// Grouped convolution (neither depthwise nor one group): plain loops.

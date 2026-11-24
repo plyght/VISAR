@@ -67,6 +67,9 @@ jobs:
           zoo=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/face_detection_yunet_2023mar.onnx" "$zoo/face_detection_yunet_2023mar.onnx"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg" || true
+          media=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/object_detection_nanodet_2022nov.onnx" "$media/object_detection_nanodet/object_detection_nanodet_2022nov.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/object_detection_yolox_2022nov.onnx" "$media/object_detection_yolox/object_detection_yolox_2022nov.onnx"
           echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
       - run: zig build difftest -Doptimize=ReleaseSafe
       # Runners may or may not have AVX-512; pin the AVX2 and SSE4 paths so a
