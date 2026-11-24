@@ -307,6 +307,45 @@ inline fn pack(v: [2]V8) V16 {
     return @intCast(std.simd.join(v[0], v[1]));
 }
 
+/// Window elements per vector step. NEON has no pmaddwd and 128-bit
+/// registers, so ARM works on 8 i16 lanes (one register) with planar
+/// widening multiply-accumulates (smull/smlal); x86 keeps 16 lanes paired
+/// for pmaddwd. 8-lane steps also waste less of a 21-element window row
+/// (24 lanes instead of 32).
+const neon = builtin.cpu.arch == .aarch64;
+const B = if (neon) 8 else 16;
+const VB = @Vector(B, i16);
+const VBi = @Vector(B, i32);
+
+/// Bilinear weights in the form `sample` takes.
+const Wv = if (neon) [4]@Vector(8, i16) else [2]V16;
+
+inline fn wvec(w: Weights) Wv {
+    if (neon) return .{ @splat(@intCast(w.w00)), @splat(@intCast(w.w01)), @splat(@intCast(w.w10)), @splat(@intCast(w.w11)) };
+    return .{ w.pair01(), w.pair23() };
+}
+
+/// Bilinear samples of B consecutive elements at p[x] (neighbours at +cn
+/// and one row down), rounded and descaled by `shift`, as i16.
+inline fn sample(comptime T: type, p: [*]const T, stride: usize, x: usize, cn: usize, w: Wv, comptime shift: comptime_int) VB {
+    if (!neon) return pack(bilin16(T, p, stride, x, cn, w[0], w[1], shift));
+    var acc: V8 = @splat(1 << (shift - 1));
+    const offs = [4]usize{ x, x + cn, x + stride, x + stride + cn };
+    inline for (offs, w) |o, wk| {
+        const v: @Vector(8, T) = p[o..][0..8].*;
+        acc += @as(V8, @as(@Vector(8, i16), v)) * @as(V8, wk);
+    }
+    const r: @Vector(8, u32) = @bitCast(acc >> @splat(shift));
+    return @bitCast(@as(@Vector(8, u16), @truncate(r)));
+}
+
+/// Products of a and b summed into 8 i32 lanes (lane pairing is
+/// unspecified: only for accumulators reduced over all lanes).
+inline fn dot(a: VB, b: VB) V8 {
+    if (!neon) return madd(a, b);
+    return @as(V8, a) * @as(V8, b);
+}
+
 /// Products summed per i32 lane before the lanes are flushed to i64: each
 /// madd lane is below 2^27 (two 8160 * 4080 products), so 16 cannot
 /// overflow.
@@ -434,13 +473,13 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
     const wh: usize = o.win_height;
     const cn: usize = prev.levels[0].channels;
     const e = ww * cn; // elements per window row
-    const nv = (e + 15) / 16; // 16-element blocks per window row
-    const rl = nv * 16;
+    const nv = (e + B - 1) / B; // B-element blocks per window row
+    const rl = nv * B;
     // Patch geometry: window rows plus the row below, elements plus the
     // right neighbour.
     const pcols = rl + cn;
     const prows = wh + 1;
-    const iwin = try gpa.alloc(i32, rl * wh);
+    const iwin = try gpa.alloc(i16, rl * wh);
     defer gpa.free(iwin);
     const gbuf = try gpa.alloc(i16, 2 * rl * wh);
     defer gpa.free(gbuf);
@@ -455,10 +494,9 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
     const dbuf = try gpa.alloc(i16, 2 * pcols * prows + 2 * mcols);
     defer gpa.free(dbuf);
     // Lanes of the last block past the window's last element.
-    var tail_mask: [16]i16 = undefined;
-    for (&tail_mask, 0..) |*m, i| m.* = if ((nv - 1) * 16 + i < e) -1 else 0;
-    const tmask: V16 = tail_mask;
-    const tmask32: [2]V8 = .{ @as(V8, lo8(tmask)), @as(V8, hi8(tmask)) };
+    var tail_mask: [B]i16 = undefined;
+    for (&tail_mask, 0..) |*m, i| m.* = if ((nv - 1) * B + i < e) -1 else 0;
+    const tmask: VB = tail_mask;
     const half_w: f32 = (@as(f32, @floatFromInt(ww)) - 1) * 0.5;
     const half_h: f32 = (@as(f32, @floatFromInt(wh)) - 1) * 0.5;
     const max_count: usize = @min(o.max_count, 100);
@@ -500,8 +538,7 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                 scharrPatch(pm, cn, pcols, prows, dbuf);
                 zeroOutside(I, ix0, iy0, cn, pcols, prows, dbuf);
                 const isrc = pm.ptr + pm.stride + cn;
-                var w01 = wt.pair01();
-                var w23 = wt.pair23();
+                var wv = wvec(wt);
                 var a11: VL = @splat(0);
                 var a12: VL = @splat(0);
                 var a22: VL = @splat(0);
@@ -514,22 +551,20 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                     const dxs = dbuf.ptr + y * pcols;
                     const dys = dbuf.ptr + pcols * prows + y * pcols;
                     for (0..nv) |v| {
-                        const x = v * 16;
+                        const x = v * B;
                         const k = y * rl + x;
-                        const ival = bilin16(u8, src, pm.stride, x, cn, w01, w23, w_bits - 5);
-                        var gx = pack(bilin16(i16, dxs, pcols, x, cn, w01, w23, w_bits));
-                        var gy = pack(bilin16(i16, dys, pcols, x, cn, w01, w23, w_bits));
+                        iwin[k..][0..B].* = sample(u8, src, pm.stride, x, cn, wv, w_bits - 5);
+                        var gx = sample(i16, dxs, pcols, x, cn, wv, w_bits);
+                        var gy = sample(i16, dys, pcols, x, cn, wv, w_bits);
                         if (v == nv - 1) {
                             gx &= tmask;
                             gy &= tmask;
                         }
-                        iwin[k..][0..8].* = ival[0];
-                        iwin[k + 8 ..][0..8].* = ival[1];
-                        ixw[k..][0..16].* = gx;
-                        iyw[k..][0..16].* = gy;
-                        s11 += madd(gx, gx);
-                        s12 += madd(gx, gy);
-                        s22 += madd(gy, gy);
+                        ixw[k..][0..B].* = gx;
+                        iyw[k..][0..B].* = gy;
+                        s11 += dot(gx, gx);
+                        s12 += dot(gx, gy);
+                        s22 += dot(gy, gy);
                         cnt += 1;
                         if (cnt == flush_every) {
                             a11 += @as(VL, s11);
@@ -571,8 +606,7 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                         break;
                     }
                     wt = weights(next_pt.x - @as(f32, @floatFromInt(inx.?)), next_pt.y - @as(f32, @floatFromInt(iny.?)));
-                    w01 = wt.pair01();
-                    w23 = wt.pair23();
+                    wv = wvec(wt);
                     const pJ = Patch(u8).get(J, inx.?, iny.?, pcols, prows, sbuf);
                     var b1: VL = @splat(0);
                     var b2: VL = @splat(0);
@@ -582,12 +616,11 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                     for (0..wh) |y| {
                         const jrow = pJ.ptr + y * pJ.stride;
                         for (0..nv) |v| {
-                            const x = v * 16;
+                            const x = v * B;
                             const k = y * rl + x;
-                            const jval = bilin16(u8, jrow, pJ.stride, x, cn, w01, w23, w_bits - 5);
-                            const diff = pack(.{ jval[0] - @as(V8, iwin[k..][0..8].*), jval[1] - @as(V8, iwin[k + 8 ..][0..8].*) });
-                            t1 += madd(diff, ixw[k..][0..16].*);
-                            t2 += madd(diff, iyw[k..][0..16].*);
+                            const diff = sample(u8, jrow, pJ.stride, x, cn, wv, w_bits - 5) - @as(VB, iwin[k..][0..B].*);
+                            t1 += dot(diff, ixw[k..][0..B].*);
+                            t2 += dot(diff, iyw[k..][0..B].*);
                             tc += 1;
                             if (tc == flush_every) {
                                 b1 += @as(VL, t1);
@@ -626,23 +659,17 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                     continue;
                 }
                 wt = weights(np.x - @as(f32, @floatFromInt(inx.?)), np.y - @as(f32, @floatFromInt(iny.?)));
-                const w01 = wt.pair01();
-                const w23 = wt.pair23();
+                const ev = wvec(wt);
                 const pJ = Patch(u8).get(J, inx.?, iny.?, pcols, prows, sbuf);
-                var acc: V8 = @splat(0);
+                var acc: VBi = @splat(0);
                 for (0..wh) |y| {
                     const jrow = pJ.ptr + y * pJ.stride;
                     for (0..nv) |v| {
-                        const x = v * 16;
+                        const x = v * B;
                         const k = y * rl + x;
-                        const jval = bilin16(u8, jrow, pJ.stride, x, cn, w01, w23, w_bits - 5);
-                        var d0: V8 = @intCast(@abs(jval[0] - @as(V8, iwin[k..][0..8].*)));
-                        var d1: V8 = @intCast(@abs(jval[1] - @as(V8, iwin[k + 8 ..][0..8].*)));
-                        if (v == nv - 1) {
-                            d0 &= tmask32[0];
-                            d1 &= tmask32[1];
-                        }
-                        acc += d0 + d1;
+                        var d = sample(u8, jrow, pJ.stride, x, cn, ev, w_bits - 5) - @as(VB, iwin[k..][0..B].*);
+                        if (v == nv - 1) d &= tmask;
+                        acc += @as(VBi, @abs(d));
                     }
                 }
                 const errval: f32 = @floatFromInt(@reduce(.Add, acc));
