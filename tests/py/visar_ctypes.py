@@ -274,15 +274,21 @@ def connected_components_with_stats(a, connectivity=8):
     h, w = a.shape[:2]
     labels = np.empty((h, w), np.int32)
     count = ctypes.c_size_t(0)
-    cap = h * w + 1
-    stats = np.empty((min(cap, 1 << 20), 5), np.int32)
-    cents = np.empty((stats.shape[0], 2), np.float64)
-    _check(lib.visar_connected_components(ctypes.byref(desc(a)), ctypes.byref(desc(labels)), connectivity,
-                                          stats.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-                                          cents.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                                          stats.shape[0], ctypes.byref(count)))
-    n = count.value
-    return n, labels, stats[:n].copy(), cents[:n].copy()
+    # Start small (allocating room for every possible label costs more
+    # than labelling); the library reports the full count, so retry with
+    # exactly that much room when there are more components.
+    cap = min(h * w + 1, 4096)
+    while True:
+        stats = np.empty((cap, 5), np.int32)
+        cents = np.empty((cap, 2), np.float64)
+        _check(lib.visar_connected_components(ctypes.byref(desc(a)), ctypes.byref(desc(labels)), connectivity,
+                                              stats.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                                              cents.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                                              cap, ctypes.byref(count)))
+        n = count.value
+        if n <= cap:
+            return n, labels, stats[:n], cents[:n]
+        cap = n
 
 
 # ------------------------------------------------------------- contours

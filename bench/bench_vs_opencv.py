@@ -130,6 +130,7 @@ def contour_cases(h, w):
     yield "findContours TREE simple", lambda: vs.find_contours(mask, 3, 2, raw=True), lambda: cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     yield "findContours EXT none", lambda: vs.find_contours(mask, 0, 1, raw=True), lambda: cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     yield "moments binary", lambda: vs.moments(mask, True), lambda: cv2.moments(mask, True)
+    yield "connectedComponents stats", lambda: vs.connected_components_with_stats(mask, 8), lambda: cv2.connectedComponentsWithStats(mask, connectivity=8)
     big = max(cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0], key=len)
     rng = np.random.default_rng(3)
     cloud = rng.integers(0, max(h, w), (20000, 1, 2)).astype(np.int32)
