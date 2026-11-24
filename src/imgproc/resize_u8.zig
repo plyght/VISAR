@@ -763,3 +763,244 @@ fn up2VCubic(comptime R: usize, comptime cn: usize, r: [4]Planar(f32), b: [R][4]
         };
     }
 }
+
+/// One INTER_AREA table entry (OpenCV's DecimateAlpha): source cell `si`
+/// contributes `alpha` to destination cell `di`.
+pub const AreaTab = struct { di: u32, si: u32, alpha: f32 };
+
+/// Most horizontal taps handled by the fixed-tap kernels; wider cells use
+/// OpenCV's table loop directly.
+const area_max_k = 8;
+
+fn AreaTap(comptime K: usize) type {
+    return struct { o: [K]u32, w: [K]f32 };
+}
+
+/// Fractional INTER_AREA shrink with OpenCV's arithmetic
+/// (ResizeArea_Invoker<uchar, float>): each source row is resampled
+/// horizontally into f32 by summing `s * alpha` over the destination cell's
+/// taps in table order, then destination rows are `sum(beta * row)` in
+/// table order, rounded half to even. The kernels keep that per-element
+/// order of operations (plain multiplies and adds, no FMA) and vectorise
+/// across channels and pixels, so results are bit-exact; each source row is
+/// resampled once per worker. `ystart[dy]..ystart[dy+1]` is the run of
+/// `ytab` entries of destination row `dy`.
+pub fn area(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), xtab: []const AreaTab, ytab: []const AreaTab, ystart: []const u32) Allocator.Error!void {
+    var kx: usize = 0;
+    var i: usize = 0;
+    while (i < xtab.len) {
+        var j = i;
+        while (j < xtab.len and xtab[j].di == xtab[i].di) j += 1;
+        kx = @max(kx, j - i);
+        i = j;
+    }
+    var ky: usize = 1;
+    for (0..dst.height) |y| ky = @max(ky, ystart[y + 1] - ystart[y]);
+    switch (kx) {
+        inline 1...area_max_k => |K| {
+            // Fixed K taps per destination pixel; shorter cells are padded
+            // with zero weights on their last source pixel (adding s * 0 to
+            // a non-negative partial sum leaves it unchanged).
+            const cn: u32 = src.channels;
+            const xt = try gpa.alloc(AreaTap(K), dst.width);
+            defer gpa.free(xt);
+            var e: usize = 0;
+            for (xt, 0..) |*t, x| {
+                var k: usize = 0;
+                while (e < xtab.len and xtab[e].di == x) : (e += 1) {
+                    t.o[k] = xtab[e].si * cn;
+                    t.w[k] = xtab[e].alpha;
+                    k += 1;
+                }
+                std.debug.assert(k > 0);
+                while (k < K) : (k += 1) {
+                    t.o[k] = t.o[k - 1];
+                    t.w[k] = 0;
+                }
+            }
+            areaRun(K, exec, gpa, src, dst, xt, xtab, ytab, ystart, ky);
+        },
+        else => areaRun(0, exec, gpa, src, dst, &.{}, xtab, ytab, ystart, ky),
+    }
+}
+
+fn areaRun(comptime K: usize, exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), xt: []const AreaTap(K), xtab: []const AreaTab, ytab: []const AreaTab, ystart: []const u32, ky: usize) void {
+    const Ctx = struct { s: Image(u8), d: Image(u8), xt: []const AreaTap(K), xtab: []const AreaTab, ytab: []const AreaTab, ystart: []const u32, ky: usize, gpa: Allocator };
+    const ctx: Ctx = .{ .s = src, .d = dst, .xt = xt, .xtab = xtab, .ytab = ytab, .ystart = ystart, .ky = ky, .gpa = gpa };
+    exec.parallelFor(dst.height, 4, ctx, struct {
+        fn run(c: Ctx, y0: usize, y1: usize) void {
+            switch (c.s.channels) {
+                inline 1, 2, 3, 4 => |cn| areaRows(K, cn, c, y0, y1),
+                else => unreachable,
+            }
+        }
+    }.run);
+}
+
+const area_vn = 16;
+
+fn areaRows(comptime K: usize, comptime cn: usize, c: anytype, y0: usize, y1: usize) void {
+    const n = c.d.rowLen();
+    // Rows are padded for the 4-lane stores of 3-channel pixels and for
+    // whole vectors in the vertical pass.
+    const stride = std.mem.alignForward(usize, n + 4, area_vn);
+    const slen = c.s.rowLen() + 4;
+    const buf = c.gpa.alloc(f32, c.ky * stride + slen) catch @panic("out of memory");
+    defer c.gpa.free(buf);
+    const fsrc = buf[c.ky * stride ..];
+    @memset(buf, 0);
+    const tags = c.gpa.alloc(u32, c.ky) catch @panic("out of memory");
+    defer c.gpa.free(tags);
+    @memset(tags, std.math.maxInt(u32));
+    var rows_: [area_max_k][]const f32 = undefined;
+    var betas: [area_max_k]f32 = undefined;
+    for (y0..y1) |dy| {
+        const es = c.ytab[c.ystart[dy]..c.ystart[dy + 1]];
+        for (es, 0..) |e, k| {
+            const slot = e.si % c.ky;
+            const h = buf[slot * stride ..][0..stride];
+            if (tags[slot] != e.si) {
+                tags[slot] = e.si;
+                areaH(K, cn, c.s.row(e.si), fsrc, h, c.xt, c.xtab);
+            }
+            if (k < area_max_k) {
+                rows_[k] = h;
+                betas[k] = e.alpha;
+            }
+        }
+        const d = c.d.row(dy);
+        switch (es.len) {
+            inline 1...4 => |M| areaV(M, rows_[0..M].*, betas[0..M].*, d),
+            else => areaVAny(c.ky, es, buf, stride, d),
+        }
+    }
+}
+
+/// Horizontal pass of one source row into `h` (f32, `n` + padding).
+fn areaH(comptime K: usize, comptime cn: usize, s: []const u8, f: []f32, h: []f32, xt: []const AreaTap(K), xtab: []const AreaTab) void {
+    {
+        // u8 -> f32 once per row.
+        const V = @Vector(area_vn, u8);
+        var i: usize = 0;
+        while (i + area_vn <= s.len) : (i += area_vn) {
+            const v: V = s[i..][0..area_vn].*;
+            f[i..][0..area_vn].* = simd.toF32(area_vn, v);
+        }
+        while (i < s.len) : (i += 1) f[i] = @floatFromInt(s[i]);
+    }
+    if (K == 0) {
+        // OpenCV's loop over the table.
+        @memset(h, 0);
+        for (xtab) |t| inline for (0..cn) |ch| {
+            h[t.di * cn + ch] += f[t.si * cn + ch] * t.alpha;
+        };
+        return;
+    }
+    if (cn == 1) {
+        for (xt, 0..) |t, x| {
+            var acc = f[t.o[0]] * t.w[0];
+            inline for (1..K) |k| acc = acc + f[t.o[k]] * t.w[k];
+            h[x] = acc;
+        }
+        return;
+    }
+    // One vector per pixel; 3-channel pixels use 4 lanes, the extra lane is
+    // overwritten by the next pixel (or lands in the padding).
+    const L = if (cn == 3) 4 else cn;
+    const V = @Vector(L, f32);
+    for (xt, 0..) |t, x| {
+        var acc = @as(V, f[t.o[0]..][0..L].*) * @as(V, @splat(t.w[0]));
+        inline for (1..K) |k| acc = acc + @as(V, f[t.o[k]..][0..L].*) * @as(V, @splat(t.w[k]));
+        h[x * cn ..][0..L].* = acc;
+    }
+}
+
+/// Vertical pass for a destination row with `M` source rows.
+fn areaV(comptime M: usize, r: [M][]const f32, b: [M]f32, d: []u8) void {
+    const V = @Vector(area_vn, f32);
+    var x: usize = 0;
+    while (x < d.len) : (x += area_vn) {
+        var acc = @as(V, r[0][x..][0..area_vn].*) * @as(V, @splat(b[0]));
+        inline for (1..M) |k| acc = acc + @as(V, r[k][x..][0..area_vn].*) * @as(V, @splat(b[k]));
+        const o: [area_vn]u8 = simd.satF32(u8, area_vn, acc);
+        if (x + area_vn <= d.len) {
+            d[x..][0..area_vn].* = o;
+        } else @memcpy(d[x..], o[0 .. d.len - x]);
+    }
+}
+
+fn areaVAny(ky: usize, es: []const AreaTab, buf: []const f32, stride: usize, d: []u8) void {
+    for (d, 0..) |*o, x| {
+        var acc: f32 = buf[(es[0].si % ky) * stride + x] * es[0].alpha;
+        for (es[1..]) |e| acc = acc + buf[(e.si % ky) * stride + x] * e.alpha;
+        o.* = sat.cast(u8, acc);
+    }
+}
+
+/// Integer-factor INTER_AREA shrink (OpenCV's resizeAreaFast for factors
+/// other than 2x2): the integer block sum times the f32 reciprocal of the
+/// block area, rounded half to even.
+pub fn areaInt(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), ix: u32, iy: u32) void {
+    const Ctx = struct { s: Image(u8), d: Image(u8), ix: u32, iy: u32, gpa: Allocator };
+    exec.parallelFor(dst.height, 4, Ctx{ .s = src, .d = dst, .ix = ix, .iy = iy, .gpa = gpa }, struct {
+        fn run(c: Ctx, y0: usize, y1: usize) void {
+            switch (c.s.channels) {
+                inline 1, 2, 3, 4 => |cn| areaIntRows(cn, c, y0, y1),
+                else => unreachable,
+            }
+        }
+    }.run);
+}
+
+fn areaIntRows(comptime cn: usize, c: anytype, y0: usize, y1: usize) void {
+    const n = c.d.rowLen();
+    const sn: usize = c.d.width * c.ix * cn; // source elements used per row
+    const stride = std.mem.alignForward(usize, n + 4, area_vn);
+    const buf = c.gpa.alloc(u32, sn + 4 + stride) catch @panic("out of memory");
+    defer c.gpa.free(buf);
+    @memset(buf, 0);
+    const vs = buf[0 .. sn + 4];
+    const hs = buf[sn + 4 ..];
+    const scale: f32 = 1.0 / @as(f32, @floatFromInt(c.ix * c.iy));
+    const U = @Vector(area_vn, u32);
+    for (y0..y1) |dy| {
+        // Column sums over the block's rows.
+        for (0..c.iy) |k| {
+            const s = c.s.row(dy * c.iy + k)[0..sn];
+            var i: usize = 0;
+            while (i + area_vn <= sn) : (i += area_vn) {
+                const v: @Vector(area_vn, u8) = s[i..][0..area_vn].*;
+                const prev: U = if (k == 0) @splat(0) else vs[i..][0..area_vn].*;
+                vs[i..][0..area_vn].* = prev + @as(U, v);
+            }
+            while (i < sn) : (i += 1) vs[i] = (if (k == 0) 0 else vs[i]) + s[i];
+        }
+        // Row sums over the block's columns.
+        if (cn == 1) {
+            for (0..c.d.width) |x| {
+                var acc: u32 = 0;
+                for (vs[x * c.ix ..][0..c.ix]) |v| acc += v;
+                hs[x] = acc;
+            }
+        } else {
+            const L = if (cn == 3) 4 else cn;
+            const W = @Vector(L, u32);
+            for (0..c.d.width) |x| {
+                var acc: W = @splat(0);
+                const base = x * c.ix * cn;
+                for (0..c.ix) |k| acc += @as(W, vs[base + k * cn ..][0..L].*);
+                hs[x * cn ..][0..L].* = acc;
+            }
+        }
+        const d = c.d.row(dy);
+        var x: usize = 0;
+        while (x < n) : (x += area_vn) {
+            const v: U = hs[x..][0..area_vn].*;
+            const f = @as(@Vector(area_vn, f32), @floatFromInt(v)) * @as(@Vector(area_vn, f32), @splat(scale));
+            const o: [area_vn]u8 = simd.satF32(u8, area_vn, f);
+            if (x + area_vn <= n) {
+                d[x..][0..area_vn].* = o;
+            } else @memcpy(d[x..], o[0 .. n - x]);
+        }
+    }
+}

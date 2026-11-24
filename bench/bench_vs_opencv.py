@@ -64,6 +64,7 @@ def cases(h, w):
     yield "resize linear 2x", lambda: vs.resize(bgr, (w * 2, h * 2), 1, dbl), lambda: cv2.resize(bgr, (w * 2, h * 2), dst=dbl, interpolation=cv2.INTER_LINEAR)
     yield "resize linear 0.75", lambda: vs.resize(bgr, (odd.shape[1], odd.shape[0]), 1, odd), lambda: cv2.resize(bgr, (odd.shape[1], odd.shape[0]), dst=odd, interpolation=cv2.INTER_LINEAR)
     yield "resize area 1/2", lambda: vs.resize(bgr, (w // 2, h // 2), 3, half), lambda: cv2.resize(bgr, (w // 2, h // 2), dst=half, interpolation=cv2.INTER_AREA)
+    yield from area_cases()
     yield "resize nearest 2x", lambda: vs.resize(bgr, (w * 2, h * 2), 0, dbl), lambda: cv2.resize(bgr, (w * 2, h * 2), dst=dbl, interpolation=cv2.INTER_NEAREST)
     yield "resize cubic 2x", lambda: vs.resize(bgr, (w * 2, h * 2), 2, dbl), lambda: cv2.resize(bgr, (w * 2, h * 2), dst=dbl, interpolation=cv2.INTER_CUBIC)
     yield "GaussianBlur 5x5", lambda: vs.gaussian_blur(bgr, (5, 5), 0, dst=out_bgr), lambda: cv2.GaussianBlur(bgr, (5, 5), 0, dst=out_bgr)
@@ -159,6 +160,19 @@ def blob_mask(h, w, n=None, seed=7):
         x, y, r = int(rng.integers(0, w)), int(rng.integers(0, h)), int(rng.integers(2, max(3, min(h, w) // 40)))
         cv2.circle(m, (x, y), r, 255, -1 if rng.random() < 0.7 else 2)
     return m
+
+
+def area_cases():
+    """INTER_AREA shrinks at fixed sizes: fractional and integer factors,
+    1, 3 and 4 channels."""
+    for (sw, sh), (dw, dh), cns in [((640, 480), (416, 312), (1, 3, 4)), ((1920, 1080), (1280, 720), (3,)),
+                                    ((1920, 1080), (640, 360), (3,)), ((1280, 720), (320, 180), (3,)),
+                                    ((97, 61), (53, 37), (3,))]:
+        for cn in cns:
+            src = natural(sh, sw, cn)
+            out = np.empty((dh, dw) if cn == 1 else (dh, dw, cn), np.uint8)
+            yield (f"resize area {sw}x{sh}->{dw}x{dh} c{cn}", lambda src=src, out=out, dw=dw, dh=dh: vs.resize(src, (dw, dh), 3, out),
+                   lambda src=src, out=out, dw=dw, dh=dh: cv2.resize(src, (dw, dh), dst=out, interpolation=cv2.INTER_AREA))
 
 
 def contour_cases(h, w):

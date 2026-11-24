@@ -35,6 +35,10 @@ pub fn resize(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), inter
             .area => {
                 if (dst.width > src.width or dst.height > src.height) return linearU8(exec, gpa, src, dst, true);
                 if (exact_half) return ru8.half(exec, src, dst);
+                const ix = src.width / dst.width;
+                const iy = src.height / dst.height;
+                if (ix * dst.width == src.width and iy * dst.height == src.height) return ru8.areaInt(exec, gpa, src, dst, ix, iy);
+                return areaU8(exec, gpa, src, dst);
             },
             .cubic => return cubicU8(exec, gpa, src, dst),
             else => {},
@@ -459,7 +463,7 @@ fn areaInt(exec: Exec, src: anytype, dst: @TypeOf(src), ix: u32, iy: u32) Error!
     }.run);
 }
 
-const AreaTab = struct { di: u32, si: u32, alpha: f32 };
+const AreaTab = ru8.AreaTab;
 
 /// OpenCV's computeResizeAreaTab: the overlap of each destination cell with
 /// source cells, as (destination index, source index, weight) triples.
@@ -488,26 +492,53 @@ fn areaTab(gpa: Allocator, ssize: u32, dsize: u32, scale: f64) Allocator.Error![
     return list.toOwnedSlice(gpa);
 }
 
-/// Non-integer area shrink (OpenCV's ResizeArea_Invoker), float accumulation.
-fn areaGeneric(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src)) Error!void {
-    const T = @TypeOf(src).Elem;
-    const sx = @as(f64, @floatFromInt(src.width)) / @as(f64, @floatFromInt(dst.width));
-    const sy = @as(f64, @floatFromInt(src.height)) / @as(f64, @floatFromInt(dst.height));
-    const xtab = try areaTab(gpa, src.width, dst.width, sx);
-    defer gpa.free(xtab);
-    const ytab = try areaTab(gpa, src.height, dst.height, sy);
-    defer gpa.free(ytab);
-    // Start of each destination row's run in ytab.
-    const ystart = try gpa.alloc(u32, dst.height + 1);
-    defer gpa.free(ystart);
-    {
+/// The x and y tables of a non-integer area shrink, with the start of each
+/// destination row's run in ytab.
+const AreaTabs = struct {
+    xtab: []AreaTab,
+    ytab: []AreaTab,
+    ystart: []u32,
+
+    fn init(gpa: Allocator, sw: u32, sh: u32, dw: u32, dh: u32) Allocator.Error!AreaTabs {
+        const sx = @as(f64, @floatFromInt(sw)) / @as(f64, @floatFromInt(dw));
+        const sy = @as(f64, @floatFromInt(sh)) / @as(f64, @floatFromInt(dh));
+        const xtab = try areaTab(gpa, sw, dw, sx);
+        errdefer gpa.free(xtab);
+        const ytab = try areaTab(gpa, sh, dh, sy);
+        errdefer gpa.free(ytab);
+        const ystart = try gpa.alloc(u32, dh + 1);
         var k: u32 = 0;
-        for (0..dst.height) |dy| {
+        for (0..dh) |dy| {
             ystart[dy] = k;
             while (k < ytab.len and ytab[k].di == dy) k += 1;
         }
-        ystart[dst.height] = k;
+        ystart[dh] = k;
+        return .{ .xtab = xtab, .ytab = ytab, .ystart = ystart };
     }
+
+    fn deinit(t: AreaTabs, gpa: Allocator) void {
+        gpa.free(t.xtab);
+        gpa.free(t.ytab);
+        gpa.free(t.ystart);
+    }
+};
+
+/// 8-bit non-integer area shrink: the vectorised kernels in resize_u8.zig,
+/// bit-exact with `areaGeneric`.
+fn areaU8(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8)) Error!void {
+    const t = try AreaTabs.init(gpa, src.width, src.height, dst.width, dst.height);
+    defer t.deinit(gpa);
+    return ru8.area(exec, gpa, src, dst, t.xtab, t.ytab, t.ystart);
+}
+
+/// Non-integer area shrink (OpenCV's ResizeArea_Invoker), float accumulation.
+fn areaGeneric(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src)) Error!void {
+    const T = @TypeOf(src).Elem;
+    const t = try AreaTabs.init(gpa, src.width, src.height, dst.width, dst.height);
+    defer t.deinit(gpa);
+    const xtab = t.xtab;
+    const ytab = t.ytab;
+    const ystart = t.ystart;
     const Ctx = struct { s: Image(T), d: Image(T), xtab: []const AreaTab, ytab: []const AreaTab, ystart: []const u32, gpa: Allocator };
     exec.parallelFor(dst.height, 4, Ctx{ .s = src, .d = dst, .xtab = xtab, .ytab = ytab, .ystart = ystart, .gpa = gpa }, struct {
         fn run(c: Ctx, y0: usize, y1: usize) void {
@@ -663,5 +694,41 @@ test "nearest: 2x fast path and row reuse match the naive mapping" {
                 try std.testing.expectEqual(src.row(sy)[sx * cn + c], dst.row(y)[x * cn + c]);
             };
         }
+    }
+}
+
+test "u8 area kernels match the scalar table loop and OpenCV's integer rounding" {
+    const gpa = std.testing.allocator;
+    inline for (.{ 1, 2, 3, 4 }) |cn| {
+        var src = try Image(u8).init(gpa, 97, 61, cn);
+        defer src.deinit(gpa);
+        var seed: u32 = 777;
+        for (src.slice()) |*v| {
+            seed = seed *% 1103515245 +% 12345;
+            v.* = @truncate(seed >> 16);
+        }
+        // Fractional ratios (2 to 8 taps, one wide-cell fallback, exact
+        // width with fractional height) and integer factors.
+        for ([_][2]u32{ .{ 53, 37 }, .{ 64, 40 }, .{ 30, 20 }, .{ 13, 9 }, .{ 11, 61 }, .{ 97, 29 }, .{ 7, 3 }, .{ 1, 1 }, .{ 2, 60 }, .{ 96, 60 } }) |sz| {
+            var a = try Image(u8).init(gpa, sz[0], sz[1], cn);
+            defer a.deinit(gpa);
+            var b = try Image(u8).init(gpa, sz[0], sz[1], cn);
+            defer b.deinit(gpa);
+            try resize(.serial, gpa, src, a, .area);
+            try areaGeneric(.serial, gpa, src, b);
+            try std.testing.expectEqualSlices(u8, b.slice(), a.slice());
+        }
+        const s2 = try src.roi(0, 0, 96, 60);
+        var d = try Image(u8).init(gpa, 24, 20, cn);
+        defer d.deinit(gpa);
+        try resize(.serial, gpa, s2, d, .area);
+        for (0..20) |y| for (0..24) |x| for (0..cn) |ch| {
+            var sum: u32 = 0;
+            for (0..3) |dy| for (0..4) |dx| {
+                sum += s2.row(y * 3 + dy)[(x * 4 + dx) * cn + ch];
+            };
+            const want = sat.cast(u8, @as(f32, @floatFromInt(sum)) * (1.0 / 12.0));
+            try std.testing.expectEqual(want, d.row(y)[x * cn + ch]);
+        };
     }
 }

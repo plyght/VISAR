@@ -63,6 +63,9 @@ HAL_ALLOWANCE = {  # case-name prefix: (max difference, max % of samples)
     "addWeighted u8": (1, 0.5),
     "warpAffine linear": (1, 0.1),
     "warpAffine nearest": (255, 0.01),  # a pixel or two picks the neighbour
+    # Carotene's area resize, and OpenCV's own float area loop compiled with
+    # FMA contraction on ARM, round a few samples differently.
+    "resize area": (1, 0.5),
 }
 hal_used = set()
 
@@ -186,11 +189,24 @@ def main():
         # --- resize
         for (dw, dh) in [(max(1, w // 2), max(1, h // 2)), (w * 2, h * 2), (max(1, w * 3 // 4), max(1, h * 2 // 3)), (113, 71)]:
             for interp, nm, tol in [(cv2.INTER_NEAREST, "nearest", 0), (cv2.INTER_LINEAR, "linear", 1),
-                                    (cv2.INTER_AREA, "area", 1), (cv2.INTER_CUBIC, "cubic", 1)]:
+                                    (cv2.INTER_AREA, "area", 0), (cv2.INTER_CUBIC, "cubic", 1)]:
                 run(f"resize {nm} u8 {tag}->{dw}x{dh}",
                     lambda: (vs.resize(bgr, (dw, dh), interp), cv2.resize(bgr, (dw, dh), interpolation=interp)), tol)
             run(f"resize linear f32 {tag}->{dw}x{dh}",
                 lambda: (vs.resize(f, (dw, dh), 1), cv2.resize(f, (dw, dh), interpolation=cv2.INTER_LINEAR)), 1e-4)
+
+        if (h, w) == SIZES[0]:
+            # INTER_AREA is bit-exact: fractional and integer shrinks (2x2
+            # rounds half up, other integer factors half to even), wide cells,
+            # one fractional axis, enlarging (bilinear), 1/3/4 channels.
+            for (sw, sh), (dw, dh) in [((640, 480), (416, 312)), ((1920, 1080), (640, 360)), ((1920, 1080), (1280, 720)),
+                                       ((1280, 720), (320, 180)), ((97, 61), (53, 37)), ((640, 480), (60, 45)),
+                                       ((640, 480), (7, 5)), ((640, 480), (640, 300)), ((640, 480), (320, 480)),
+                                       ((640, 480), (639, 479)), ((97, 61), (130, 80)), ((97, 61), (50, 80))]:
+                for cn in (1, 3, 4):
+                    a = natural(sh, sw, cn)
+                    run(f"resize area u8 c{cn} {sw}x{sh}->{dw}x{dh}",
+                        lambda: (vs.resize(a, (dw, dh), 3), cv2.resize(a, (dw, dh), interpolation=cv2.INTER_AREA)))
 
         # --- filters
         for k, s in [(3, 0), (5, 0), (7, 0), (0, 1.5), (9, 2.0), (0, 3.0)]:
