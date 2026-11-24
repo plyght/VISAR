@@ -88,6 +88,23 @@ inline fn flipRow(comptime T: type, comptime cn: usize, s: []const T, d: []T) vo
             d[x * 3 ..][0..64].* = @shuffle(u8, v, undefined, m21);
         }
     }
+    if (T == u8 and (cn == 3 or cn == 4) and core.vec.is_arm) {
+        // ldN, reverse each channel register (rev64 + ext), stN: 16 pixels
+        // per step, two steps per iteration.
+        const rev = comptime blk: {
+            var m: [16]i32 = undefined;
+            for (0..16) |i| m[i] = @intCast(15 - i);
+            break :blk m;
+        };
+        while (x + 32 <= w) : (x += 32) {
+            inline for (0..2) |b| {
+                const ch = core.vec.load(cn, s[(w - x - 16 * (b + 1)) * cn ..].ptr);
+                var out: [cn]core.vec.V16 = undefined;
+                inline for (0..cn) |c| out[c] = @shuffle(u8, ch[c], undefined, rev);
+                core.vec.store(cn, out, d[(x + 16 * b) * cn ..].ptr);
+            }
+        }
+    }
     if (T == u8 and cn == 3) {
         // 5 pixels per 16-byte shuffle (lane-local, so a single pshufb); the
         // load ends at the group's last byte and the store spills one byte
