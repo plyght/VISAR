@@ -57,6 +57,10 @@ pub const FlowPyramid = struct {
     levels: []Image(u8),
     win_width: u32,
     win_height: u32,
+    /// Levels above 0 are views into buffers with `pad` pixels of
+    /// reflect101 border on every side (OpenCV pads its levels the same
+    /// way), so windows that straddle the edge read them in place.
+    pad: u32 = 0,
 
     /// OpenCV's buildOpticalFlowPyramid: levels 0..max_level, stopping
     /// before a level that would not be larger than the window. `img` must
@@ -78,31 +82,75 @@ pub const FlowPyramid = struct {
         }
         const levels = try gpa.alloc(Image(u8), n_levels);
         var made: usize = 1;
+        const pad: usize = padFor(win_width, win_height);
         errdefer {
-            for (levels[1..made]) |*l| l.deinit(gpa);
+            for (levels[1..made]) |l| freeLevel(gpa, l, pad);
             gpa.free(levels);
         }
         levels[0] = img.view();
         while (made < n_levels) : (made += 1) {
             const prev = levels[made - 1];
             const sz = imgproc.pyramid.downSize(prev.width, prev.height);
-            var next = try Image(u8).init(gpa, sz[0], sz[1], prev.channels);
+            const cn: usize = prev.channels;
+            const stride = (sz[0] + 2 * pad) * cn;
+            const buf = try gpa.alignedAlloc(u8, .@"64", stride * (sz[1] + 2 * pad));
+            const next: Image(u8) = .{ .width = sz[0], .height = sz[1], .channels = prev.channels, .stride = stride, .data = buf.ptr + pad * stride + pad * cn };
             imgproc.pyrDown(exec, gpa, prev, next, .reflect101) catch |e| {
-                next.deinit(gpa);
+                gpa.free(buf);
                 return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => unreachable,
                 };
             };
+            fillBorder(next, pad);
             levels[made] = next;
         }
-        return .{ .levels = levels, .win_width = win_width, .win_height = win_height };
+        return .{ .levels = levels, .win_width = win_width, .win_height = win_height, .pad = @intCast(pad) };
     }
 
     pub fn deinit(self: *FlowPyramid, gpa: Allocator) void {
-        for (self.levels[1..]) |*l| l.deinit(gpa);
+        for (self.levels[1..]) |l| freeLevel(gpa, l, self.pad);
         gpa.free(self.levels);
         self.* = undefined;
+    }
+
+    fn freeLevel(gpa: Allocator, l: Image(u8), pad: usize) void {
+        const start = l.data - (pad * l.stride + pad * l.channels);
+        gpa.free(@as([]align(64) u8, @alignCast(start[0 .. l.stride * (l.height + 2 * pad)])));
+    }
+
+    /// Border wide enough for every window patch Patch.get takes for this
+    /// window size (left/top: the window may start ww/wh outside plus the
+    /// derivative margin; right/bottom: the patch is a vector block wider).
+    fn padFor(ww: u32, wh: u32) usize {
+        return @as(usize, @max(ww, wh)) + B + 4;
+    }
+
+    /// Fills the `pad`-pixel frame around `img` with reflect101.
+    fn fillBorder(img: Image(u8), pad: usize) void {
+        const cn: usize = img.channels;
+        const w = img.width;
+        const h = img.height;
+        const ip: isize = @intCast(pad);
+        for (0..pad) |i| {
+            const lx = imgproc.border.map(@as(isize, @intCast(i)) - ip, w, .reflect101).?;
+            const rx = imgproc.border.map(@intCast(w + i), w, .reflect101).?;
+            for (0..h) |y| {
+                const r = img.data + y * img.stride;
+                for (0..cn) |c| {
+                    (r - pad * cn)[i * cn + c] = r[lx * cn + c];
+                    r[(w + i) * cn + c] = r[rx * cn + c];
+                }
+            }
+        }
+        const full = (w + 2 * pad) * cn;
+        const left = pad * cn;
+        for (0..pad) |i| {
+            const ty = imgproc.border.map(@as(isize, @intCast(i)) - ip, h, .reflect101).?;
+            const by = imgproc.border.map(@intCast(h + i), h, .reflect101).?;
+            @memcpy((img.data - (pad - i) * img.stride - left)[0..full], (img.data + ty * img.stride - left)[0..full]);
+            @memcpy((img.data + (h + i) * img.stride - left)[0..full], (img.data + by * img.stride - left)[0..full]);
+        }
     }
 
     pub fn levelCount(self: FlowPyramid) usize {
@@ -359,10 +407,14 @@ fn Patch(comptime T: type) type {
         ptr: [*]const T,
         stride: usize,
 
-        fn get(img: Image(T), x0: isize, y0: isize, cols: usize, rows: usize, scratch: []T) @This() {
+        /// `pad`: pixels of reflect101 border `img` has in memory.
+        fn get(img: Image(T), pad: usize, x0: isize, y0: isize, cols: usize, rows: usize, scratch: []T) @This() {
             const cn: usize = img.channels;
-            if (x0 >= 0 and y0 >= 0 and @as(usize, @intCast(y0)) + rows <= img.height and @as(usize, @intCast(x0)) * cn + cols <= img.rowLen())
-                return .{ .ptr = img.data + @as(usize, @intCast(y0)) * img.stride + @as(usize, @intCast(x0)) * cn, .stride = img.stride };
+            const ip: isize = @intCast(pad);
+            if (x0 >= -ip and y0 >= -ip and @as(usize, @intCast(y0 + ip)) + rows <= img.height + 2 * pad and @as(usize, @intCast(x0 + ip)) * cn + cols <= img.rowLen() + 2 * pad * cn) {
+                const origin = img.data - (pad * img.stride + pad * cn);
+                return .{ .ptr = origin + @as(usize, @intCast(y0 + ip)) * img.stride + @as(usize, @intCast(x0 + ip)) * cn, .stride = img.stride };
+            }
             const px = (cols + cn - 1) / cn;
             const w: isize = @intCast(img.width);
             // Columns [lo, hi) of the patch lie inside the image.
@@ -447,15 +499,22 @@ fn zeroOutside(img: Image(u8), x0: isize, y0: isize, cn: usize, cols: usize, row
     const h: isize = @intCast(img.height);
     const px: isize = @intCast((cols + cn - 1) / cn);
     if (x0 >= 0 and y0 >= 0 and x0 + px <= w and y0 + @as(isize, @intCast(rows)) <= h) return;
+    // Elements [lo, hi) of each row lie inside the image.
+    const lo: usize = @min(@as(usize, @intCast(std.math.clamp(-x0, 0, px))) * cn, cols);
+    const hi: usize = @max(lo, @min(@as(usize, @intCast(std.math.clamp(w - x0, 0, px))) * cn, cols));
     for (0..rows) |r| {
         const y = y0 + @as(isize, @intCast(r));
-        for (0..cols) |e| {
-            const x = x0 + @as(isize, @intCast(e / cn));
-            if (y < 0 or y >= h or x < 0 or x >= w) {
-                d[r * cols + e] = 0;
-                d[cols * rows + r * cols + e] = 0;
-            }
+        const dx = d[r * cols ..][0..cols];
+        const dy = d[cols * rows + r * cols ..][0..cols];
+        if (y < 0 or y >= h) {
+            @memset(dx, 0);
+            @memset(dy, 0);
+            continue;
         }
+        @memset(dx[0..lo], 0);
+        @memset(dy[0..lo], 0);
+        @memset(dx[hi..], 0);
+        @memset(dy[hi..], 0);
     }
 }
 
@@ -504,6 +563,8 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
             level -= 1;
             const I = prev.levels[level];
             const J = next.levels[level];
+            const ipad: usize = if (level == 0) 0 else prev.pad;
+            const jpad: usize = if (level == 0) 0 else next.pad;
             const lscale: f32 = @floatCast(1.0 / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(level))));
             var prev_pt: Point2f = .{ .x = prev_pts[pi].x * lscale, .y = prev_pts[pi].y * lscale };
             var next_pt: Point2f = if (level == max_level)
@@ -530,7 +591,7 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
             // Sample the previous window and its gradients; sum the
             // gradient matrix.
             {
-                const pm = Patch(u8).get(I, ix0 - 1, iy0 - 1, mcols, prows + 2, mbuf);
+                const pm = Patch(u8).get(I, ipad, ix0 - 1, iy0 - 1, mcols, prows + 2, mbuf);
                 scharrPatch(pm, cn, pcols, prows, dbuf);
                 zeroOutside(I, ix0, iy0, cn, pcols, prows, dbuf);
                 const isrc = pm.ptr + pm.stride + cn;
@@ -603,7 +664,7 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                     }
                     wt = weights(next_pt.x - @as(f32, @floatFromInt(inx.?)), next_pt.y - @as(f32, @floatFromInt(iny.?)));
                     wv = wvec(wt);
-                    const pJ = Patch(u8).get(J, inx.?, iny.?, pcols, prows, sbuf);
+                    const pJ = Patch(u8).get(J, jpad, inx.?, iny.?, pcols, prows, sbuf);
                     var b1: VL = @splat(0);
                     var b2: VL = @splat(0);
                     var t1: V8 = @splat(0);
@@ -656,7 +717,7 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                 }
                 wt = weights(np.x - @as(f32, @floatFromInt(inx.?)), np.y - @as(f32, @floatFromInt(iny.?)));
                 const ev = wvec(wt);
-                const pJ = Patch(u8).get(J, inx.?, iny.?, pcols, prows, sbuf);
+                const pJ = Patch(u8).get(J, jpad, inx.?, iny.?, pcols, prows, sbuf);
                 var acc: VBi = @splat(0);
                 for (0..wh) |y| {
                     const jrow = pJ.ptr + y * pJ.stride;
