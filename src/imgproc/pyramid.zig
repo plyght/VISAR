@@ -141,11 +141,18 @@ fn downChunkParityF(comptime cn: usize, s: Image(f32), d: Image(f32), border: Bo
     // er[q] is padded pixel 2q, or[q] padded pixel 2q + 1 (padded pixel p is
     // source pixel p - 2), cn samples each; one pair per output row.
     const rlen = (dw + 3) * cn + NV;
-    const buf = try gpa.alloc(f32, 4 * rlen);
+    // Output rows per pass (AArch64: more, as its 4-lane blocks keep all
+    // rows' sums in registers).
+    const RM = if (arm) 3 else 2;
+    const buf = try gpa.alloc(f32, 2 * RM * rlen);
     defer gpa.free(buf);
     @memset(buf, 0);
     var y = y0;
-    while (y + 2 <= y1) : (y += 2) downRowsF(cn, 2, s, d, border, buf, rlen, y);
+    while (y + RM <= y1) : (y += RM) downRowsF(cn, RM, s, d, border, buf, rlen, y);
+    if (RM > 2 and y + 2 <= y1) {
+        downRowsF(cn, 2, s, d, border, buf, rlen, y);
+        y += 2;
+    }
     if (y < y1) downRowsF(cn, 1, s, d, border, buf, rlen, y);
 }
 
