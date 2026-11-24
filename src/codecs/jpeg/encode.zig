@@ -8,6 +8,7 @@ const common = @import("../common.zig");
 const tables = @import("tables.zig");
 const dct = @import("dct.zig");
 const decode = @import("decode.zig");
+const core_vec = @import("../../core/vec.zig");
 
 const Allocator = std.mem.Allocator;
 const EncodeError = common.EncodeError;
@@ -314,6 +315,65 @@ const U16 = @Vector(16, u8);
 
 fn rgbToYcc(comptime bgr: bool, comptime ch: usize, src: []const u8, w: usize, y: []u8, cb: []u8, cr: []u8) void {
     var x: usize = 0;
+    if (comptime dct.arm_neon) {
+        // ld3/ld4, then u16 x u16 -> u32 multiply-accumulates (umull,
+        // umlal, umlsl) and narrowing shifts: the same sums, all
+        // non-negative in u32 (Cb and Cr include their +128 offset, which
+        // outweighs the negative terms).
+        const U = @Vector(4, u16);
+        const W = @Vector(4, u32);
+        const S = struct {
+            extern fn @"llvm.aarch64.neon.umull.v4i32"(U, U) W;
+            inline fn mul(a: U, comptime c: u16) W {
+                return @"llvm.aarch64.neon.umull.v4i32"(a, @splat(c));
+            }
+            /// Quarter q of the 16 bytes as u16 lanes.
+            inline fn q16(v: [4]U, comptime q: usize) U {
+                return v[q];
+            }
+            inline fn widen(v: core_vec.V16) [4]U {
+                const lo: @Vector(8, u16) = @as([16]u8, v)[0..8].*;
+                const hi: @Vector(8, u16) = @as([16]u8, v)[8..16].*;
+                const a: [8]u16 = @bitCast(core_vec.opaqueV(@bitCast(lo)));
+                const b: [8]u16 = @bitCast(core_vec.opaqueV(@bitCast(hi)));
+                return .{ a[0..4].*, a[4..8].*, b[0..4].*, b[4..8].* };
+            }
+            /// Bits 16..23 of each lane: uzp2 at 16 bits, uzp1 at 8.
+            inline fn narrow(v: [4]W) @Vector(16, u8) {
+                const H = @Vector(8, u16);
+                const odd = [8]i32{ 1, 3, 5, 7, -2, -4, -6, -8 };
+                const a = @shuffle(u16, @as(H, @bitCast(v[0])), @as(H, @bitCast(v[1])), odd);
+                const b = @shuffle(u16, @as(H, @bitCast(v[2])), @as(H, @bitCast(v[3])), odd);
+                const ab: @Vector(32, u8) = @bitCast(std.simd.join(a, b));
+                return @shuffle(u8, ab, undefined, blk: {
+                    var m: [16]i32 = undefined;
+                    for (0..16) |i| m[i] = 2 * i;
+                    break :blk m;
+                });
+            }
+        };
+        while (x + 16 <= w) : (x += 16) {
+            // The ldN results and their u16 widenings are opaque: LLVM
+            // otherwise turns the deinterleave into tbl and widens the
+            // bytes straight to u32.
+            const c = core_vec.load(ch, src[ch * x ..].ptr);
+            const r = S.widen(core_vec.opaqueV(if (bgr) c[2] else c[0]));
+            const g = S.widen(core_vec.opaqueV(c[1]));
+            const b = S.widen(core_vec.opaqueV(if (bgr) c[0] else c[2]));
+            var yv: [4]W = undefined;
+            var cbv: [4]W = undefined;
+            var crv: [4]W = undefined;
+            const off: W = @splat((128 << 16) + 32767);
+            inline for (0..4) |q| {
+                yv[q] = S.mul(r[q], 19595) + S.mul(g[q], 38470) + S.mul(b[q], 7471) + @as(W, @splat(32768));
+                cbv[q] = off + S.mul(b[q], 32768) -% S.mul(r[q], 11059) -% S.mul(g[q], 21709);
+                crv[q] = off + S.mul(r[q], 32768) -% S.mul(g[q], 27439) -% S.mul(b[q], 5329);
+            }
+            y[x..][0..16].* = S.narrow(yv);
+            cb[x..][0..16].* = S.narrow(cbv);
+            cr[x..][0..16].* = S.narrow(crv);
+        }
+    }
     if (ch == 3) {
         while (x + 16 <= w) : (x += 16) {
             const v0: U16 = src[3 * x ..][0..16].*;
@@ -590,4 +650,29 @@ test "jpeg 16-bit FDCT and quantisation match the i32/f32 path" {
             }
         }
     }
+}
+
+test "jpeg colour conversion vector paths match the scalar formulas" {
+    var px: [4 * 101]u8 = undefined;
+    var seed: u32 = 5;
+    for (&px, 0..) |*v, i| {
+        seed = seed *% 1664525 +% 1013904223;
+        v.* = if (i < 48) (if (i % 2 == 0) 255 else 0) else @truncate(seed >> 24);
+    }
+    inline for (.{ 3, 4 }) |ch| inline for (.{ false, true }) |bgr| {
+        const w = 101;
+        var y: [w]u8 = undefined;
+        var cb: [w]u8 = undefined;
+        var cr: [w]u8 = undefined;
+        rgbToYcc(bgr, ch, &px, w, &y, &cb, &cr);
+        for (0..w) |x| {
+            const p = px[ch * x ..][0..3];
+            const r: i32 = if (bgr) p[2] else p[0];
+            const g: i32 = p[1];
+            const b: i32 = if (bgr) p[0] else p[2];
+            try std.testing.expectEqual((r * 19595 + g * 38470 + b * 7471 + 32768) >> 16, y[x]);
+            try std.testing.expectEqual((r * -11059 + g * -21709 + b * 32768 + (128 << 16) + 32767) >> 16, cb[x]);
+            try std.testing.expectEqual((r * 32768 + g * -27439 + b * -5329 + (128 << 16) + 32767) >> 16, cr[x]);
+        }
+    };
 }
