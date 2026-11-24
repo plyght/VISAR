@@ -77,6 +77,8 @@ const reg_bins = 8;
 const nms_pre = 1000;
 const max_levels = 4;
 
+const Best = struct { score: f32, class_id: i32 };
+
 const Candidate = struct {
     /// x, y, w, h (double, as the boxes NMS sees).
     box: [4]f64,
@@ -100,6 +102,7 @@ pub const ObjectDetector = struct {
     resized: ?Image(u8) = null,
     candidates: std.ArrayList(Candidate) = .empty,
     level_order: std.ArrayList(u32) = .empty,
+    best: std.ArrayList(Best) = .empty,
     order: std.ArrayList(u32) = .empty,
     kept: std.ArrayList(u32) = .empty,
     nms_boxes: std.ArrayList([4]f64) = .empty,
@@ -135,6 +138,7 @@ pub const ObjectDetector = struct {
         if (d.resized) |*r| r.deinit(d.gpa);
         d.candidates.deinit(d.gpa);
         d.level_order.deinit(d.gpa);
+        d.best.deinit(d.gpa);
         d.order.deinit(d.gpa);
         d.kept.deinit(d.gpa);
         d.nms_boxes.deinit(d.gpa);
@@ -309,32 +313,34 @@ pub const ObjectDetector = struct {
             const cls = d.net.output(d.levels[l][0]).data;
             const reg = d.net.output(d.levels[l][1]).data;
             const n = cls.len / nc;
-            // Anchors in decreasing order of best score when the level has
-            // more than nms_pre (numpy's argsort()[::-1][:nms_pre]).
+            // Best class per anchor (np.max / np.argmax: the first maximum).
+            try d.best.resize(d.gpa, n);
+            for (d.best.items, 0..) |*b, i| {
+                const sc = cls[i * nc ..][0..nc];
+                var k: usize = 0;
+                for (sc, 0..) |v, c| {
+                    if (v > sc[k]) k = c;
+                }
+                b.* = .{ .score = sc[k], .class_id = @intCast(k) };
+            }
+            // Only anchors above the score threshold can survive NMS. A
+            // level with more than nms_pre anchors keeps its best nms_pre
+            // (numpy's argsort()[::-1][:nms_pre]) in decreasing score order.
             d.level_order.clearRetainingCapacity();
-            for (0..n) |i| try d.level_order.append(d.gpa, @intCast(i));
+            for (d.best.items, 0..) |b, i| {
+                if (b.score > d.score_threshold) try d.level_order.append(d.gpa, @intCast(i));
+            }
             if (n > nms_pre) {
-                const Ctx = struct {
-                    cls: []const f32,
-                    nc: usize,
-                    fn best(c: @This(), i: u32) f32 {
-                        return std.mem.max(f32, c.cls[i * c.nc ..][0..c.nc]);
+                std.sort.block(u32, d.level_order.items, d.best.items, struct {
+                    fn gt(bs: []const Best, a: u32, b: u32) bool {
+                        return bs[a].score > bs[b].score;
                     }
-                    fn gt(c: @This(), a: u32, b: u32) bool {
-                        return c.best(a) > c.best(b);
-                    }
-                };
-                std.sort.block(u32, d.level_order.items, Ctx{ .cls = cls, .nc = nc }, Ctx.gt);
-                d.level_order.shrinkRetainingCapacity(nms_pre);
+                }.gt);
+                d.level_order.shrinkRetainingCapacity(@min(nms_pre, d.level_order.items.len));
             }
             for (d.level_order.items) |ai| {
                 const i: usize = ai;
-                const sc = cls[i * nc ..][0..nc];
-                // np.max / np.argmax: the first maximum.
-                var best: usize = 0;
-                for (sc, 0..) |v, k| {
-                    if (v > sc[best]) best = k;
-                }
+                const best = d.best.items[i];
                 // Side distances: softmax over the bins in f32 (numpy's
                 // pairwise order for the sum of 8), expectation in f64.
                 var dist: [4]f64 = undefined;
@@ -353,7 +359,7 @@ pub const ObjectDetector = struct {
                 const y1 = std.math.clamp(cy - dist[1], 0, max_h);
                 const x2 = std.math.clamp(cx + dist[2], 0, max_w);
                 const y2 = std.math.clamp(cy + dist[3], 0, max_h);
-                try d.candidates.append(d.gpa, .{ .box = .{ x1, y1, x2 - x1, y2 - y1 }, .score = sc[best], .class_id = @intCast(best) });
+                try d.candidates.append(d.gpa, .{ .box = .{ x1, y1, x2 - x1, y2 - y1 }, .score = best.score, .class_id = best.class_id });
             }
         }
     }

@@ -35,8 +35,9 @@ pub const lane_broadcast = neon;
 /// Accumulator vectors the pointwise and direct kernels keep live.
 const acc_budget: usize = if (avx512) 24 else if (avx) 12 else if (neon) 20 else 8;
 
-/// Output-channel blocks per register tile (at most).
-pub const max_nb: usize = 4;
+/// Output-channel blocks per register tile (at most). AVX2 has 16
+/// registers: 3 blocks x 4 pixels of accumulators, 3 weights, 1 broadcast.
+pub const max_nb: usize = if (avx and !avx512) 3 else 4;
 
 /// Pixels per register tile for a tile `nb` blocks wide.
 pub fn tileR(comptime nb: usize) usize {
