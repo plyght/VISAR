@@ -40,7 +40,13 @@ const acc_budget: usize = if (avx512) 24 else if (avx) 12 else if (neon) 20 else
 pub const max_nb: usize = if (avx and !avx512) 3 else 4;
 
 /// Pixels per register tile for a tile `nb` blocks wide.
+///
+/// NEON keeps the tile's `R` pixel vectors live next to the `R x NB`
+/// accumulators and `NB` weights (lanes are splatted from registers), so
+/// all three share the 32 registers: `R` is the largest with
+/// `R*NB + R + NB <= 30` (a 2x10 tile would need 32 and spills).
 pub fn tileR(comptime nb: usize) usize {
+    if (neon) return @max(1, @min(14, (30 - nb) / (nb + 1)));
     return @max(1, @min(12, acc_budget / nb));
 }
 
