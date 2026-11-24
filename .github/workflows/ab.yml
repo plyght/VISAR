@@ -37,6 +37,17 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install numpy "opencv-python-headless==5.0.0.*"
+      # OpenCV Model Zoo files for the dnn cases (not in the repository).
+      - name: Download models
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/models"
+          media=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/face_detection_yunet_2023mar.onnx" "$media/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$media/face_detection_yunet/example_outputs/largest_selfie.jpg" || true
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/object_detection_nanodet_2022nov.onnx" "$media/object_detection_nanodet/object_detection_nanodet_2022nov.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/object_detection_yolox_2022nov.onnx" "$media/object_detection_yolox/object_detection_yolox_2022nov.onnx"
+          echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
       - name: Build A and B
         run: |
           set -eu
@@ -52,6 +63,17 @@ jobs:
           python3 bench/ab.py "../out-A/lib/libvisar.$ext" "../out-B/lib/libvisar.$ext" \
             --filter "${{ inputs.filter }}" --threads "${{ inputs.threads }}" --md ab.md
           { echo "### A = \`${{ inputs.base }}\`, B = \`${{ inputs.head }}\` on ${{ inputs.runner }}"; echo; cat ab.md; } >> "$GITHUB_STEP_SUMMARY"
+          echo "--- backends under auto (B):"
+          VISAR_LIB="../out-B/lib/libvisar.$ext" python3 -c "
+          import os, sys; sys.path.insert(0, 'tests/py'); import visar_ctypes as vs
+          print('metal:', vs.metal_available(), vs.metal_device())
+          d = os.environ['VISAR_MODELS']
+          for f, s in [('object_detection_nanodet_2022nov.onnx', 416), ('object_detection_yolox_2022nov.onnx', 640)]:
+              n = vs.Net(open(os.path.join(d, f), 'rb').read()); n.plan((1, 3, s, s)); print(f, n.backend)
+          " || true
+          echo "--- CPU backend forced:"
+          VISAR_DNN_BACKEND=cpu python3 bench/ab.py "../out-A/lib/libvisar.$ext" "../out-B/lib/libvisar.$ext" \
+            --filter "${{ inputs.filter }}" --threads "${{ inputs.threads }}" --md ab-cpu.md || true
       # base == head: time VISAR alone at 1 and N threads (one library copy,
       # no OpenCV calls in between), to see thread scaling undisturbed.
       - name: Solo thread scaling
@@ -60,3 +82,21 @@ jobs:
           ext=so; [ "$RUNNER_OS" = macOS ] && ext=dylib
           python3 bench/solo.py "../out-A/lib/libvisar.$ext" --filter "${{ inputs.filter }}" --threads "${{ inputs.threads }}" --md solo.md
           { echo "### \`${{ inputs.base }}\` alone on ${{ inputs.runner }}"; echo; cat solo.md; } >> "$GITHUB_STEP_SUMMARY"
+      # Per-item profile of the dnn programs (only when B carries the
+      # temporary profiler src/prof_tmp.zig; A gets the same file).
+      - name: Per-layer profile
+        continue-on-error: true
+        run: |
+          [ -f ../src-B/src/prof_tmp.zig ] || exit 0
+          cp ../src-B/src/prof_tmp.zig ../src-A/src/prof_tmp.zig
+          for tag in A B; do
+            (cd "../src-$tag" && zig build-exe -OReleaseFast src/prof_tmp.zig -femit-bin="$RUNNER_TEMP/prof-$tag")
+          done
+          for m in "object_detection_nanodet_2022nov.onnx 416" "object_detection_yolox_2022nov.onnx 640"; do
+            set -- $m
+            for tag in A B; do
+              echo "=== $tag $1"; "$RUNNER_TEMP/prof-$tag" "$VISAR_MODELS/$1" "$2" 20
+            done
+          done
+          echo "=== B nanodet unstreamed"; "$RUNNER_TEMP/prof-B" "$VISAR_MODELS/object_detection_nanodet_2022nov.onnx" 416 20 x
+          echo "=== B yolox unstreamed"; "$RUNNER_TEMP/prof-B" "$VISAR_MODELS/object_detection_yolox_2022nov.onnx" 640 20 x
