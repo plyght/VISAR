@@ -387,6 +387,33 @@ inline fn sample(comptime T: type, p: [*]const T, stride: usize, x: usize, cn: u
     return @bitCast(@as(@Vector(8, u16), @truncate(r)));
 }
 
+/// NEON column walk: a window column block is sampled top to bottom, and
+/// each row's widened elements (at x and x + cn) are reused as the next
+/// sample's upper taps, so every source row is loaded and widened once.
+const Carry = struct {
+    a: @Vector(8, i16),
+    b: @Vector(8, i16),
+
+    inline fn init(comptime T: type, p: [*]const T, cn: usize) Carry {
+        return .{ .a = @as(@Vector(8, T), p[0..8].*), .b = @as(@Vector(8, T), p[cn..][0..8].*) };
+    }
+
+    /// The sample whose lower row starts at `p` (the upper row is the
+    /// carried one); `p` becomes the carried row.
+    inline fn next(c: *Carry, comptime T: type, p: [*]const T, cn: usize, w: Wv, comptime shift: comptime_int) VB {
+        const lo: @Vector(8, i16) = @as(@Vector(8, T), p[0..8].*);
+        const ln: @Vector(8, i16) = @as(@Vector(8, T), p[cn..][0..8].*);
+        var acc: V8 = @splat(1 << (shift - 1));
+        acc += @as(V8, c.a) * @as(V8, w[0]);
+        acc += @as(V8, c.b) * @as(V8, w[1]);
+        acc += @as(V8, lo) * @as(V8, w[2]);
+        acc += @as(V8, ln) * @as(V8, w[3]);
+        c.* = .{ .a = lo, .b = ln };
+        const r: @Vector(8, u32) = @bitCast(acc >> @splat(shift));
+        return @bitCast(@as(@Vector(8, u16), @truncate(r)));
+    }
+};
+
 /// Products of a and b summed into 8 i32 lanes (lane pairing is
 /// unspecified: only for accumulators reduced over all lanes).
 inline fn dot(a: VB, b: VB) V8 {
@@ -603,7 +630,36 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                 var s12: V8 = @splat(0);
                 var s22: V8 = @splat(0);
                 var cnt: usize = 0;
-                for (0..wh) |y| {
+                if (neon) {
+                    for (0..nv) |v| {
+                        const x = v * B;
+                        var ci = Carry.init(u8, isrc + x, cn);
+                        var cx = Carry.init(i16, dbuf.ptr + x, cn);
+                        var cy = Carry.init(i16, dbuf.ptr + pcols * prows + x, cn);
+                        const m: VB = if (v == nv - 1) tmask else @splat(-1);
+                        for (0..wh) |y| {
+                            const k = y * rl + x;
+                            iwin[k..][0..B].* = ci.next(u8, isrc + (y + 1) * pm.stride + x, cn, wv, w_bits - 5);
+                            const gx = cx.next(i16, dbuf.ptr + (y + 1) * pcols + x, cn, wv, w_bits) & m;
+                            const gy = cy.next(i16, dbuf.ptr + pcols * prows + (y + 1) * pcols + x, cn, wv, w_bits) & m;
+                            ixw[k..][0..B].* = gx;
+                            iyw[k..][0..B].* = gy;
+                            s11 += dot(gx, gx);
+                            s12 += dot(gx, gy);
+                            s22 += dot(gy, gy);
+                            cnt += 1;
+                            if (cnt == flush_every) {
+                                a11 += @as(VL, s11);
+                                a12 += @as(VL, s12);
+                                a22 += @as(VL, s22);
+                                s11 = @splat(0);
+                                s12 = @splat(0);
+                                s22 = @splat(0);
+                                cnt = 0;
+                            }
+                        }
+                    }
+                } else for (0..wh) |y| {
                     const src = isrc + y * pm.stride;
                     const dxs = dbuf.ptr + y * pcols;
                     const dys = dbuf.ptr + pcols * prows + y * pcols;
@@ -670,7 +726,26 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                     var t1: V8 = @splat(0);
                     var t2: V8 = @splat(0);
                     var tc: usize = 0;
-                    for (0..wh) |y| {
+                    if (neon) {
+                        for (0..nv) |v| {
+                            const x = v * B;
+                            var c = Carry.init(u8, pJ.ptr + x, cn);
+                            for (0..wh) |y| {
+                                const k = y * rl + x;
+                                const diff = c.next(u8, pJ.ptr + (y + 1) * pJ.stride + x, cn, wv, w_bits - 5) - @as(VB, iwin[k..][0..B].*);
+                                t1 += dot(diff, ixw[k..][0..B].*);
+                                t2 += dot(diff, iyw[k..][0..B].*);
+                                tc += 1;
+                                if (tc == flush_every) {
+                                    b1 += @as(VL, t1);
+                                    b2 += @as(VL, t2);
+                                    t1 = @splat(0);
+                                    t2 = @splat(0);
+                                    tc = 0;
+                                }
+                            }
+                        }
+                    } else for (0..wh) |y| {
                         const jrow = pJ.ptr + y * pJ.stride;
                         for (0..nv) |v| {
                             const x = v * B;
