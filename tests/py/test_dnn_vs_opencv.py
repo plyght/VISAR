@@ -134,6 +134,14 @@ def yunet_cases(path):
 # (the demos truncate to int for drawing), as boxes x, y, w, h.
 
 
+def zoo_resize(img, size, interpolation):
+    """The zoo pipelines' cv2.resize, done by VISAR's resize (checked against
+    cv2.resize in the core suite: equal on x86, and within 1 where OpenCV's
+    own ARM and x86 paths round differently). The detector cases then compare
+    the network, decoding and NMS on identical inputs on every platform."""
+    return vs.resize(np.ascontiguousarray(img), size, interpolation)
+
+
 def nanodet_letterbox(srcimg, target_size=(416, 416)):
     img = srcimg.copy()
     top, left, newh, neww = 0, 0, target_size[0], target_size[1]
@@ -141,16 +149,16 @@ def nanodet_letterbox(srcimg, target_size=(416, 416)):
         hw_scale = img.shape[0] / img.shape[1]
         if hw_scale > 1:
             newh, neww = target_size[0], int(target_size[1] / hw_scale)
-            img = cv2.resize(img, (neww, newh), interpolation=cv2.INTER_AREA)
+            img = zoo_resize(img, (neww, newh), cv2.INTER_AREA)
             left = int((target_size[1] - neww) * 0.5)
             img = cv2.copyMakeBorder(img, 0, 0, left, target_size[1] - neww - left, cv2.BORDER_CONSTANT, value=0)
         else:
             newh, neww = int(target_size[0] * hw_scale), target_size[1]
-            img = cv2.resize(img, (neww, newh), interpolation=cv2.INTER_AREA)
+            img = zoo_resize(img, (neww, newh), cv2.INTER_AREA)
             top = int((target_size[0] - newh) * 0.5)
             img = cv2.copyMakeBorder(img, top, target_size[0] - newh - top, 0, 0, cv2.BORDER_CONSTANT, value=0)
     else:
-        img = cv2.resize(img, target_size, interpolation=cv2.INTER_AREA)
+        img = zoo_resize(img, target_size, cv2.INTER_AREA)
     return img, [top, left, newh, neww]
 
 
@@ -276,8 +284,8 @@ class NanoDetRef:
 def yolox_letterbox(srcimg, target_size=(640, 640)):
     padded_img = np.ones((target_size[0], target_size[1], 3)).astype(np.float32) * 114.0
     ratio = min(target_size[0] / srcimg.shape[0], target_size[1] / srcimg.shape[1])
-    resized_img = cv2.resize(
-        srcimg, (int(srcimg.shape[1] * ratio), int(srcimg.shape[0] * ratio)), interpolation=cv2.INTER_LINEAR
+    resized_img = zoo_resize(
+        srcimg, (int(srcimg.shape[1] * ratio), int(srcimg.shape[0] * ratio)), cv2.INTER_LINEAR
     ).astype(np.float32)
     padded_img[: int(srcimg.shape[0] * ratio), : int(srcimg.shape[1] * ratio)] = resized_img
     return padded_img, ratio
