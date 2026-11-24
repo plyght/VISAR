@@ -410,8 +410,20 @@ fn hrow(comptime K: usize, comptime cn: usize, comptime E: type, s: []const u8, 
     if (E == i16 and fast_permute and gs.len > 0) {
         const gn: usize = gs[0].n;
         switch (gs[0].win) {
-            inline 16, 32, 64 => |W| for (gs, 0..) |g, gi| {
-                if (g.ok) hrowGroup(W, s, out[gi * gn * cn ..], g) else hrowPixels(K, cn, E, s, out, xt, gi * gn, gi * gn + gn);
+            inline 16, 32, 64 => |W| {
+                var gi: usize = 0;
+                if (comptime planar) {
+                    // Two groups per step: the NEON group is only ~12
+                    // arithmetic instructions, so loop overhead matters.
+                    const step = gn * cn;
+                    while (gi + 2 <= gs.len and gs[gi].ok and gs[gi + 1].ok) : (gi += 2) {
+                        hrowGroup(W, s, out[gi * step ..], gs[gi]);
+                        hrowGroup(W, s, out[(gi + 1) * step ..], gs[gi + 1]);
+                    }
+                }
+                for (gs[gi..], gi..) |g, k| {
+                    if (g.ok) hrowGroup(W, s, out[k * gn * cn ..], g) else hrowPixels(K, cn, E, s, out, xt, k * gn, k * gn + gn);
+                }
             },
             else => unreachable,
         }
