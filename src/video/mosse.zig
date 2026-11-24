@@ -51,7 +51,12 @@ pub const Mosse = struct {
     a: []Complex,
     b: []f32,
     g: []Complex,
+    /// The filter A / B, refreshed whenever A and B change.
+    filt: []Complex,
     window: []f32,
+    /// Per-column sample positions of an axis-aligned patch.
+    col_x0: []u32,
+    col_fx: []f32,
     buf: []Complex,
     cx: f32,
     cy: f32,
@@ -69,6 +74,9 @@ pub const Mosse = struct {
             .a = try gpa.alloc(Complex, nn),
             .b = try gpa.alloc(f32, nn),
             .g = try gpa.alloc(Complex, nn),
+            .filt = try gpa.alloc(Complex, nn),
+            .col_x0 = try gpa.alloc(u32, n),
+            .col_fx = try gpa.alloc(f32, n),
             .window = try gpa.alloc(f32, nn),
             .buf = try gpa.alloc(Complex, nn),
             .cx = start.cx(),
@@ -106,6 +114,9 @@ pub const Mosse = struct {
         self.gpa.free(self.a);
         self.gpa.free(self.b);
         self.gpa.free(self.g);
+        self.gpa.free(self.filt);
+        self.gpa.free(self.col_x0);
+        self.gpa.free(self.col_fx);
         self.gpa.free(self.window);
         self.gpa.free(self.buf);
     }
@@ -125,11 +136,8 @@ pub const Mosse = struct {
             if (!self.o.scale and s != 1.0) continue;
             self.patch(frame, self.cx, self.cy, s, 0, 1);
             self.plan.forward(self.buf);
-            for (self.buf, self.a, self.b) |*f, a, b| {
-                // R = F * A / B
-                const h = Complex{ .re = a.re / (b + 1e-4), .im = a.im / (b + 1e-4) };
-                f.* = f.*.mul(h);
-            }
+            // R = F * A / B
+            for (self.buf, self.filt) |*f, h| f.* = f.*.mul(h);
             self.plan.inverse(self.buf);
             const p = self.peak();
             // Prefer the unscaled match unless another scale is clearly better.
@@ -171,6 +179,10 @@ pub const Mosse = struct {
                 b.* = keep * b.* + rate * nb;
             }
         }
+        for (self.filt, self.a, self.b) |*h, a, b| {
+            const inv = 1 / (b + 1e-4);
+            h.* = .{ .re = a.re * inv, .im = a.im * inv };
+        }
     }
 
     /// Samples the search region around (cx, cy) into `buf` (bilinear,
@@ -187,7 +199,52 @@ pub const Mosse = struct {
         const maxy: f32 = @floatFromInt(frame.height - 1);
         var sum: f32 = 0;
         var sum2: f32 = 0;
-        for (0..n) |y| for (0..n) |x| {
+        if (ang == 0 and n % L == 0) {
+            // Axis-aligned (every update): sample positions separate into
+            // per-column and per-row ones; log and sums are vector-wide.
+            for (self.col_x0, self.col_fx, 0..) |*x0, *fx, x| {
+                const u = (@as(f32, @floatFromInt(x)) + 0.5) / nf - 0.5;
+                const sx = std.math.clamp(cx + u * rw, 0, maxx);
+                x0.* = @intFromFloat(@floor(sx));
+                fx.* = sx - @as(f32, @floatFromInt(x0.*));
+            }
+            var vs: VF = @splat(0);
+            var vs2: VF = @splat(0);
+            const one: VF = @splat(1);
+            for (0..n) |y| {
+                const v = (@as(f32, @floatFromInt(y)) + 0.5) / nf - 0.5;
+                const sy = std.math.clamp(cy + v * rh, 0, maxy);
+                const y0: usize = @intFromFloat(@floor(sy));
+                const y1 = @min(y0 + 1, frame.height - 1);
+                const fy: VF = @splat(sy - @as(f32, @floatFromInt(y0)));
+                const r0 = frame.row(y0);
+                const r1 = frame.row(y1);
+                var x: usize = 0;
+                while (x < n) : (x += L) {
+                    var p: [4][L]f32 = undefined;
+                    for (0..L) |k| {
+                        const x0 = self.col_x0[x + k];
+                        const x1 = @min(x0 + 1, frame.width - 1);
+                        p[0][k] = @floatFromInt(r0[x0]);
+                        p[1][k] = @floatFromInt(r0[x1]);
+                        p[2][k] = @floatFromInt(r1[x0]);
+                        p[3][k] = @floatFromInt(r1[x1]);
+                    }
+                    const fx: VF = self.col_fx[x..][0..L].*;
+                    const p00: VF = p[0];
+                    const p10: VF = p[1];
+                    const p01: VF = p[2];
+                    const p11: VF = p[3];
+                    const val = logv(one + (p00 * (one - fx) * (one - fy) + p10 * fx * (one - fy) + p01 * (one - fx) * fy + p11 * fx * fy));
+                    const arr: [L]f32 = val;
+                    for (self.buf[y * n + x ..][0..L], arr) |*b, a| b.* = .{ .re = a, .im = 0 };
+                    vs += val;
+                    vs2 += val * val;
+                }
+            }
+            sum = @reduce(.Add, vs);
+            sum2 = @reduce(.Add, vs2);
+        } else for (0..n) |y| for (0..n) |x| {
             const u = (@as(f32, @floatFromInt(x)) + 0.5) / nf - 0.5;
             const v = (@as(f32, @floatFromInt(y)) + 0.5) / nf - 0.5;
             const ox = u * rw;
@@ -212,7 +269,8 @@ pub const Mosse = struct {
         const cnt: f32 = @floatFromInt(n * n);
         const mean = sum / cnt;
         const sd = @sqrt(@max(sum2 / cnt - mean * mean, 1e-6));
-        for (self.buf, self.window) |*b, wv| b.* = .{ .re = (b.re - mean) / sd * wv, .im = 0 };
+        const isd = 1 / sd;
+        for (self.buf, self.window) |*b, wv| b.* = .{ .re = (b.re - mean) * isd * wv, .im = 0 };
     }
 
     const Peak = struct { dx: f32, dy: f32, value: f32, psr: f32 };
@@ -223,24 +281,26 @@ pub const Mosse = struct {
         const n = self.o.size;
         var bi: usize = 0;
         var bv: f32 = -std.math.inf(f32);
-        for (self.buf, 0..) |v, i| if (v.re > bv) {
-            bv = v.re;
-            bi = i;
-        };
-        const px = bi % n;
-        const py = bi / n;
-        // Sidelobe: everything outside an 11x11 window around the peak.
         var s: f32 = 0;
         var s2: f32 = 0;
-        var cnt: f32 = 0;
-        for (0..n) |y| for (0..n) |x| {
-            const ddx = @as(isize, @intCast(x)) - @as(isize, @intCast(px));
-            const ddy = @as(isize, @intCast(y)) - @as(isize, @intCast(py));
-            if (@abs(ddx) <= 5 and @abs(ddy) <= 5) continue;
+        for (self.buf, 0..) |v, i| {
+            if (v.re > bv) {
+                bv = v.re;
+                bi = i;
+            }
+            s += v.re;
+            s2 += v.re * v.re;
+        }
+        const px = bi % n;
+        const py = bi / n;
+        // Sidelobe: everything outside an 11x11 window around the peak
+        // (the totals minus the window).
+        var cnt: f32 = @floatFromInt(n * n);
+        for (py -| 5..@min(n, py + 6)) |y| for (px -| 5..@min(n, px + 6)) |x| {
             const v = self.buf[y * n + x].re;
-            s += v;
-            s2 += v * v;
-            cnt += 1;
+            s -= v;
+            s2 -= v * v;
+            cnt -= 1;
         };
         const mean = s / cnt;
         const sd = @sqrt(@max(s2 / cnt - mean * mean, 1e-12));
@@ -265,6 +325,43 @@ pub const Mosse = struct {
         };
     }
 };
+
+const L = 8;
+const VF = @Vector(L, f32);
+
+/// Natural logarithm of positive normal floats, vector-wide (Cephes logf,
+/// within a couple of ulp).
+fn logv(x: VF) VF {
+    const VU = @Vector(L, u32);
+    const VI = @Vector(L, i32);
+    const bits: VU = @bitCast(x);
+    var e: VI = @as(VI, @bitCast(bits >> @splat(23))) - @as(VI, @splat(127));
+    var m: VF = @bitCast((bits & @as(VU, @splat(0x7fffff))) | @as(VU, @splat(0x3f800000)));
+    const big = m > @as(VF, @splat(std.math.sqrt2));
+    m = @select(f32, big, m * @as(VF, @splat(0.5)), m);
+    e += @select(i32, big, @as(VI, @splat(1)), @as(VI, @splat(0)));
+    const f = m - @as(VF, @splat(1));
+    const z = f * f;
+    var y: VF = @splat(7.0376836292e-2);
+    inline for (.{ -1.1514610310e-1, 1.1676998740e-1, -1.2420140846e-1, 1.4249322787e-1, -1.6668057665e-1, 2.0000714765e-1, -2.4999993993e-1, 3.3333331174e-1 }) |c|
+        y = y * f + @as(VF, @splat(c));
+    y = y * f * z;
+    const ef: VF = @floatFromInt(e);
+    y += ef * @as(VF, @splat(-2.12194440e-4));
+    y -= z * @as(VF, @splat(0.5));
+    return f + y + ef * @as(VF, @splat(0.693359375));
+}
+
+test "logv matches @log" {
+    var x: VF = .{ 1, 1.5, 2, 3.7, 10, 100.25, 255, 256 };
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const got: [L]f32 = logv(x);
+        const xs: [L]f32 = x;
+        for (got, xs) |g, v| try std.testing.expectApproxEqRel(@log(v), g, 1e-6);
+        x = x * @as(VF, @splat(1.013));
+    }
+}
 
 fn parabola(l: f32, c: f32, r: f32) f32 {
     const den = l - 2 * c + r;

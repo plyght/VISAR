@@ -113,6 +113,7 @@ def cases(h, w):
     yield "imdecode JPEG", lambda: vs.imdecode(jpgb), lambda: cv2.imdecode(jpg, cv2.IMREAD_UNCHANGED)
     yield "imencode JPEG q90", lambda: vs.imencode(".jpg", bgr, quality=90), lambda: cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
     yield from contour_cases(h, w)
+    yield from tracking_cases()
 
 
 def blob_mask(h, w, n=None, seed=7):
@@ -137,6 +138,150 @@ def contour_cases(h, w):
     yield "contour moments", lambda: vs.moments(big), lambda: cv2.moments(big)
     yield "convexHull 20k pts", lambda: vs.convex_hull(cloud), lambda: cv2.convexHull(cloud)
     yield "approxPolyDP", lambda: vs.approx_poly_dp(big, 2.0, True), lambda: cv2.approxPolyDP(big, 2.0, True)
+
+
+def moving_scene(h, w, frames=48, objects=8, seed=11):
+    """BGR frames of textured objects moving over a static textured
+    background (the kind of input `visar track` sees)."""
+    rng = np.random.default_rng(seed)
+    bg = natural(h, w, 3)
+    s = w / 960
+    obj = []
+    for _ in range(objects):
+        ow, oh = int(rng.integers(40, 90) * s), int(rng.integers(30, 60) * s)
+        tex = np.clip(rng.normal(60 if rng.random() < 0.5 else 200, 25, (oh, ow, 3)), 0, 255).astype(np.uint8)
+        obj.append((tex, rng.uniform(0, w - ow), rng.uniform(0, h - oh), rng.uniform(-6, 6) * s, rng.uniform(-3, 3) * s))
+    out = []
+    for f in range(frames):
+        img = bg.copy()
+        for tex, x, y, vx, vy in obj:
+            oh, ow = tex.shape[:2]
+            # Bounce off the borders, so the sequence loops smoothly back and forth.
+            px = int(abs((x + vx * f) % (2 * (w - ow)) - (w - ow))) if w > ow else 0
+            py = int(abs((y + vy * f) % (2 * (h - oh)) - (h - oh))) if h > oh else 0
+            img[py:py + oh, px:px + ow] = tex
+        out.append(img)
+    return out
+
+
+def tracking_cases(h=720, w=1280):
+    """The classic tracking stack at 720p: MOSSE, background subtraction and
+    the full `visar track` detection pipeline, each against the closest
+    OpenCV counterpart. Stateful: every call processes the next frame."""
+    if not hasattr(vs.lib, "visar_mosse_create"):
+        return
+    frames = moving_scene(h, w)
+    grays = [cv2.GaussianBlur(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (5, 5), 0) for f in frames]
+    n = len(frames)
+
+    def stepper(fn):
+        i = [0]
+
+        def step():
+            fn(i[0] % n)
+            i[0] += 1
+        return step
+
+    # MOSSE: one 80x60 textured target moving 4 px/frame (back and forth).
+    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
+        rng = np.random.default_rng(5)
+        tex = np.clip(rng.normal(128, 50, (60, 80)), 0, 255).astype(np.uint8)
+        tex = cv2.GaussianBlur(tex, (5, 5), 0)
+        base = cv2.GaussianBlur(rng.integers(70, 110, (h, w)).astype(np.uint8), (3, 3), 0)
+        seq = []
+        for f in range(2 * n):
+            k = f if f < n else 2 * n - 1 - f
+            img = base.copy()
+            x, y = 300 + 4 * k, 200 + 2 * k
+            img[y:y + 60, x:x + 80] = tex
+            seq.append(img)
+        box = (300, 200, 80, 60)
+        ours, theirs = vs.Mosse(seq[0], box, scale=False), cv2.legacy.TrackerMOSSE_create()
+        theirs.init(seq[0], box)
+        j = [1, 1]
+
+        def mo():
+            ours.update(seq[j[0] % len(seq)])
+            j[0] += 1
+
+        def mt():
+            theirs.update(seq[j[1] % len(seq)])
+            j[1] += 1
+        yield "MOSSE update 720p (1 scale)", mo, mt
+
+    # Background subtraction: different algorithms, timed per frame. VISAR's
+    # model is a running average with a selective update.
+    mask = np.empty((h, w), np.uint8)
+    bgv = [vs.Background(w, h, 4)]
+    vis_bg = stepper(lambda i: bgv[0].apply(grays[i], mask, 28))
+    mog = cv2.createBackgroundSubtractorMOG2(detectShadows=False)
+    knn = cv2.createBackgroundSubtractorKNN(detectShadows=False)
+    fg = np.empty((h, w), np.uint8)
+    yield "motion mask (VISAR running average) vs MOG2 720p", vis_bg, stepper(lambda i: mog.apply(grays[i], fg))
+    yield "motion mask (VISAR running average) vs KNN 720p", vis_bg, stepper(lambda i: knn.apply(grays[i], fg))
+    acc = grays[0].astype(np.float32)
+    bg8 = np.empty((h, w), np.uint8)
+    diff = np.empty((h, w), np.uint8)
+
+    def ocv_avg(src, out):
+        cv2.convertScaleAbs(acc, dst=bg8)
+        cv2.absdiff(src, bg8, dst=diff)
+        cv2.threshold(diff, 28, 255, cv2.THRESH_BINARY, dst=out)
+        cv2.accumulateWeighted(src, acc, 1 / 16)
+    yield "motion mask (VISAR running average) vs accumulateWeighted+absdiff 720p", vis_bg, stepper(lambda i: ocv_avg(grays[i], fg))
+
+    # The full detection pipeline of `visar track` (demos/track_lib.zig
+    # Detector) at 720p: gray, Gaussian 5x5, background, open 3x3, elliptical
+    # dilate, connected components, boxes, tracker. OpenCV has no
+    # multi-object tracker, so both sides feed the same VISAR tracker.
+    sx = w / 960
+    d = min(31, max(3, round(9 * sx)) | 1)
+    min_area = int(250 * sx * sx)
+    el3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    eld = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+
+    def pipeline(bgsub):
+        gray = np.empty((h, w), np.uint8)
+        blur = np.empty((h, w), np.uint8)
+        m1 = np.empty((h, w), np.uint8)
+        m2 = np.empty((h, w), np.uint8)
+        trk = vs.Tracker(40 * sx)
+        cv_acc = [None]
+        pmog = cv2.createBackgroundSubtractorMOG2(detectShadows=False) if bgsub == "mog2" else None
+
+        def ours(i):
+            vs.cvt_color(frames[i], 6, gray)
+            vs.gaussian_blur(gray, (5, 5), 0, dst=blur)
+            bgsub.apply(blur, m1, 28)
+            vs.morphology(m1, cv2.MORPH_OPEN, cv2.MORPH_RECT, (3, 3), 1, m2)
+            vs.morphology(m2, cv2.MORPH_DILATE, cv2.MORPH_ELLIPSE, (d, d), 1, m1)
+            _, _, st, _ = vs.connected_components_with_stats(m1, 8)
+            trk.update(st[1:][st[1:, 4] >= min_area, :4].astype(np.float32))
+
+        def theirs(i):
+            cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY, dst=gray)
+            cv2.GaussianBlur(gray, (5, 5), 0, dst=blur)
+            if pmog is not None:
+                pmog.apply(blur, m1)
+            else:
+                if cv_acc[0] is None:
+                    cv_acc[0] = blur.astype(np.float32)
+                cv2.convertScaleAbs(cv_acc[0], dst=bg8)
+                cv2.absdiff(blur, bg8, dst=diff)
+                cv2.threshold(diff, 28, 255, cv2.THRESH_BINARY, dst=m1)
+                cv2.accumulateWeighted(blur, cv_acc[0], 1 / 16)
+            cv2.morphologyEx(m1, cv2.MORPH_OPEN, el3, dst=m2)
+            cv2.dilate(m2, eld, dst=m1)
+            _, _, st, _ = cv2.connectedComponentsWithStats(m1, connectivity=8)
+            trk.update(st[1:][st[1:, 4] >= min_area, :4].astype(np.float32))
+        return ours, theirs
+
+    po, _ = pipeline(vs.Background(w, h, 4))
+    _, pt = pipeline("avg")
+    yield "track pipeline 720p vs OpenCV (accumulateWeighted)", stepper(po), stepper(pt)
+    po, _ = pipeline(vs.Background(w, h, 4))
+    _, pt = pipeline("mog2")
+    yield "track pipeline 720p vs OpenCV (MOG2)", stepper(po), stepper(pt)
 
 
 def main():

@@ -174,6 +174,55 @@ def optical_flow():
                 check(f"min eigenvalues {tag}", a, b, pts, err_tol=1e-6, flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS)
 
 
+def tracking():
+    """The tracking C ABI: the background model against a NumPy model of
+    its documented arithmetic (exact), MOSSE against the ground-truth path
+    of a moving target, and the multi-object tracker's track count."""
+    rng = np.random.default_rng(21)
+    for (h, w) in [(240, 320), (37, 53), (1, 1), (7, 1)]:
+        for shift, thr in ((4, 28), (2, 5), (8, 0)):
+            bg = vs.Background(w, h, shift)
+            ref = None
+            for f in range(6):
+                frame = natural(h, w, 1)
+                frame = np.clip(frame.astype(np.int32) + rng.integers(-60, 60, frame.shape), 0, 255).astype(np.uint8)
+                mask = np.empty_like(frame)
+                bg.apply(frame, mask, thr)
+                fi = frame.astype(np.int32)
+                if ref is None:
+                    ref, want = fi << 8, np.zeros_like(frame)
+                else:
+                    fg = np.abs(fi - (ref >> 8)) > thr
+                    want = np.where(fg, 255, 0).astype(np.uint8)
+                    ref = ref + (((fi << 8) - ref) >> np.where(fg, shift + 2, shift))
+                run(f"background shift{shift} t{thr} frame{f} {w}x{h}", lambda: (mask, want))
+
+    # MOSSE on a textured target moving 3 px right and 2 px down per frame.
+    h, w = 240, 320
+    base = cv2.GaussianBlur(rng.integers(70, 110, (h, w)).astype(np.uint8), (3, 3), 0)
+    tex = cv2.GaussianBlur(np.clip(rng.normal(128, 60, (30, 40)), 0, 255).astype(np.uint8), (5, 5), 0)
+
+    def frame_at(k):
+        img = base.copy()
+        img[40 + 2 * k:70 + 2 * k, 30 + 3 * k:70 + 3 * k] = tex
+        return img
+    for scale in (False, True):
+        t = vs.Mosse(frame_at(0), (30, 40, 40, 30), scale=scale)
+        got, truth = [], []
+        for k in range(1, 40):
+            (x, y, bw, bh), psr, ok = t.update(frame_at(k))
+            got.append((x + bw / 2, y + bh / 2, float(ok)))
+            truth.append((50 + 3 * k, 55 + 2 * k, 1.0))
+        run(f"MOSSE path scale={scale}", lambda: (np.array(got), np.array(truth)), 2.0)
+        _, _, ok = t.update(base)
+        run(f"MOSSE reports loss scale={scale}", lambda: (np.array([ok]), np.array([False])))
+
+    tr = vs.Tracker(60)
+    counts = [tr.update(np.float32([[10 + 5 * k, 10, 10, 10], [200 - 5 * k, 100, 12, 12]])) for k in range(10)]
+    counts.append(tr.update(np.zeros((0, 4), np.float32)))
+    run("tracker track counts", lambda: (np.array(counts), np.array([2] * 11)))
+
+
 def main():
     vs.set_num_threads(0)
     print(f"VISAR {vs.version()} ({vs.lib.visar_build_info().decode()}) vs OpenCV {cv2.__version__}")
@@ -181,6 +230,7 @@ def main():
     corners()
     gftt()
     optical_flow()
+    tracking()
     width = max(len(r[0]) for r in results)
     failed = [r for r in results if not r[3]]
     for name, mx, frac, ok in results:
