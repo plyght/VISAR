@@ -106,6 +106,8 @@ pub const Group = struct {
     /// all have w0 + w1 = 2048 and w1 < 2048 (see sumGroups and
     /// hrowSumNeon), not `n` whole pixels.
     sum: bool = false,
+    /// Sum groups: how many groups from this one on are `ok` in a row.
+    run: u32 = 0,
 };
 
 /// Builds the groups for a bilinear row of `rowlen` source samples. Uses
@@ -222,6 +224,13 @@ fn sumGroupsN(comptime cn: usize, gpa: Allocator, xt: []const Tap(2), rowlen: us
             }
             gr.w[l] = @intCast(t.w[1] << 4);
         }
+    }
+    var run: u32 = 0;
+    var i = g.len;
+    while (i > 0) {
+        i -= 1;
+        run = if (g[i].ok) run + 1 else 0;
+        g[i].run = run;
     }
     return g;
 }
@@ -595,11 +604,20 @@ fn hrowNeon(comptime R: usize, comptime cn: usize, s: [R][]const u8, out: [R][]i
             if (gs[0].sum) {
                 var o: [R][*]i16 = undefined;
                 inline for (0..R) |r| o[r] = out[r].ptr;
-                for (gs, 0..) |*g, k| {
-                    if (g.ok) {
-                        hrowSumNeon(R, W, s, o, g);
-                    } else for (0..R) |r| hrowSamples(cn, s[r], out[r], xt, k * 16, k * 16 + 16);
-                    inline for (0..R) |r| o[r] += 16;
+                var k: usize = 0;
+                while (k < gs.len) {
+                    if (gs[k].ok) {
+                        // A run of windows that fit: no per-group checks.
+                        for (gs[k..][0..gs[k].run]) |*g| {
+                            hrowSumNeon(R, W, s, o, g);
+                            inline for (0..R) |r| o[r] += 16;
+                        }
+                        k += gs[k].run;
+                    } else {
+                        for (0..R) |r| hrowSamples(cn, s[r], out[r], xt, k * 16, k * 16 + 16);
+                        inline for (0..R) |r| o[r] += 16;
+                        k += 1;
+                    }
                 }
                 for (0..R) |r| hrowSamples(cn, s[r], out[r], xt, gs.len * 16, xt.len * cn);
                 return;
