@@ -64,6 +64,7 @@ pub inline fn opaqueV(v: V16) V16 {
 /// (vpermt2b) are single instructions, so 64-pixel deinterleaves are cheap.
 pub const has_vbmi = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .x86_64 and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi);
+const has_avx2 = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
 
 pub const V64 = @Vector(64, u8);
 
@@ -359,6 +360,38 @@ pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map:
         }
         return x;
     }
+    if (comptime builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm and scn == 3 and dcn == 3)
+        return permute3(map, s, d, n);
+    if (comptime has_avx2 and scn == 3 and dcn == 4) {
+        // AVX2: one in-lane vpshufb over two 16-byte loads 12 bytes apart
+        // makes 8 pixels, stored as one 32-byte store.
+        const m32 = comptime blk: {
+            var m: [32]i32 = undefined;
+            for (0..32) |t| {
+                const lane = t / 16;
+                const p = (t % 16) / 4;
+                const c = t % 4;
+                m[t] = if (map[c]) |sc| @intCast(16 * lane + p * 3 + sc) else -1;
+            }
+            break :blk m;
+        };
+        const f: @Vector(1, u8) = .{fill};
+        var x: usize = 0;
+        while (x * 3 + 28 <= n * 3) : (x += 8) {
+            const lo = opaqueV(s[x * 3 ..][0..16].*);
+            const hi = opaqueV(s[x * 3 + 12 ..][0..16].*);
+            const v: @Vector(32, u8) = @shuffle(u8, lo, hi, blk: {
+                var m: [32]i32 = undefined;
+                for (0..16) |i| {
+                    m[i] = @intCast(i);
+                    m[16 + i] = ~@as(i32, @intCast(i));
+                }
+                break :blk m;
+            });
+            d[x * 4 ..][0..32].* = @shuffle(u8, v, f, m32);
+        }
+        return x;
+    }
     const widest: usize = if (scn > dcn) scn else dcn;
     const per: usize = 16 / widest;
     const mask = comptime blk: {
@@ -379,6 +412,71 @@ pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map:
         d[x * dcn ..][0..16].* = @shuffle(u8, v, f, mask);
     }
     return x;
+}
+
+/// x86 3 -> 3 channel permutation (BGR <-> RGB). Output byte i is input
+/// byte i + map[i % 3] - i % 3, a shift of at most two bytes, so with two
+/// unaligned loads 2 bytes before and 2 bytes after the output position
+/// every output byte is in the same 16-byte lane of one of them: each
+/// output vector is two in-lane pshufbs and an or, stored whole (32 bytes
+/// with AVX2). Unlike 5-pixel pshufb steps with overlapping 16-byte
+/// stores, this keeps the store count at one per vector. Three vectors
+/// (three mask phases) per step, from pixel 1 on so the loads stay inside
+/// the row, plus one overlapping step at the row end; pixel 0 is converted
+/// here. Returns the pixels done from 0.
+inline fn permute3(comptime map: [3]?u8, s: [*]const u8, d: [*]u8, n: usize) usize {
+    const W = if (has_avx2) 32 else 16;
+    const V = @Vector(W, u8);
+    // ma[t][i] / mb[t][i]: lane-local source index of output byte i of
+    // vector t in the load at -2 / +2, or a zero lane (index into the
+    // second operand).
+    const masks = comptime blk: {
+        var ma: [3][W]i32 = undefined;
+        var mb: [3][W]i32 = undefined;
+        for (0..3) |t| for (0..W) |i| {
+            const c = (W * t + i) % 3;
+            const delta: i32 = @as(i32, map[c].?) - @as(i32, c);
+            const li: i32 = @intCast(i % 16);
+            const base: i32 = @intCast(i - i % 16);
+            if (li + delta + 2 <= 15) {
+                ma[t][i] = base + li + delta + 2;
+                mb[t][i] = -1;
+            } else {
+                ma[t][i] = -1;
+                mb[t][i] = base + li + delta - 2;
+            }
+        };
+        break :blk .{ ma, mb };
+    };
+    const end = 3 * n;
+    if (end < 3 * W + 5) return 0;
+    const z: V = @splat(0);
+    const Step = struct {
+        inline fn opaque_(v: V) V {
+            return asm (""
+                : [ret] "=x" (-> V),
+                : [v] "0" (v),
+            );
+        }
+        inline fn run(src: [*]const u8, dst: [*]u8, o: usize) void {
+            inline for (0..3) |t| {
+                const a = opaque_(src[o + W * t - 2 ..][0..W].*);
+                const b = opaque_(src[o + W * t + 2 ..][0..W].*);
+                dst[o + W * t ..][0..W].* = @shuffle(u8, a, z, masks[0][t]) | @shuffle(u8, b, z, masks[1][t]);
+            }
+        }
+    };
+    var o: usize = 3;
+    while (o + 3 * W + 2 <= end) : (o += 3 * W) Step.run(s, d, o);
+    // One more step ending near the row end, overlapping the last one
+    // (same bytes rewritten), leaves at most a pixel or two.
+    const last = (end - 3 * W - 2) / 3 * 3;
+    if (last + 3 * W > o) {
+        Step.run(s, d, last);
+        o = last + 3 * W;
+    }
+    inline for (0..3) |c| d[c] = s[map[c].?];
+    return o / 3;
 }
 
 /// gather() restricted to the listed blocks.
