@@ -729,11 +729,14 @@ pub const Extract = struct {
             const lo = @max(k.c0, b * B);
             const hi = @min(k.c1, b * B + B);
             const src = x + ((n * nb + b) * hw + y * w) * B;
+            const whole = lo == b * B and hi == b * B + B;
             for (0..w) |i| {
-                const v: [B]f32 = vec.actGeneric(k.act, vec.load(src + i * B));
+                const raw = vec.load(src + i * B);
+                const vv = if (k.act == .none) raw else vec.actGeneric(k.act, raw);
+                const v: [B]f32 = vv;
                 if (k.nhwc) {
                     const dst = o + (n * hw + y * w + i) * cn + (lo - k.c0);
-                    @memcpy(dst[0 .. hi - lo], v[lo - b * B .. hi - b * B]);
+                    if (whole) vec.store(dst, vv) else @memcpy(dst[0 .. hi - lo], v[lo - b * B .. hi - b * B]);
                 } else {
                     for (lo..hi) |c| o[(n * cn + c - k.c0) * hw + y * w + i] = v[c - b * B];
                 }
@@ -878,6 +881,15 @@ pub const Gather = struct {
             srcs[l] = k.ins[k.src[ch]].ptr(base) + img * k.in_img[k.src[ch]] + k.off[ch] + y * k.w * B;
         }
         const mask = vec.laneMask(lanes);
+        if (lanes == B and k.act == .none) {
+            // Whole blocks (the usual case), lanes unrolled.
+            for (0..k.w) |x| {
+                var v: [B]f32 = undefined;
+                inline for (0..B) |l| v[l] = srcs[l][x * B];
+                dst[x * B ..][0..B].* = v;
+            }
+            return;
+        }
         for (0..k.w) |x| {
             var v: [B]f32 = @splat(0);
             for (0..lanes) |l| v[l] = srcs[l][x * B];
