@@ -78,6 +78,7 @@ pub const Lib = enum {
     coregraphics,
     quartzcore,
     corefoundation,
+    metal,
 
     pub fn path(l: Lib) [*:0]const u8 {
         return switch (l) {
@@ -91,6 +92,7 @@ pub const Lib = enum {
             .coregraphics => "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
             .quartzcore => "/System/Library/Frameworks/QuartzCore.framework/QuartzCore",
             .corefoundation => "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+            .metal => "/System/Library/Frameworks/Metal.framework/Metal",
         };
     }
 };

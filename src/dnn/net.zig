@@ -1,6 +1,7 @@
 //! `Net`: an ONNX model loaded into the IR, compiled for a fixed input shape
 //! (shape inference, folding, fusion, layout and memory planning, then the
-//! CPU program), and run with no allocation per inference.
+//! CPU program or, on macOS, the Metal program), and run with no allocation
+//! per inference.
 //!
 //!     var net = try dnn.Net.load(gpa, model_bytes);
 //!     defer net.deinit();
@@ -15,11 +16,34 @@ const ir = @import("ir.zig");
 const passes = @import("passes.zig");
 const plan_mod = @import("plan.zig");
 const cpu = @import("cpu/backend.zig");
+const metal = @import("metal/metal.zig");
 const core = @import("../core/core.zig");
 const Allocator = std.mem.Allocator;
 const Exec = core.Exec;
 
-pub const Error = ir.Error || onnx.Error || error{NotPlanned};
+pub const Error = ir.Error || onnx.Error || error{
+    NotPlanned,
+    /// `backend = .metal` on a machine without a usable Metal device.
+    BackendUnavailable,
+};
+
+/// Failure of one inference on the GPU (the CPU backend cannot fail).
+pub const RunError = error{GpuFailed};
+
+/// Which backend runs the network.
+pub const Backend = enum {
+    /// Metal when a device is available (macOS) and the model is big
+    /// enough for the GPU to pay off (`metal.auto_min_macs`) and every op
+    /// has a Metal kernel; otherwise the CPU.
+    auto,
+    cpu,
+    /// Metal or an error from `plan` (error.BackendUnavailable without a
+    /// device, error.Unsupported for an op without a kernel).
+    metal,
+};
+
+/// The backend a planned network runs on.
+pub const Device = enum { cpu, metal };
 
 pub const Tensor = struct {
     shape: ir.Shape,
@@ -34,12 +58,18 @@ pub const Options = struct {
     blocked: bool = true,
     /// Stream chains of convolutions and pools row by row.
     stream: bool = true,
+    /// Backend selection, applied at `plan`. The Metal backend always uses
+    /// its own blocked layout and ignores `blocked` and `stream`.
+    backend: Backend = .auto,
 };
 
 const Compiled = struct {
     arena: std.heap.ArenaAllocator,
     plan: plan_mod.Plan,
+    /// The CPU program (undefined when `gpu` is set).
     program: cpu.Program,
+    /// The Metal program; `buf` is then its shared arena buffer.
+    gpu: ?metal.Program = null,
     buf: []align(64) u8,
 };
 
@@ -70,7 +100,7 @@ pub const Net = struct {
 
     fn unplan(net: *Net) void {
         if (net.compiled) |*c| {
-            net.gpa.free(c.buf);
+            if (c.gpu) |*g| g.deinit() else net.gpa.free(c.buf);
             c.arena.deinit();
         }
         net.compiled = null;
@@ -114,11 +144,40 @@ pub const Net = struct {
         var g = try net.graph.clone(a);
         try ir.inferShapes(&g, a, ss);
         try passes.run(&g, a, .{ .fuse = net.opts.fuse });
+        if (net.opts.backend != .cpu) {
+            if (planMetal(&c, &g, net.opts.backend == .auto)) {
+                net.compiled = c;
+                return;
+            } else |e| if (net.opts.backend == .metal) return switch (e) {
+                error.Unavailable => error.BackendUnavailable,
+                error.GpuFailed => error.BackendUnavailable,
+                error.TooSmall => unreachable,
+                else => |x| x,
+            };
+        }
         c.plan = try plan_mod.build(a, &g, if (net.opts.blocked) cpu.block else 0, if (net.opts.stream) &cpu.streamable else null);
         c.program = try cpu.Program.init(a, &c.plan, .{ .stream = net.opts.stream });
         c.buf = try net.gpa.alignedAlloc(u8, .@"64", @max(c.plan.arena_bytes, 64));
         @memset(c.buf, 0);
         net.compiled = c;
+    }
+
+    /// The whole plan on the GPU, or an error (the caller then plans for
+    /// the CPU). `auto`: only plans big enough to gain from the GPU.
+    fn planMetal(c: *Compiled, g: *ir.Graph, auto: bool) (ir.Error || metal.Error || error{TooSmall})!void {
+        if (!metal.available()) return error.Unavailable;
+        const a = c.arena.allocator();
+        const p = try plan_mod.build(a, g, metal.block, null);
+        if (auto and metal.encode.convMacs(&p) < metal.auto_min_macs) return error.TooSmall;
+        c.plan = p;
+        c.gpu = try metal.Program.init(a, &c.plan);
+        c.buf = c.gpu.?.memory();
+    }
+
+    /// The backend the current plan runs on (null before `plan`).
+    pub fn device(net: *const Net) ?Device {
+        const c = &(net.compiled orelse return null);
+        return if (c.gpu != null) .metal else .cpu;
     }
 
     pub fn planned(net: *const Net) ?*const plan_mod.Plan {
@@ -138,8 +197,19 @@ pub const Net = struct {
         return net.tensor(net.compiled.?.plan.inputs[i]).data;
     }
 
+    /// Runs one inference. A GPU failure (see `tryRun`) leaves NaN in
+    /// every output, so it cannot pass for a result.
     pub fn run(net: *Net, exec: Exec) void {
+        net.tryRun(exec) catch {
+            for (0..net.outputCount()) |i| @memset(net.output(i).data, std.math.nan(f32));
+        };
+    }
+
+    /// Runs one inference; only the Metal backend can fail (`exec` is
+    /// unused there: the GPU runs the whole plan).
+    pub fn tryRun(net: *Net, exec: Exec) RunError!void {
         const c = &net.compiled.?;
+        if (c.gpu) |*g| return g.run() catch error.GpuFailed;
         c.program.run(exec, c.buf);
     }
 

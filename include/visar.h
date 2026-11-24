@@ -170,6 +170,14 @@ int visar_dnn_net_run(visar_net *net);
 size_t visar_dnn_net_output_count(visar_net *net);
 const char *visar_dnn_net_output_name(visar_net *net, size_t i);
 int visar_dnn_net_output(visar_net *net, size_t i, size_t shape[6], size_t *rank, const float **data);
+/* Backends: 0 auto (default: Metal on macOS for large enough models whose ops all have GPU kernels,
+   else CPU), 1 CPU, 2 Metal (planning fails without a Metal device or for unsupported ops).
+   set_backend applies at the next plan; net_backend reports the current plan's (1 CPU, 2 Metal,
+   0 before planning). */
+int visar_dnn_metal_available(void);
+const char *visar_dnn_metal_device(void); /* device name, or why Metal is unavailable */
+int visar_dnn_net_set_backend(visar_net *net, int backend);
+int visar_dnn_net_backend(visar_net *net);
 
 /* YuNet face detection, matching cv2.FaceDetectorYN. detect() takes a BGR VISAR_8U image of the
    configured size and writes up to cap rows of 15 floats: x, y, w, h, right eye, left eye, nose tip,
@@ -179,6 +187,8 @@ int visar_face_detector_create(const void *model, size_t len, int width, int hei
                                float nms_threshold, int top_k, visar_face_detector **out);
 void visar_face_detector_free(visar_face_detector *d);
 int visar_face_detector_set_input_size(visar_face_detector *d, int width, int height);
+int visar_face_detector_set_backend(visar_face_detector *d, int backend); /* re-plans */
+int visar_face_detector_backend(visar_face_detector *d);
 void visar_face_detector_set_thresholds(visar_face_detector *d, float score_threshold, float nms_threshold, int top_k);
 int visar_face_detector_detect(visar_face_detector *d, const visar_image *img, float *out, size_t cap, size_t *count);
 

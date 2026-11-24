@@ -602,13 +602,53 @@ lib.visar_dnn_net_output_count.restype = _sz
 lib.visar_dnn_net_free.argtypes = [_vp]
 lib.visar_face_detector_free.argtypes = [_vp]
 
+# dnn backends (older libraries predate them: CPU only).
+BACKENDS = {"auto": 0, "cpu": 1, "metal": 2}
+_DEVICES = {0: None, 1: "cpu", 2: "metal"}
+HAS_BACKENDS = hasattr(lib, "visar_dnn_net_set_backend")
+if HAS_BACKENDS:
+    lib.visar_dnn_metal_device.restype = ctypes.c_char_p
+    for _fn in ("visar_dnn_net_set_backend", "visar_dnn_net_backend",
+                "visar_face_detector_set_backend", "visar_face_detector_backend"):
+        getattr(lib, _fn).argtypes = [_vp] + ([ctypes.c_int] if _fn.endswith("set_backend") else [])
+
+
+def metal_available():
+    return bool(HAS_BACKENDS and lib.visar_dnn_metal_available())
+
+
+def metal_device():
+    """The Metal device name, or why Metal is unavailable."""
+    return lib.visar_dnn_metal_device().decode() if HAS_BACKENDS else "library has no backend API"
+
+
+def _backend_code(backend):
+    if backend is None:
+        backend = os.environ.get("VISAR_DNN_BACKEND") or None
+    if backend is None:
+        return None
+    if not HAS_BACKENDS:
+        if backend in ("auto", "cpu"):
+            return None
+        raise VisarError(f"this library has no dnn backend API (asked for {backend})")
+    return BACKENDS[backend]
+
 
 class Net:
-    """An ONNX network planned for one input shape (plain NCHW f32)."""
+    """An ONNX network planned for one input shape (plain NCHW f32).
+    backend: "auto", "cpu" or "metal" (default: $VISAR_DNN_BACKEND, else auto)."""
 
-    def __init__(self, model_bytes):
+    def __init__(self, model_bytes, backend=None):
         self._h = _vp()
         _check(lib.visar_dnn_net_load(model_bytes, _sz(len(model_bytes)), ctypes.byref(self._h)))
+        code = _backend_code(backend)
+        if code is not None:
+            _check(lib.visar_dnn_net_set_backend(self._h, code))
+
+    @property
+    def backend(self):
+        """The planned network's backend: "cpu" or "metal"."""
+        return _DEVICES[lib.visar_dnn_net_backend(self._h)] if HAS_BACKENDS else "cpu"
 
     def __del__(self):
         if getattr(self, "_h", None):
@@ -643,12 +683,19 @@ class Net:
 class FaceDetector:
     """YuNet face detector with cv2.FaceDetectorYN's interface."""
 
-    def __init__(self, model_bytes, size, score_threshold=0.9, nms_threshold=0.3, top_k=5000):
+    def __init__(self, model_bytes, size, score_threshold=0.9, nms_threshold=0.3, top_k=5000, backend=None):
         self._h = _vp()
         _check(lib.visar_face_detector_create(model_bytes, _sz(len(model_bytes)), int(size[0]), int(size[1]),
                                               ctypes.c_float(score_threshold), ctypes.c_float(nms_threshold),
                                               int(top_k), ctypes.byref(self._h)))
         self._out = np.empty((64, 15), np.float32)
+        code = _backend_code(backend)
+        if code is not None:
+            _check(lib.visar_face_detector_set_backend(self._h, code))
+
+    @property
+    def backend(self):
+        return _DEVICES[lib.visar_face_detector_backend(self._h)] if HAS_BACKENDS else "cpu"
 
     def __del__(self):
         if getattr(self, "_h", None):

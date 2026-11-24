@@ -5,7 +5,8 @@
 //! epilogue fusion, dead-code elimination) -> `plan` (layouts and a
 //! liveness-based memory plan with every shape fixed: device-neutral data a
 //! backend consumes whole) -> `cpu` (the CPU backend: SIMD kernels with
-//! weights packed at plan time, threaded through `Exec`).
+//! weights packed at plan time, threaded through `Exec`) or `metal` (the
+//! whole plan on an Apple GPU, one command buffer per inference; macOS).
 //!
 //! `Net` ties the stages together; `FaceDetector` runs YuNet the way
 //! OpenCV's FaceDetectorYN does.
@@ -18,11 +19,14 @@ pub const ir = @import("ir.zig");
 pub const passes = @import("passes.zig");
 pub const plan = @import("plan.zig");
 pub const cpu = @import("cpu/backend.zig");
+pub const metal = @import("metal/metal.zig");
 pub const net = @import("net.zig");
 pub const face = @import("face.zig");
 
 pub const Net = net.Net;
 pub const Tensor = net.Tensor;
+pub const Backend = net.Backend;
+pub const Device = net.Device;
 pub const FaceDetector = face.FaceDetector;
 pub const Face = face.Face;
 
@@ -34,6 +38,8 @@ test {
     _ = plan;
     _ = net;
     _ = face;
+    _ = metal;
     _ = @import("tests.zig");
+    _ = @import("metal/tests.zig");
     _ = @import("cpu/vec.zig");
 }
