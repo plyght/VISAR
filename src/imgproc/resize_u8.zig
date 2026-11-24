@@ -57,6 +57,7 @@ const neon = struct {
     extern fn @"llvm.aarch64.neon.tbl2.v16i8"(V, V, V) V;
     extern fn @"llvm.aarch64.neon.tbl1.v16i8"(V, V) V;
     extern fn @"llvm.aarch64.neon.uaddlp.v8i16.v16i8"(V) @Vector(8, u16);
+    extern fn @"llvm.aarch64.neon.addp.v8i16"(@Vector(8, u16), @Vector(8, u16)) @Vector(8, u16);
     inline fn tbl(comptime k: usize, t: [k]V, idx: V) V {
         return switch (k) {
             1 => @"llvm.aarch64.neon.tbl1.v16i8"(t[0], idx),
@@ -953,6 +954,7 @@ pub fn areaInt(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), ix: u
 }
 
 fn areaIntRows(comptime cn: usize, c: anytype, y0: usize, y1: usize) void {
+    if (comptime planar) if (c.ix == 4 and c.iy == 4) return area4Rows(cn, c, y0, y1);
     const n = c.d.rowLen();
     const sn: usize = c.d.width * c.ix * cn; // source elements used per row
     const stride = std.mem.alignForward(usize, n + 4, area_vn);
@@ -1001,6 +1003,56 @@ fn areaIntRows(comptime cn: usize, c: anytype, y0: usize, y1: usize) void {
             if (x + area_vn <= n) {
                 d[x..][0..area_vn].* = o;
             } else @memcpy(d[x..], o[0 .. n - x]);
+        }
+    }
+}
+
+/// NEON 4x4 block average (the shape of carotene's resizeAreaU8): per
+/// channel, pairwise-add 16 deinterleaved bytes of each of the four rows
+/// into u16 (uaddlp), sum the rows, pairwise-add again (addp) and divide by
+/// 16 rounding half to even, as the f32 path does (the sums are exact).
+fn area4Rows(comptime cn: usize, c: anytype, y0: usize, y1: usize) void {
+    @setEvalBranchQuota(10000);
+    const H = @Vector(8, u16);
+    const w = c.d.width;
+    for (y0..y1) |dy| {
+        var r: [4][*]const u8 = undefined;
+        inline for (0..4) |k| r[k] = c.s.row(4 * dy + k).ptr;
+        const d = c.d.row(dy);
+        var x: usize = 0;
+        while (x + 16 <= w) : (x += 16) {
+            // Each half: 8 output pixels from 32 source pixels; acc[g][ch]
+            // holds pair sums of source pixels 16g..16g+15 of the half.
+            var b: [2][cn]@Vector(8, u8) = undefined;
+            inline for (0..2) |h| {
+                var acc: [2][cn]H = undefined;
+                inline for (0..2) |g| {
+                    const off = (4 * x + 32 * h + 16 * g) * cn;
+                    inline for (0..4) |k| {
+                        const v = vec.load(cn, r[k] + off);
+                        inline for (0..cn) |ch| {
+                            const p = neon.@"llvm.aarch64.neon.uaddlp.v8i16.v16i8"(v[ch]);
+                            acc[g][ch] = if (k == 0) p else acc[g][ch] + p;
+                        }
+                    }
+                }
+                inline for (0..cn) |ch| {
+                    const sum = neon.@"llvm.aarch64.neon.addp.v8i16"(acc[0][ch], acc[1][ch]);
+                    b[h][ch] = @truncate((sum + @as(H, @splat(7)) + ((sum >> @splat(4)) & @as(H, @splat(1)))) >> @splat(4));
+                }
+            }
+            var out: [cn]vec.V16 = undefined;
+            inline for (0..cn) |ch| out[ch] = std.simd.join(b[0][ch], b[1][ch]);
+            vec.store(cn, out, d.ptr + x * cn);
+        }
+        while (x < w) : (x += 1) {
+            inline for (0..cn) |ch| {
+                var s: u32 = 0;
+                for (0..4) |k| for (0..4) |j| {
+                    s += r[k][(4 * x + j) * cn + ch];
+                };
+                d[x * cn + ch] = @intCast((s + 7 + ((s >> 4) & 1)) >> 4);
+            }
         }
     }
 }

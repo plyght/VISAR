@@ -718,17 +718,23 @@ test "u8 area kernels match the scalar table loop and OpenCV's integer rounding"
             try areaGeneric(.serial, gpa, src, b);
             try std.testing.expectEqualSlices(u8, b.slice(), a.slice());
         }
+        // 4x3, and 4x4 (NEON path: one 16-pixel chunk plus a tail).
         const s2 = try src.roi(0, 0, 96, 60);
-        var d = try Image(u8).init(gpa, 24, 20, cn);
-        defer d.deinit(gpa);
-        try resize(.serial, gpa, s2, d, .area);
-        for (0..20) |y| for (0..24) |x| for (0..cn) |ch| {
-            var sum: u32 = 0;
-            for (0..3) |dy| for (0..4) |dx| {
-                sum += s2.row(y * 3 + dy)[(x * 4 + dx) * cn + ch];
+        for ([_][2]u32{ .{ 4, 3 }, .{ 4, 4 } }) |f| {
+            const dw = 96 / f[0];
+            const dh = 60 / f[1];
+            var d = try Image(u8).init(gpa, dw, dh, cn);
+            defer d.deinit(gpa);
+            try resize(.serial, gpa, s2, d, .area);
+            const scale = 1.0 / @as(f32, @floatFromInt(f[0] * f[1]));
+            for (0..dh) |y| for (0..dw) |x| for (0..cn) |ch| {
+                var sum: u32 = 0;
+                for (0..f[1]) |dy| for (0..f[0]) |dx| {
+                    sum += s2.row(y * f[1] + dy)[(x * f[0] + dx) * cn + ch];
+                };
+                const want = sat.cast(u8, @as(f32, @floatFromInt(sum)) * scale);
+                try std.testing.expectEqual(want, d.row(y)[x * cn + ch]);
             };
-            const want = sat.cast(u8, @as(f32, @floatFromInt(sum)) * (1.0 / 12.0));
-            try std.testing.expectEqual(want, d.row(y)[x * cn + ch]);
-        };
+        }
     }
 }
