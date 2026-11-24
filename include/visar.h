@@ -143,6 +143,29 @@ void visar_image_free(visar_image *img);
 int visar_imencode(const char *ext, const visar_image *img, int bgr, int quality, uint8_t **out, size_t *out_len);
 void visar_free(uint8_t *p, size_t len);
 
+/* dnn: ONNX inference (f32). Model bytes are copied. A net is planned for one input shape;
+   the input buffer (plain NCHW) and outputs live inside the net and stay valid until the next plan. */
+typedef struct visar_net visar_net;
+int visar_dnn_net_load(const void *bytes, size_t len, visar_net **out);
+void visar_dnn_net_free(visar_net *net);
+int visar_dnn_net_plan(visar_net *net, const size_t *shape, size_t rank);
+float *visar_dnn_net_input(visar_net *net, size_t *count);
+int visar_dnn_net_run(visar_net *net);
+size_t visar_dnn_net_output_count(visar_net *net);
+const char *visar_dnn_net_output_name(visar_net *net, size_t i);
+int visar_dnn_net_output(visar_net *net, size_t i, size_t shape[6], size_t *rank, const float **data);
+
+/* YuNet face detection, matching cv2.FaceDetectorYN. detect() takes a BGR VISAR_8U image of the
+   configured size and writes up to cap rows of 15 floats: x, y, w, h, right eye, left eye, nose tip,
+   right and left mouth corners (x, y each), score. *count receives the number of faces. */
+typedef struct visar_face_detector visar_face_detector;
+int visar_face_detector_create(const void *model, size_t len, int width, int height, float score_threshold,
+                               float nms_threshold, int top_k, visar_face_detector **out);
+void visar_face_detector_free(visar_face_detector *d);
+int visar_face_detector_set_input_size(visar_face_detector *d, int width, int height);
+void visar_face_detector_set_thresholds(visar_face_detector *d, float score_threshold, float nms_threshold, int top_k);
+int visar_face_detector_detect(visar_face_detector *d, const visar_image *img, float *out, size_t cap, size_t *count);
+
 #ifdef __cplusplus
 }
 #endif

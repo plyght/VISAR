@@ -45,9 +45,9 @@ fn fail(err: anyerror) c_int {
     last_error[n] = 0;
     const st: Status = switch (err) {
         error.OutOfMemory => .out_of_memory,
-        error.SizeMismatch => .size_mismatch,
+        error.SizeMismatch, error.ShapeMismatch => .size_mismatch,
         error.Unsupported, error.UnsupportedChannels => .unsupported,
-        error.InvalidData, error.Truncated, error.TooLarge => .invalid_data,
+        error.InvalidData, error.Truncated, error.TooLarge, error.InvalidModel => .invalid_data,
         error.InvalidSize, error.OutOfBounds, error.InvalidKernel, error.InvalidArgument => .invalid_argument,
         else => .internal,
     };
@@ -773,6 +773,151 @@ export fn visar_imencode(ext: [*:0]const u8, img: *const CImage, bgr: c_int, qua
 
 export fn visar_free(p: ?[*]u8, len: usize) void {
     if (p) |ptr| gpa.free(ptr[0..len]);
+}
+
+// ------------------------------------------------------------------ dnn
+
+const dnn = visar.dnn;
+
+/// A loaded network. The model bytes are copied (the IR refers to them).
+const CNet = struct {
+    bytes: []u8,
+    net: dnn.Net,
+    names: [][:0]u8,
+};
+
+export fn visar_dnn_net_load(bytes: [*]const u8, len: usize, out: *?*CNet) c_int {
+    out.* = null;
+    const h = gpa.create(CNet) catch |e| return fail(e);
+    h.bytes = gpa.dupe(u8, bytes[0..len]) catch |e| {
+        gpa.destroy(h);
+        return fail(e);
+    };
+    h.net = dnn.Net.load(gpa, h.bytes) catch |e| {
+        gpa.free(h.bytes);
+        gpa.destroy(h);
+        return fail(e);
+    };
+    h.names = gpa.alloc([:0]u8, h.net.outputCount()) catch |e| {
+        h.net.deinit();
+        gpa.free(h.bytes);
+        gpa.destroy(h);
+        return fail(e);
+    };
+    for (h.names, 0..) |*n, i| n.* = gpa.dupeSentinel(u8, h.net.outputName(i), 0) catch |e| {
+        for (h.names[0..i]) |s| gpa.free(s);
+        gpa.free(h.names);
+        h.net.deinit();
+        gpa.free(h.bytes);
+        gpa.destroy(h);
+        return fail(e);
+    };
+    out.* = h;
+    return 0;
+}
+
+export fn visar_dnn_net_free(h: ?*CNet) void {
+    const n = h orelse return;
+    for (n.names) |s| gpa.free(s);
+    gpa.free(n.names);
+    n.net.deinit();
+    gpa.free(n.bytes);
+    gpa.destroy(n);
+}
+
+/// Plans the (single-input) network for an input of `rank` dims.
+export fn visar_dnn_net_plan(h: *CNet, shape: [*]const usize, rank: usize) c_int {
+    return run(h.net.plan(&.{shape[0..rank]}));
+}
+
+/// The planned input buffer (plain NCHW f32) and its element count.
+export fn visar_dnn_net_input(h: *CNet, count: *usize) ?[*]f32 {
+    if (h.net.compiled == null) return null;
+    const x = h.net.input(0);
+    count.* = x.len;
+    return x.ptr;
+}
+
+export fn visar_dnn_net_run(h: *CNet) c_int {
+    if (h.net.compiled == null) return fail(error.InvalidArgument);
+    h.net.run(exec());
+    return 0;
+}
+
+export fn visar_dnn_net_output_count(h: *CNet) usize {
+    return h.net.outputCount();
+}
+
+export fn visar_dnn_net_output_name(h: *CNet, i: usize) [*:0]const u8 {
+    return if (i < h.names.len) h.names[i].ptr else "";
+}
+
+/// Output `i` after a run: `shape` receives up to 6 dims, `data` points
+/// into the network's buffer (valid until the next run or plan).
+export fn visar_dnn_net_output(h: *CNet, i: usize, shape: *[6]usize, rank: *usize, data: *?[*]const f32) c_int {
+    if (h.net.compiled == null or i >= h.net.outputCount()) return fail(error.InvalidArgument);
+    const t = h.net.output(i);
+    rank.* = t.shape.rank;
+    shape.* = @splat(0);
+    @memcpy(shape[0..t.shape.rank], t.shape.dims());
+    data.* = t.data.ptr;
+    return 0;
+}
+
+const CFaceDetector = struct {
+    bytes: []u8,
+    det: dnn.FaceDetector,
+};
+
+export fn visar_face_detector_create(bytes: [*]const u8, len: usize, width: c_int, height: c_int, score_threshold: f32, nms_threshold: f32, top_k: c_int, out: *?*CFaceDetector) c_int {
+    out.* = null;
+    if (width <= 0 or height <= 0) return fail(error.InvalidArgument);
+    const h = gpa.create(CFaceDetector) catch |e| return fail(e);
+    h.bytes = gpa.dupe(u8, bytes[0..len]) catch |e| {
+        gpa.destroy(h);
+        return fail(e);
+    };
+    h.det = dnn.FaceDetector.create(gpa, h.bytes, .{ .width = @intCast(width), .height = @intCast(height), .score_threshold = score_threshold, .nms_threshold = nms_threshold, .top_k = top_k }) catch |e| {
+        gpa.free(h.bytes);
+        gpa.destroy(h);
+        return fail(e);
+    };
+    out.* = h;
+    return 0;
+}
+
+export fn visar_face_detector_free(h: ?*CFaceDetector) void {
+    const d = h orelse return;
+    d.det.deinit();
+    gpa.free(d.bytes);
+    gpa.destroy(d);
+}
+
+export fn visar_face_detector_set_input_size(h: *CFaceDetector, width: c_int, height: c_int) c_int {
+    if (width <= 0 or height <= 0) return fail(error.InvalidArgument);
+    return run(h.det.setInputSize(@intCast(width), @intCast(height)));
+}
+
+export fn visar_face_detector_set_thresholds(h: *CFaceDetector, score_threshold: f32, nms_threshold: f32, top_k: c_int) void {
+    h.det.opts.score_threshold = score_threshold;
+    h.det.opts.nms_threshold = nms_threshold;
+    h.det.opts.top_k = top_k;
+}
+
+/// Detects faces in a BGR VISAR_8U image. Writes up to `cap` rows of 15
+/// floats (x, y, w, h, 5 landmark x/y pairs, score) like cv2.FaceDetectorYN;
+/// `count` receives the number of faces found.
+export fn visar_face_detector_detect(h: *CFaceDetector, img: *const CImage, out: ?[*]f32, cap: usize, count: *usize) c_int {
+    count.* = 0;
+    const src = typed(u8, img) catch |e| return fail(e);
+    const faces = h.det.detect(exec(), src) catch |e| return fail(e);
+    count.* = faces.len;
+    if (out) |o| {
+        const n = @min(cap, faces.len);
+        const flat: [*]const f32 = @ptrCast(faces.ptr);
+        @memcpy(o[0 .. n * 15], flat[0 .. n * 15]);
+    }
+    return 0;
 }
 
 comptime {

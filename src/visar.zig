@@ -11,6 +11,7 @@ pub const codecs = @import("codecs/codecs.zig");
 pub const video = @import("video/video.zig");
 pub const videoio = @import("videoio/videoio.zig");
 pub const ui = @import("ui/ui.zig");
+pub const dnn = @import("dnn/dnn.zig");
 
 pub const Image = core.Image;
 pub const AnyImage = core.AnyImage;
@@ -26,4 +27,5 @@ test {
     _ = video;
     _ = videoio;
     _ = ui;
+    _ = dnn;
 }
