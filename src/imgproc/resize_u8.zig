@@ -176,39 +176,48 @@ pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allo
 /// (s0 w0 + s1 w1) >> 4 = 128 s0 + floor((s1 - s0) w1 / 16), one sqdmulh
 /// per 8 samples (hrowSumNeon). Null when the row does not qualify.
 fn sumGroups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allocator.Error!?[]Group {
+    return switch (cn) {
+        inline 1, 2, 3, 4 => |c| sumGroupsN(c, gpa, xt, rowlen),
+        else => null,
+    };
+}
+
+fn sumGroupsN(comptime cn: usize, gpa: Allocator, xt: []const Tap(2), rowlen: usize) Allocator.Error!?[]Group {
     for (xt) |t| if (t.w[0] + t.w[1] != coef_scale or t.w[1] >= coef_scale or t.w[1] < 0) return null;
     const ng = xt.len * cn / 16;
     if (ng == 0) return null;
-    const Span = struct {
-        fn of(x: []const Tap(2), c: usize, gi: usize) [2]usize {
-            var lo: usize = std.math.maxInt(usize);
-            var hi: usize = 0;
-            for (gi * 16..gi * 16 + 16) |i| {
-                const t = x[i / c];
-                lo = @min(lo, t.o[0] + i % c);
-                hi = @max(hi, t.o[1] + i % c + 1);
-            }
-            return .{ lo, hi - lo };
-        }
-    };
+    const g = try gpa.alloc(Group, ng);
+    // Pass 1: each group's window start and span.
     var bad: usize = 0;
     var win: usize = 16;
-    for (0..ng) |gi| {
-        const span = Span.of(xt, cn, gi)[1];
-        if (span > 64) bad += 1 else win = @max(win, @as(usize, if (span <= 16) 16 else if (span <= 32) 32 else 64));
-    }
-    if (bad * 16 > ng) return null;
-    const g = try gpa.alloc(Group, ng);
     for (g, 0..) |*gr, gi| {
-        const base = Span.of(xt, cn, gi)[0];
+        var lo: usize = std.math.maxInt(usize);
+        var hi: usize = 0;
+        inline for (0..16) |l| {
+            const t = xt[(gi * 16 + l) / cn];
+            const ch = (gi * 16 + l) % cn;
+            lo = @min(lo, t.o[0] + ch);
+            hi = @max(hi, t.o[1] + ch + 1);
+        }
+        const span = hi - lo;
+        if (span > 64) bad += 1 else win = @max(win, @as(usize, if (span <= 16) 16 else if (span <= 32) 32 else 64));
+        gr.base = @intCast(lo);
+    }
+    if (bad * 16 > ng) {
+        gpa.free(g);
+        return null;
+    }
+    // Pass 2: indices and weights.
+    for (g, 0..) |*gr, gi| {
+        const base: usize = gr.base;
         gr.* = .{ .idx = @splat(0xff), .w = @splat(0), .base = @intCast(base), .n = 0, .win = @intCast(win), .ok = base + win <= rowlen, .sum = true };
-        for (0..16) |l| {
-            const i = gi * 16 + l;
-            const t = xt[i / cn];
+        inline for (0..16) |l| {
+            const t = xt[(gi * 16 + l) / cn];
+            const ch = (gi * 16 + l) % cn;
             // Lane l of the 16-bit tap vectors takes its sample as the high
             // byte (s << 8); index 0xff (out of range) zeroes the low byte.
-            for (0..2) |tap| {
-                const off = t.o[tap] + i % cn - base;
+            inline for (0..2) |tap| {
+                const off = t.o[tap] + ch - base;
                 if (off >= win) gr.ok = false else gr.idx[tap * 32 + 2 * l + 1] = @intCast(off);
             }
             gr.w[l] = @intCast(t.w[1] << 4);
