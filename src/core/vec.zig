@@ -15,13 +15,17 @@ const neon = struct {
     extern fn @"llvm.aarch64.neon.st2.v16i8.p0"(V16, V16, [*]u8) void;
     extern fn @"llvm.aarch64.neon.st3.v16i8.p0"(V16, V16, V16, [*]u8) void;
     extern fn @"llvm.aarch64.neon.st4.v16i8.p0"(V16, V16, V16, V16, [*]u8) void;
+    extern fn @"llvm.aarch64.neon.tbl1.v16i8"(V16, V16) V16;
     extern fn @"llvm.aarch64.neon.tbl2.v16i8"(V16, V16, V16) V16;
     extern fn @"llvm.aarch64.neon.tbl3.v16i8"(V16, V16, V16, V16) V16;
-    inline fn tbl2(a: V16, b: V16, i: V16) V16 {
-        return @"llvm.aarch64.neon.tbl2.v16i8"(a, b, i);
-    }
-    inline fn tbl3(a: V16, b: V16, c: V16, i: V16) V16 {
-        return @"llvm.aarch64.neon.tbl3.v16i8"(a, b, c, i);
+    /// tbl over `k` consecutive registers of `t` starting at `lo`.
+    inline fn tbl(comptime lo: usize, comptime k: usize, t: anytype, i: V16) V16 {
+        return switch (k) {
+            1 => @"llvm.aarch64.neon.tbl1.v16i8"(t[lo], i),
+            2 => @"llvm.aarch64.neon.tbl2.v16i8"(t[lo], t[lo + 1], i),
+            3 => @"llvm.aarch64.neon.tbl3.v16i8"(t[lo], t[lo + 1], t[lo + 2], i),
+            else => @compileError("tbl of 1-3 registers"),
+        };
     }
     inline fn st2(a: V16, b: V16, p: [*]u8) void {
         @"llvm.aarch64.neon.st2.v16i8.p0"(a, b, p);
@@ -278,39 +282,61 @@ pub inline fn remap(comptime scn: usize, comptime dcn: usize, comptime map: [dcn
 /// step uses, so the loop stops while a full 16 bytes still fit on both
 /// sides. Returns the number of pixels done; the caller finishes the rest.
 pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map: [dcn]?u8, fill: u8, s: [*]const u8, d: [*]u8, n: usize) usize {
-    if (comptime is_arm and simd.llvm_intrinsics and scn == 3 and dcn == 3) {
-        // AArch64 3 -> 3 (BGR <-> RGB): each 16-byte output block is one
-        // multi-register tbl over the two or three input blocks it draws
-        // from, with plain loads and stores. The indices go through
-        // opaqueV, or LLVM folds the tbl back into a shuffle and
-        // scalarises it.
-        const idx = comptime blk: {
-            var m: [3]V16 = undefined;
-            for (0..3) |b| {
-                const first = if (b == 2) 1 else 0;
-                var v: [16]u8 = undefined;
+    if (comptime is_arm and simd.llvm_intrinsics and scn == 3) {
+        // AArch64, 3 channels in (BGR <-> RGB, alpha add): each 16-byte
+        // output block is one tbl over the one to three consecutive input
+        // blocks it draws from, plus an orr for a filled channel (out of
+        // range tbl indices give 0), with plain loads and stores. The
+        // indices go through opaqueV, or LLVM folds the tbl back into a
+        // shuffle and scalarises it.
+        const plan = comptime blk: {
+            var lo: [dcn]usize = undefined;
+            var k: [dcn]usize = undefined;
+            var idx: [dcn][16]u8 = undefined;
+            var fmask: [dcn][16]bool = undefined;
+            for (0..dcn) |b| {
+                var mn: usize = 48;
+                var mx: usize = 0;
                 for (0..16) |t| {
                     const g = 16 * b + t;
-                    v[t] = @intCast(3 * (g / 3) + map[g % 3].? - 16 * first);
+                    if (map[g % dcn]) |c| {
+                        const src = 3 * (g / dcn) + c;
+                        mn = @min(mn, src);
+                        mx = @max(mx, src);
+                    }
                 }
-                m[b] = v;
+                lo[b] = mn / 16;
+                k[b] = mx / 16 - mn / 16 + 1;
+                for (0..16) |t| {
+                    const g = 16 * b + t;
+                    fmask[b][t] = map[g % dcn] == null;
+                    idx[b][t] = if (map[g % dcn]) |c| 3 * (g / dcn) + c - 16 * lo[b] else 0xff;
+                }
             }
-            break :blk m;
+            break :blk .{ .lo = lo, .k = k, .idx = idx, .fmask = fmask };
         };
-        const k0 = opaqueV(idx[0]);
-        const k1 = opaqueV(idx[1]);
-        const k2 = opaqueV(idx[2]);
+        var keys: [dcn]V16 = undefined;
+        var fills: [dcn]V16 = undefined;
+        inline for (0..dcn) |b| {
+            keys[b] = opaqueV(plan.idx[b]);
+            fills[b] = @select(u8, @as(@Vector(16, bool), plan.fmask[b]), @as(V16, @splat(fill)), @as(V16, @splat(0)));
+        }
+        const any_fill = comptime blk: {
+            for (map) |m| if (m == null) break :blk true;
+            break :blk false;
+        };
         var x: usize = 0;
         while (x + 16 <= n) : (x += 16) {
-            const b0: V16 = s[x * 3 ..][0..16].*;
-            const b1: V16 = s[x * 3 + 16 ..][0..16].*;
-            const b2: V16 = s[x * 3 + 32 ..][0..16].*;
-            d[x * 3 ..][0..16].* = neon.tbl2(b0, b1, k0);
-            d[x * 3 + 16 ..][0..16].* = neon.tbl3(b0, b1, b2, k1);
-            d[x * 3 + 32 ..][0..16].* = neon.tbl2(b1, b2, k2);
+            var in: [3]V16 = undefined;
+            inline for (0..3) |b| in[b] = s[x * 3 + 16 * b ..][0..16].*;
+            inline for (0..dcn) |b| {
+                const v = neon.tbl(plan.lo[b], plan.k[b], in, keys[b]);
+                d[x * dcn + 16 * b ..][0..16].* = if (any_fill) v | fills[b] else v;
+            }
         }
         return x;
     }
+
     // AArch64: ldN + stN do the whole reorder in two instructions per 16
     // pixels (measured faster than single-register tbl groups for BGR <->
     // RGB on Apple cores), two blocks per iteration.
