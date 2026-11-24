@@ -97,6 +97,67 @@ def run(name, fn, tol=0.0, pct=100.0):
         results.append((name, "ERROR", str(e), False))
 
 
+def _spiral(h, w, step=4):
+    """A one-pixel square spiral: a single path that crosses every band."""
+    pts = []
+    x0, y0, x1, y1 = 0, 0, w - 1, h - 1
+    while x0 < x1 and y0 < y1:
+        pts += [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0 + step)]
+        x0, y0, x1, y1 = x0 + step, y0 + step, x1 - step, y1 - step
+    m = np.zeros((h, w), np.uint8)
+    cv2.polylines(m, [np.array(pts, np.int32)], False, 255, 1, cv2.LINE_4)
+    return m
+
+
+def connected_components_cases():
+    """Labels, stats and centroids on shapes that stress the banded
+    (multi-threaded) labelling: many bands, components spanning many bands,
+    boundaries on odd and even rows, and degenerate sizes."""
+    lrng = np.random.default_rng(99)
+    yy, xx = np.mgrid[0:997, 0:211]
+    masks = [
+        ("tall random", (lrng.random((1500, 37)) > 0.5).astype(np.uint8) * 255),
+        ("tall sparse", (lrng.random((2001, 64)) > 0.93).astype(np.uint8) * 255),
+        ("checkerboard", (((xx + yy) % 2) * 255).astype(np.uint8)),
+        ("checker 2x2", ((((xx // 2) + (yy // 2)) % 2) * 255).astype(np.uint8)),
+        ("vertical stripes", ((xx % 4 == 0) * 255).astype(np.uint8)),
+        ("diagonals", ((((xx + yy) % 9 == 0) | ((xx - yy) % 13 == 0)) * 255).astype(np.uint8)),
+        ("spiral", _spiral(803, 611)),
+        ("comb", np.where((yy % 64 == 63) | (xx % 6 == 0), 255, 0).astype(np.uint8)),
+        ("one row", (lrng.random((1, 777)) > 0.5).astype(np.uint8) * 255),
+        ("one col", (lrng.random((777, 1)) > 0.5).astype(np.uint8) * 255),
+        ("all zero", np.zeros((300, 200), np.uint8)),
+        ("all one", np.full((300, 200), 255, np.uint8)),
+        ("single pixel", np.full((1, 1), 7, np.uint8)),
+        ("blobs", None),
+    ]
+    from_bench = None
+    for threads in (1, 3, 4, 8):
+        vs.set_num_threads(threads)
+        for nm, m in masks:
+            if m is None:
+                if from_bench is None:
+                    from_bench = np.zeros((720, 1280), np.uint8)
+                    for _ in range(1200):
+                        cx, cy, r = int(lrng.integers(0, 1280)), int(lrng.integers(0, 720)), int(lrng.integers(2, 20))
+                        cv2.circle(from_bench, (cx, cy), r, 255, -1 if lrng.random() < 0.7 else 2)
+                m = from_bench
+            for conn in (4, 8):
+                def cc():
+                    n, lab, st, ce = vs.connected_components_with_stats(m, conn)
+                    rn, rlab, rst, rce = cv2.connectedComponentsWithStats(m, connectivity=conn)
+                    if n != rn:
+                        return np.array([n]), np.array([rn])
+                    return (np.concatenate([lab.ravel(), st.ravel()]).astype(np.float64),
+                            np.concatenate([rlab.ravel(), rst.ravel()]).astype(np.float64))
+                tag = f"{nm} {m.shape[1]}x{m.shape[0]} conn{conn} {threads}T"
+                run(f"connectedComponents {tag}", cc)
+                run(f"connectedComponents centroids {tag}",
+                    lambda: (np.nan_to_num(vs.connected_components_with_stats(m, conn)[3], nan=-7),
+                             np.nan_to_num(cv2.connectedComponentsWithStats(m, connectivity=conn)[3], nan=-7)), 1e-9)
+    vs.set_num_threads(0)
+
+
 def main():
     vs.set_num_threads(0)
     print(f"VISAR {vs.version()} ({vs.lib.visar_build_info().decode()}) vs OpenCV {cv2.__version__}, custom HAL: {HAL}")
@@ -210,6 +271,8 @@ def main():
         run(f"addWeighted u8 {tag}", lambda: (vs.add_weighted(bgr, 0.3, other, 0.7, 5), cv2.addWeighted(bgr, 0.3, other, 0.7, 5)))
         run(f"convertTo u8->f32 {tag}", lambda: (vs.convert_to(bgr, np.float32, 1 / 255.0), bgr.astype(np.float32) * np.float32(1 / 255.0)), 1e-6)
         run(f"convertTo f32->u8 {tag}", lambda: (vs.convert_to(f, np.uint8, 255.0), (f * 255.0).round().clip(0, 255).astype(np.uint8)), 1)
+
+    connected_components_cases()
 
     # --- codecs (decode files written by OpenCV; OpenCV decodes ours)
     img = natural(97, 131, 3)

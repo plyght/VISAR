@@ -543,7 +543,7 @@ pub const Detector = struct {
         try ip.morphologyEx(exec, gpa, self.mask, self.mask2, .open, el3, 1);
         try ip.dilate(exec, gpa, self.mask2, self.mask, eld, 1);
         const t_morph = clock.lap();
-        var cc = try ip.connectedComponentsWithStats(gpa, self.mask, self.labels, .eight);
+        var cc = try ip.connectedComponentsWithStats(exec, gpa, self.mask, self.labels, .eight);
         defer cc.deinit(gpa);
         self.boxes.clearRetainingCapacity();
         for (cc.stats[1..]) |st| {

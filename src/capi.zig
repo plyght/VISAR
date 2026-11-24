@@ -405,7 +405,7 @@ export fn visar_connected_components(src: *const CImage, labels: *const CImage, 
     const s = typed(u8, src) catch |e| return fail(e);
     const l = typed(i32, labels) catch |e| return fail(e);
     const conn: ip.components.Connectivity = if (connectivity == 4) .four else .eight;
-    var r = ip.connectedComponentsWithStats(gpa, s, l, conn) catch |e| return fail(e);
+    var r = ip.connectedComponentsWithStats(exec(), gpa, s, l, conn) catch |e| return fail(e);
     defer r.deinit(gpa);
     count.* = r.count;
     for (r.stats[0..@min(max, r.stats.len)], 0..) |st, i| {
