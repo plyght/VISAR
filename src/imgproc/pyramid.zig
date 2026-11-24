@@ -132,29 +132,32 @@ fn downChunk(comptime T: type, comptime ccn: usize, s: Image(T), d: Image(T), bo
 /// pixel parity into an even-pixel and an odd-pixel row, both still
 /// channel-interleaved: then every horizontal tap of an output element is a
 /// plain contiguous load at offset 0, cn or 2cn, and the output is stored
-/// as is. The sums and their order are those of the scalar formula.
+/// as is. Two output rows go together where possible, sharing the three
+/// source rows they overlap on. The sums and their order are those of the
+/// scalar formula.
 fn downChunkParityF(comptime cn: usize, s: Image(f32), d: Image(f32), border: Border, gpa: Allocator, y0: usize, y1: usize) Allocator.Error!void {
+    const dw: usize = d.width;
+    const NV = comptime lanes(f32);
+    // er[q] is padded pixel 2q, or[q] padded pixel 2q + 1 (padded pixel p is
+    // source pixel p - 2), cn samples each; one pair per output row.
+    const rlen = (dw + 3) * cn + NV;
+    const buf = try gpa.alloc(f32, 4 * rlen);
+    defer gpa.free(buf);
+    @memset(buf, 0);
+    var y = y0;
+    while (y + 2 <= y1) : (y += 2) downRowsF(cn, 2, s, d, border, buf, rlen, y);
+    if (y < y1) downRowsF(cn, 1, s, d, border, buf, rlen, y);
+}
+
+/// Output rows y .. y + R of downChunkParityF.
+inline fn downRowsF(comptime cn: usize, comptime R: usize, s: Image(f32), d: Image(f32), border: Border, buf: []f32, rlen: usize, y: usize) void {
     const w: usize = s.width;
     const dw: usize = d.width;
-    // Pixels per split step; the sums of 2P pixels are split at a time.
-    const P = 16;
+    // Pixels per split step: the sums of 2P pixels are split at a time.
+    const P = if (@import("builtin").cpu.arch == .aarch64) 8 else 16;
     const L = 2 * P * cn;
     const VL = @Vector(L, f32);
     const NV = comptime lanes(f32);
-    // er[q] is padded pixel 2q, or[q] padded pixel 2q + 1 (padded pixel p is
-    // source pixel p - 2), cn samples each.
-    const rlen = (dw + 3) * cn + NV;
-    const buf = try gpa.alloc(f32, 2 * rlen);
-    defer gpa.free(buf);
-    @memset(buf, 0);
-    const er = buf[0..rlen];
-    const orr = buf[rlen..][0..rlen];
-    var lmap: [2]usize = undefined;
-    var rmap: [2]usize = undefined;
-    for (0..2) |i| {
-        lmap[i] = border_mod.map(@as(isize, @intCast(i)) - 2, w, border).?;
-        rmap[i] = border_mod.map(@intCast(w + i), w, border).?;
-    }
     const pick = comptime blk: {
         var m: [2][P * cn]i32 = undefined;
         for (0..2) |par| for (0..P * cn) |i| {
@@ -167,52 +170,71 @@ fn downChunkParityF(comptime cn: usize, s: Image(f32), d: Image(f32), border: Bo
             return (if (p % 2 == 0) e else o)[(p / 2) * cn ..][0..cn];
         }
     };
+    var er: [R][]f32 = undefined;
+    var orr: [R][]f32 = undefined;
+    var out: [R][]f32 = undefined;
+    inline for (0..R) |r| {
+        er[r] = buf[2 * r * rlen ..][0..rlen];
+        orr[r] = buf[(2 * r + 1) * rlen ..][0..rlen];
+        out[r] = d.row(y + r);
+    }
+    // Source rows 2y - 2 .. 2y + 2R.
+    var rows: [3 + 2 * R][*]const f32 = undefined;
+    for (0..3 + 2 * R) |k| {
+        const sy = border_mod.map(@as(isize, @intCast(2 * y + k)) - 2, s.height, border).?;
+        rows[k] = s.row(sy).ptr;
+    }
     const n_out = dw * cn;
-    for (y0..y1) |y| {
-        var rows: [5][*]const f32 = undefined;
-        for (0..5) |k| {
-            const sy = border_mod.map(@as(isize, @intCast(2 * y + k)) - 2, s.height, border).?;
-            rows[k] = s.row(sy).ptr;
-        }
-        const out = d.row(y);
-        // Source pixel x + i is padded pixel x + 2 + i: with x even, even i
-        // go to er[(x / 2 + 1 + i / 2) * cn ..]. The horizontal pass trails
-        // the vertical one block by block, so it overlaps the row loads.
-        // Output pixel ox takes padded pixels 2ox .. 2ox + 4: er[ox],
-        // or[ox], er[ox + 1], or[ox + 1], er[ox + 2]. Output 0 waits for
-        // the left border.
-        var j: usize = cn;
-        var x: usize = 0;
-        while (x + 2 * P <= w) : (x += 2 * P) {
-            const o = x * cn;
-            const a: VL = rows[0][o..][0..L].*;
-            const b: VL = rows[1][o..][0..L].*;
-            const c: VL = rows[2][o..][0..L].*;
-            const e: VL = rows[3][o..][0..L].*;
-            const f: VL = rows[4][o..][0..L].*;
+    // Source pixel x + i is padded pixel x + 2 + i: with x even, even i go
+    // to er[(x / 2 + 1 + i / 2) * cn ..]. The horizontal pass trails the
+    // vertical one block by block, so it overlaps the row loads. Output
+    // pixel ox takes padded pixels 2ox .. 2ox + 4: er[ox], or[ox],
+    // er[ox + 1], or[ox + 1], er[ox + 2]. Output 0 waits for the left
+    // border.
+    var j: usize = cn;
+    var x: usize = 0;
+    while (x + 2 * P <= w) : (x += 2 * P) {
+        const o = x * cn;
+        var v: [3 + 2 * R]VL = undefined;
+        inline for (0..3 + 2 * R) |k| v[k] = rows[k][o..][0..L].*;
+        const q = (x / 2 + 1) * cn;
+        inline for (0..R) |r| {
+            const a = v[2 * r];
+            const b = v[2 * r + 1];
+            const c = v[2 * r + 2];
+            const e = v[2 * r + 3];
+            const f = v[2 * r + 4];
             const sum = (a + f) + (b + e) * @as(VL, @splat(4)) + c * @as(VL, @splat(6));
-            const q = (x / 2 + 1) * cn;
-            er[q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[0]);
-            orr[q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[1]);
-            // Padded pixels below x + 2 + 2P are summed: outputs below
-            // x / 2 + P - 1 are ready.
-            const ready = @min(n_out, (x / 2 + P - 1) * cn);
-            while (j + NV <= ready) : (j += NV) hstep(cn, NV, er, orr, out, j);
+            er[r][q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[0]);
+            orr[r][q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[1]);
         }
-        while (x < w) : (x += 1) {
-            const dst = Px.at(er, orr, x + 2);
+        // Padded pixels below x + 2 + 2P are summed: outputs below
+        // x / 2 + P - 1 are ready.
+        const ready = @min(n_out, (x / 2 + P - 1) * cn);
+        while (j + NV <= ready) : (j += NV) {
+            inline for (0..R) |r| hstep(cn, NV, er[r], orr[r], out[r], j);
+        }
+    }
+    const lmap = [2]usize{ border_mod.map(-2, w, border).?, border_mod.map(-1, w, border).? };
+    const rmap = [2]usize{ border_mod.map(@intCast(w), w, border).?, border_mod.map(@intCast(w + 1), w, border).? };
+    inline for (0..R) |r| {
+        var xt = x;
+        while (xt < w) : (xt += 1) {
+            const dst = Px.at(er[r], orr[r], xt + 2);
             inline for (0..cn) |ch| {
-                const i = x * cn + ch;
-                dst[ch] = (rows[0][i] + rows[4][i]) + (rows[1][i] + rows[3][i]) * 4 + rows[2][i] * 6;
+                const i = xt * cn + ch;
+                const rr = rows[2 * r ..];
+                dst[ch] = (rr[0][i] + rr[4][i]) + (rr[1][i] + rr[3][i]) * 4 + rr[2][i] * 6;
             }
         }
         for (0..2) |i| {
-            @memcpy(Px.at(er, orr, i), Px.at(er, orr, lmap[i] + 2));
-            @memcpy(Px.at(er, orr, w + 2 + i), Px.at(er, orr, rmap[i] + 2));
+            @memcpy(Px.at(er[r], orr[r], i), Px.at(er[r], orr[r], lmap[i] + 2));
+            @memcpy(Px.at(er[r], orr[r], w + 2 + i), Px.at(er[r], orr[r], rmap[i] + 2));
         }
-        while (j + NV <= n_out) : (j += NV) hstep(cn, NV, er, orr, out, j);
-        while (j < n_out) : (j += 1) hscalar(cn, er, orr, out, j);
-        for (0..cn) |i| hscalar(cn, er, orr, out, i);
+        var jt = j;
+        while (jt + NV <= n_out) : (jt += NV) hstep(cn, NV, er[r], orr[r], out[r], jt);
+        while (jt < n_out) : (jt += 1) hscalar(cn, er[r], orr[r], out[r], jt);
+        for (0..cn) |i| hscalar(cn, er[r], orr[r], out[r], i);
     }
 }
 
