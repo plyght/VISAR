@@ -46,8 +46,17 @@ jobs:
             (cd "../src-$tag" && zig build -Doptimize=ReleaseFast --prefix "$GITHUB_WORKSPACE/../out-$tag")
           done
       - name: Time
+        if: inputs.base != inputs.head
         run: |
           ext=so; [ "$RUNNER_OS" = macOS ] && ext=dylib
           python3 bench/ab.py "../out-A/lib/libvisar.$ext" "../out-B/lib/libvisar.$ext" \
             --filter "${{ inputs.filter }}" --threads "${{ inputs.threads }}" --md ab.md
           { echo "### A = \`${{ inputs.base }}\`, B = \`${{ inputs.head }}\` on ${{ inputs.runner }}"; echo; cat ab.md; } >> "$GITHUB_STEP_SUMMARY"
+      # base == head: time VISAR alone at 1 and N threads (one library copy,
+      # no OpenCV calls in between), to see thread scaling undisturbed.
+      - name: Solo thread scaling
+        if: inputs.base == inputs.head
+        run: |
+          ext=so; [ "$RUNNER_OS" = macOS ] && ext=dylib
+          python3 bench/solo.py "../out-A/lib/libvisar.$ext" --filter "${{ inputs.filter }}" --threads "${{ inputs.threads }}" --md solo.md
+          { echo "### \`${{ inputs.base }}\` alone on ${{ inputs.runner }}"; echo; cat solo.md; } >> "$GITHUB_STEP_SUMMARY"
