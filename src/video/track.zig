@@ -56,11 +56,16 @@ pub const Background = struct {
                         const fg = diff > @as(@Vector(N, u32), @splat(c.t));
                         m[x..][0..N].* = @select(u8, fg, @as(@Vector(N, u8), @splat(255)), @as(@Vector(N, u8), @splat(0)));
                         // b += (f*256 - b) >> shift (slower under the mask)
-                        const sh_fg: @Vector(N, i32) = @splat(@as(i32, c.sh) + 2);
-                        const sh_bg: @Vector(N, i32) = @splat(@as(i32, c.sh));
+                        // Two uniform shifts and a select, and a bit-exact
+                        // truncate (the sum is in 0..65535): LLVM miscompiles
+                        // per-lane variable shifts and signed->u16 narrowing
+                        // without AVX-512.
+                        const sh_bg: u5 = c.sh;
+                        const sh_fg: u5 = @as(u5, c.sh) + 2;
                         const delta = (fv << @splat(8)) - bv;
-                        const step = delta >> @intCast(@select(i32, fg, sh_fg, sh_bg));
-                        b[x..][0..N].* = @as(@Vector(N, u16), @intCast(bv + step));
+                        const step = @select(i32, fg, delta >> @splat(sh_fg), delta >> @splat(sh_bg));
+                        const nb: @Vector(N, u32) = @bitCast(bv + step);
+                        b[x..][0..N].* = @as(@Vector(N, u16), @truncate(nb));
                     }
                     while (x < f.len) : (x += 1) {
                         const fv: i32 = f[x];
