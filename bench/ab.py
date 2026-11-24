@@ -48,6 +48,15 @@ def main():
         fb, fc = cb.get(name, (None, None))
         if fb is None or (keys and not any(k in name.lower() for k in keys)):
             continue
+        # Run A on B's arrays (the case closures look `vs` up at call time),
+        # so all three sides share inputs and outputs and cache state.
+        def fa(fb=fb):
+            saved = B.vs
+            B.vs = A.vs
+            try:
+                fb()
+            finally:
+                B.vs = saved
         ta = tb = tc = float("inf")
         t0 = time.perf_counter()
         n = 0
