@@ -404,7 +404,8 @@ inline fn grayRow(comptime T: type, comptime inf: Code.Info, s: [*]const T, d: [
 
 // OpenCV's RGB2HSV_b tables (hsv_shift = 12, hrange = 180).
 const hsv_shift = 12;
-const hsv_tables = blk: {
+const HsvTables = struct { sdiv: [256]i32, hdiv: [256]i32 };
+const hsv_tables: HsvTables = blk: {
     @setEvalBranchQuota(20000);
     var sdiv: [256]i32 = undefined;
     var hdiv: [256]i32 = undefined;
@@ -414,7 +415,7 @@ const hsv_tables = blk: {
         sdiv[i] = @intFromFloat(@round(@as(f64, 255 << hsv_shift) / @as(f64, @floatFromInt(i))));
         hdiv[i] = @intFromFloat(@round(@as(f64, 180 << hsv_shift) / (6.0 * @as(f64, @floatFromInt(i)))));
     }
-    break :blk .{ .sdiv = sdiv, .hdiv = hdiv };
+    break :blk HsvTables{ .sdiv = sdiv, .hdiv = hdiv };
 };
 
 /// Both table entries (sdiv[v] and hdiv[diff]) from one f32 reciprocal of

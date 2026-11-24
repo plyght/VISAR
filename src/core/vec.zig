@@ -8,7 +8,7 @@ const simd = @import("simd.zig");
 
 pub const V16 = @Vector(16, u8);
 
-pub const is_arm = builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .aarch64_be;
+pub const is_arm = builtin.cpu.arch == .aarch64;
 
 /// LLVM's NEON structured-store intrinsics (aarch64, LLVM backend only).
 const neon = struct {
@@ -40,7 +40,7 @@ pub inline fn opaqueV(v: V16) V16 {
             : [ret] "=x" (-> V16),
             : [v] "0" (v),
         ),
-        .aarch64, .aarch64_be => asm (""
+        .aarch64 => asm (""
             : [ret] "=w" (-> V16),
             : [v] "0" (v),
         ),

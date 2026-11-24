@@ -10,7 +10,7 @@ const ir = @import("../ir.zig");
 const x86 = builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86;
 const avx512 = x86 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f);
 const avx = x86 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx);
-pub const neon = builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .aarch64_be;
+pub const neon = builtin.cpu.arch == .aarch64;
 
 /// Channels per block of the blocked layout = f32 lanes of one register.
 pub const B: usize = if (avx512) 16 else if (avx) 8 else 4;
@@ -19,7 +19,7 @@ pub const V = @Vector(B, f32);
 /// Whether the target fuses multiply-add in hardware (without it `@mulAdd`
 /// becomes a libm call per lane).
 pub const has_fma = if (x86) std.Target.x86.featureSetHas(builtin.cpu.features, .fma) else switch (builtin.cpu.arch) {
-    .aarch64, .aarch64_be => true,
+    .aarch64 => true,
     else => false,
 };
 
