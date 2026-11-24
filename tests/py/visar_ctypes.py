@@ -183,9 +183,10 @@ def calc_optical_flow_pyr_lk(prev, nxt, prev_pts, next_pts=None, win_size=(21, 2
     return npts, st, err
 
 
-lib.visar_mosse_free.argtypes = [ctypes.c_void_p]
-lib.visar_background_free.argtypes = [ctypes.c_void_p]
-lib.visar_tracker_free.argtypes = [ctypes.c_void_p]
+# Older libraries (e.g. an A/B baseline) may predate these.
+for _fn in ("visar_mosse_free", "visar_background_free", "visar_tracker_free"):
+    if hasattr(lib, _fn):
+        getattr(lib, _fn).argtypes = [ctypes.c_void_p]
 
 
 class Mosse:
