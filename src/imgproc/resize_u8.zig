@@ -211,25 +211,35 @@ inline fn maddwd(a: @Vector(32, i16), b: @Vector(32, i16)) @Vector(16, i32) {
     );
 }
 
+/// NEON bilinear group over R rows sharing the group's indices and
+/// weights. (s0 w0 + s1 w1) >> 4 with w = 16 hi + lo (weights are
+/// 0..2048) is s0 hi0 + s1 hi1 + ((s0 lo0 + s1 lo1) >> 4), all in u16
+/// (umull, umlal, usra); the result is below 2^15, so it is the same i16.
+inline fn hrowGroupNeon(comptime R: usize, comptime W: usize, s: [R][]const u8, out: [R][]i16, g: *const Group) void {
+    const U = @Vector(16, u16);
+    const ix0: neon.V = g.idx[0..16].*;
+    const ix1: neon.V = g.idx[16..32].*;
+    const wb: *const [64]u8 = @ptrCast(&g.w);
+    const h0: U = @as(@Vector(16, u8), wb[0..16].*);
+    const h1: U = @as(@Vector(16, u8), wb[16..32].*);
+    const l0: U = @as(@Vector(16, u8), wb[32..48].*);
+    const l1: U = @as(@Vector(16, u8), wb[48..64].*);
+    inline for (0..R) |r| {
+        const w = s[r][g.base..][0..W];
+        var t: [W / 16]neon.V = undefined;
+        inline for (0..W / 16) |k| t[k] = w[k * 16 ..][0..16].*;
+        const s0: U = neon.tbl(W / 16, t, ix0);
+        const s1: U = neon.tbl(W / 16, t, ix1);
+        const hi = s0 * h0 + s1 * h1;
+        const lo = s0 * l0 + s1 * l1;
+        out[r][0..16].* = @bitCast(hi + (lo >> @splat(4)));
+    }
+}
+
 /// Bilinear horizontal pass for one group: 16 samples (some unused) are
 /// written, so `out` needs room past the group's own samples.
 inline fn hrowGroup(comptime W: usize, s: []const u8, out: []i16, g: Group) void {
-    if (comptime planar) {
-        const w = s[g.base..][0..W];
-        var t: [W / 16]neon.V = undefined;
-        inline for (0..W / 16) |k| t[k] = w[k * 16 ..][0..16].*;
-        // (s0 w0 + s1 w1) >> 4 with w = 16 hi + lo (weights are 0..2048):
-        // s0 hi0 + s1 hi1 + ((s0 lo0 + s1 lo1) >> 4), all in u16 (umull,
-        // umlal, usra). The result is below 2^15, so it is the same i16.
-        const U = @Vector(16, u16);
-        const s0: U = neon.tbl(W / 16, t, g.idx[0..16].*);
-        const s1: U = neon.tbl(W / 16, t, g.idx[16..32].*);
-        const wb: *const [64]u8 = @ptrCast(&g.w);
-        const hi = s0 * @as(U, wb[0..16].*) + s1 * @as(U, wb[16..32].*);
-        const lo = s0 * @as(U, wb[32..48].*) + s1 * @as(U, wb[48..64].*);
-        out[0..16].* = @bitCast(hi + (lo >> @splat(4)));
-        return;
-    }
+    if (comptime planar) return hrowGroupNeon(1, W, .{s}, .{out}, &g);
     if (comptime avx2_shuf) {
         const w = s[g.base..][0..W];
         var bytes: avx2.B = @splat(0);
@@ -382,6 +392,12 @@ fn rows(comptime K: usize, comptime kind: Kind, comptime cn: usize, c: anytype, 
                 keep[b] = true;
             };
         }
+        if (K == 2 and kind == .linear and planar and c.gs.len > 0 and have[0] == null and have[1] == null and t.o[0] != t.o[1]) {
+            // Both rows are new: one pass over the groups for the two.
+            tag = .{ t.o[0], t.o[1] };
+            hrow2(cn, .{ c.s.row(t.o[0]), c.s.row(t.o[1]) }, .{ buf[0..stride], buf[stride..][0..stride] }, c.xt, c.gs);
+            have = .{ 0, 1 };
+        }
         for (0..K) |k| {
             if (have[k] == null) {
                 // Rows repeat at the edges: reuse one filled for an earlier tap.
@@ -430,6 +446,21 @@ fn hrow(comptime K: usize, comptime cn: usize, comptime E: type, s: []const u8, 
         return hrowPixels(K, cn, E, s, out, xt, gs.len * gn, xt.len);
     }
     hrowPixels(K, cn, E, s, out, xt, 0, xt.len);
+}
+
+/// Two rows of the NEON bilinear horizontal pass at once.
+fn hrow2(comptime cn: usize, s: [2][]const u8, out: [2][]i16, xt: []const Tap(2), gs: []const Group) void {
+    const gn: usize = gs[0].n;
+    const step = gn * cn;
+    switch (gs[0].win) {
+        inline 16, 32, 64 => |W| for (gs, 0..) |*g, k| {
+            if (g.ok) {
+                hrowGroupNeon(2, W, s, .{ out[0][k * step ..], out[1][k * step ..] }, g);
+            } else for (0..2) |r| hrowPixels(2, cn, i16, s[r], out[r], xt, k * gn, k * gn + gn);
+        },
+        else => unreachable,
+    }
+    for (0..2) |r| hrowPixels(2, cn, i16, s[r], out[r], xt, gs.len * gn, xt.len);
 }
 
 fn hrowPixels(comptime K: usize, comptime cn: usize, comptime E: type, s: []const u8, out: []E, xt: []const Tap(K), x0: usize, x1: usize) void {
