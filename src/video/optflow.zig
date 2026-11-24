@@ -2,17 +2,20 @@
 //! calcOpticalFlowPyrLK, following lkpyramid.cpp).
 //!
 //! OpenCV pads every pyramid level by one window (reflect101 for images,
-//! zeros for the Scharr derivatives) and differentiates whole levels;
-//! VISAR keeps the levels unpadded and builds each window's samples and
-//! 3x3 Scharr derivatives on demand, extrapolating exactly like that
-//! padding, so it reads the same values without the full-size buffers.
-//! Windows are sampled bilinearly with 14-bit fixed-point weights (the
-//! image patch kept at 5 fractional bits) on 16 elements per step with
-//! 16-bit multiply-adds. Sums of products are exact integers (OpenCV
-//! accumulates them in f32 in an order that depends on its SIMD path), so
-//! tracked positions agree with OpenCV's to about 1e-3 px, well inside the
-//! termination epsilon; a point whose iteration never converges can end
-//! anywhere along its chaotic path in either library.
+//! zeros for the Scharr derivatives) and differentiates whole levels.
+//! VISAR pads the levels it allocates (all but level 0, a view of the
+//! caller's image) the same way, and differentiates whole levels only
+//! where they are smaller than the windows together; elsewhere it builds
+//! each window's 3x3 Scharr derivatives on demand, extrapolating exactly
+//! like that padding, so it reads the same values without the full-size
+//! buffers. Windows are sampled bilinearly with 14-bit fixed-point weights
+//! (the image patch kept at 5 fractional bits) with 16-bit multiplies: 16
+//! elements per step paired for pmaddwd on x86, 8 per NEON register with
+//! widening multiply-accumulates on ARM. Sums of products are exact
+//! integers (OpenCV accumulates them in f32 in an order that depends on its
+//! SIMD path), so tracked positions agree with OpenCV's to about 1e-3 px,
+//! well inside the termination epsilon; a point whose iteration never
+//! converges can end anywhere along its chaotic path in either library.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -185,6 +188,10 @@ pub const FlowPyramid = struct {
             @memcpy((img.data - (pad - i) * img.stride - left)[0..full], (img.data + ty * img.stride - left)[0..full]);
             @memcpy((img.data + (h + i) * img.stride - left)[0..full], (img.data + by * img.stride - left)[0..full]);
         }
+    }
+
+    pub fn levelCount(self: FlowPyramid) usize {
+        return self.levels.len;
     }
 };
 
@@ -466,8 +473,8 @@ inline fn dot(a: VB, b: VB) V8 {
 }
 
 /// Products summed per i32 lane before the lanes are flushed to i64: each
-/// madd lane is below 2^27 (two 8160 * 4080 products), so 16 cannot
-/// overflow.
+/// step adds at most two 8160 * 4080 products (below 2^27) to a lane, so 16
+/// cannot overflow.
 const flush_every = 16;
 
 /// A window's source rows: straight from the image when the window (with
