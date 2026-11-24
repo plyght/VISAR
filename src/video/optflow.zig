@@ -199,6 +199,19 @@ pub fn calcOpticalFlowPyrLKPyr(exec: Exec, gpa: Allocator, prev: *const FlowPyra
     @memset(status, 1);
     if (prev_pts.len == 0) return;
     const eps = std.math.clamp(o.epsilon, 0, 10);
+    // Upper levels where the windows together cover more than the level
+    // get their derivatives once, like OpenCV, instead of per window.
+    var dv: [max_deriv_levels]?Deriv = @splat(null);
+    defer for (&dv) |*d| if (d.*) |*x| x.deinit(gpa);
+    {
+        const cn: usize = prev.levels[0].channels;
+        const win_elems = (std.math.divCeil(usize, @as(usize, o.win_width) * cn, B) catch unreachable) * B * (@as(usize, o.win_height) + 1);
+        for (1..@min(max_level + 1, max_deriv_levels)) |l| {
+            const lv = prev.levels[l];
+            if (prev.pad == 0 or lv.rowLen() < B or lv.rowLen() * lv.height * 2 > prev_pts.len * win_elems) continue;
+            dv[l] = try Deriv.init(exec, gpa, lv, prev.pad);
+        }
+    }
     const Ctx = struct {
         prev: *const FlowPyramid,
         next: *const FlowPyramid,
@@ -210,12 +223,13 @@ pub fn calcOpticalFlowPyrLKPyr(exec: Exec, gpa: Allocator, prev: *const FlowPyra
         max_level: usize,
         eps2: f64,
         gpa: Allocator,
+        dv: []const ?Deriv,
         fail: *?Allocator.Error,
     };
     var fail: ?Allocator.Error = null;
-    exec.parallelFor(prev_pts.len, 8, Ctx{ .prev = prev, .next = next, .pp = prev_pts, .np = next_pts, .st = status, .err = err, .o = o, .max_level = max_level, .eps2 = eps * eps, .gpa = gpa, .fail = &fail }, struct {
+    exec.parallelFor(prev_pts.len, 8, Ctx{ .prev = prev, .next = next, .pp = prev_pts, .np = next_pts, .st = status, .err = err, .o = o, .max_level = max_level, .eps2 = eps * eps, .gpa = gpa, .dv = &dv, .fail = &fail }, struct {
         fn run(c: Ctx, p0: usize, p1: usize) void {
-            trackChunk(c.prev, c.next, c.pp, c.np, c.st, c.err, c.o, c.max_level, c.eps2, c.gpa, p0, p1) catch |e| {
+            trackChunk(c.prev, c.next, c.pp, c.np, c.st, c.err, c.o, c.max_level, c.eps2, c.gpa, c.dv, p0, p1) catch |e| {
                 c.fail.* = e;
             };
         }
@@ -510,11 +524,18 @@ fn Patch(comptime T: type) type {
 /// ever read, so computing them per window gives the same values without
 /// full-size buffers.
 fn scharrPatch(m: Patch(u8), cn: usize, cols: usize, rows: usize, d: []i16) void {
+    scharrRows(m, cn, cols, rows, d.ptr, d.ptr + cols * rows, cols, d[2 * cols * rows ..]);
+}
+
+/// The Scharr derivatives of `rows` x `cols` elements (at least B per row)
+/// from `m` (one-pixel margin on every side) into rows `ostride` apart at
+/// `dx` and `dy`; `tmp` holds 2 * (cols + 2 * cn) elements.
+fn scharrRows(m: Patch(u8), cn: usize, cols: usize, rows: usize, dx: [*]i16, dy: [*]i16, ostride: usize, tmp: []i16) void {
     const M = B;
     const V = @Vector(M, i16);
     const mc = cols + 2 * cn;
     // Vertical sums of one row: smoothing in tv[0..mc], difference after.
-    const tv = d[2 * cols * rows ..][0 .. 2 * mc];
+    const tv = tmp[0 .. 2 * mc];
     for (0..rows) |r| {
         const a = m.ptr + r * m.stride;
         const b = a + m.stride;
@@ -532,8 +553,8 @@ fn scharrPatch(m: Patch(u8), cn: usize, cols: usize, rows: usize, d: []i16) void
             tv[mc + x ..][0..M].* = vc - va;
             if (x + M == mc) break;
         }
-        const ox = d[r * cols ..][0..cols];
-        const oy = d[cols * rows + r * cols ..][0..cols];
+        const ox = dx + r * ostride;
+        const oy = dy + r * ostride;
         x = 0;
         while (true) : (x += M) {
             if (x + M > cols) x = cols - M;
@@ -548,6 +569,74 @@ fn scharrPatch(m: Patch(u8), cn: usize, cols: usize, rows: usize, d: []i16) void
         }
     }
 }
+
+const max_deriv_levels = 8;
+
+/// Scharr derivatives of a whole (padded) pyramid level, as two planes
+/// with a zero frame of `pad` pixels (OpenCV's padded derivative buffer).
+const Deriv = struct {
+    buf: []i16,
+    stride: usize,
+    pad: usize,
+    plane: usize,
+    width: usize,
+    height: usize,
+    cn: usize,
+
+    fn init(exec: Exec, gpa: Allocator, img: Image(u8), pad: usize) Allocator.Error!Deriv {
+        const cn: usize = img.channels;
+        const w: usize = img.width;
+        const h: usize = img.height;
+        const stride = (w + 2 * pad) * cn;
+        const plane = stride * (h + 2 * pad);
+        const buf = try gpa.alloc(i16, 2 * plane);
+        errdefer gpa.free(buf);
+        const d: Deriv = .{ .buf = buf, .stride = stride, .pad = pad, .plane = plane, .width = w, .height = h, .cn = cn };
+        for (0..2) |k| {
+            const pl = buf[k * plane ..][0..plane];
+            @memset(pl[0 .. pad * stride], 0);
+            @memset(pl[(pad + h) * stride ..], 0);
+            for (pad..pad + h) |y| {
+                @memset(pl[y * stride ..][0 .. pad * cn], 0);
+                @memset(pl[y * stride + (pad + w) * cn ..][0 .. pad * cn], 0);
+            }
+        }
+        const Ctx = struct { d: Deriv, img: Image(u8), gpa: Allocator, fail: *?Allocator.Error };
+        var fail: ?Allocator.Error = null;
+        exec.parallelFor(h, 16, Ctx{ .d = d, .img = img, .gpa = gpa, .fail = &fail }, struct {
+            fn run(c: Ctx, y0: usize, y1: usize) void {
+                const n = c.img.rowLen();
+                const tmp = c.gpa.alloc(i16, 2 * (n + 2 * c.d.cn)) catch |e| {
+                    c.fail.* = e;
+                    return;
+                };
+                defer c.gpa.free(tmp);
+                const m: Patch(u8) = .{ .ptr = c.img.data + y0 * c.img.stride - c.img.stride - c.d.cn, .stride = c.img.stride };
+                scharrRows(m, c.d.cn, n, y1 - y0, c.d.at(0, 0, @intCast(y0)), c.d.at(1, 0, @intCast(y0)), c.d.stride, tmp);
+            }
+        }.run);
+        if (fail) |e| return e;
+        return d;
+    }
+
+    fn deinit(d: *Deriv, gpa: Allocator) void {
+        gpa.free(d.buf);
+    }
+
+    /// Plane k (0: Ix, 1: Iy) at pixel (x, y), which may lie in the frame.
+    fn at(d: Deriv, k: usize, x: isize, y: isize) [*]i16 {
+        const ip: isize = @intCast(d.pad);
+        return d.buf.ptr + k * d.plane + @as(usize, @intCast(y + ip)) * d.stride + @as(usize, @intCast(x + ip)) * d.cn;
+    }
+
+    /// Whether a cols x rows element block at pixel (x, y) lies in the
+    /// buffer.
+    fn holds(d: Deriv, x: isize, y: isize, cols: usize, rows: usize) bool {
+        const ip: isize = @intCast(d.pad);
+        return x >= -ip and y >= -ip and @as(usize, @intCast(x + ip)) * d.cn + cols <= d.stride and
+            @as(usize, @intCast(y + ip)) + rows <= d.height + 2 * d.pad;
+    }
+};
 
 /// Zeroes the derivatives of window pixels outside the image (OpenCV pads
 /// its derivative buffers with zeros).
@@ -580,7 +669,7 @@ fn outside(x: ?i32, y: ?i32, ww: usize, wh: usize, img: Image(u8)) bool {
         y.? < -@as(i32, @intCast(wh)) or y.? >= @as(i32, @intCast(img.height));
 }
 
-fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []const Point2f, next_pts: []Point2f, status: []u8, err: ?[]f32, o: LKOptions, max_level: usize, eps2: f64, gpa: Allocator, p0: usize, p1: usize) Allocator.Error!void {
+fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []const Point2f, next_pts: []Point2f, status: []u8, err: ?[]f32, o: LKOptions, max_level: usize, eps2: f64, gpa: Allocator, dv: []const ?Deriv, p0: usize, p1: usize) Allocator.Error!void {
     const ww: usize = o.win_width;
     const wh: usize = o.win_height;
     const cn: usize = prev.levels[0].channels;
@@ -648,10 +737,26 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
             // Sample the previous window and its gradients; sum the
             // gradient matrix.
             {
-                const pm = Patch(u8).get(I, ipad, ix0 - 1, iy0 - 1, mcols, prows + 2, mbuf);
-                scharrPatch(pm, cn, pcols, prows, dbuf);
-                zeroOutside(I, ix0, iy0, cn, pcols, prows, dbuf);
-                const isrc = pm.ptr + pm.stride + cn;
+                var isrc: [*]const u8 = undefined;
+                var istride: usize = undefined;
+                var dxp: [*]const i16 = dbuf.ptr;
+                var dyp: [*]const i16 = dbuf.ptr + pcols * prows;
+                var dstride: usize = pcols;
+                const lvd: ?Deriv = if (level < dv.len) dv[level] else null;
+                if (lvd != null and lvd.?.holds(ix0, iy0, pcols, prows)) {
+                    const pi_ = Patch(u8).get(I, ipad, ix0, iy0, pcols, prows, mbuf);
+                    isrc = pi_.ptr;
+                    istride = pi_.stride;
+                    dxp = lvd.?.at(0, ix0, iy0);
+                    dyp = lvd.?.at(1, ix0, iy0);
+                    dstride = lvd.?.stride;
+                } else {
+                    const pm = Patch(u8).get(I, ipad, ix0 - 1, iy0 - 1, mcols, prows + 2, mbuf);
+                    scharrPatch(pm, cn, pcols, prows, dbuf);
+                    zeroOutside(I, ix0, iy0, cn, pcols, prows, dbuf);
+                    isrc = pm.ptr + pm.stride + cn;
+                    istride = pm.stride;
+                }
                 var wv = wvec(wt);
                 var a11: VL = @splat(0);
                 var a12: VL = @splat(0);
@@ -664,14 +769,14 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                     for (0..nv) |v| {
                         const x = v * B;
                         var ci = Carry.init(u8, isrc + x, cn);
-                        var cx = Carry.init(i16, dbuf.ptr + x, cn);
-                        var cy = Carry.init(i16, dbuf.ptr + pcols * prows + x, cn);
+                        var cx = Carry.init(i16, dxp + x, cn);
+                        var cy = Carry.init(i16, dyp + x, cn);
                         const m: VB = if (v == nv - 1) tmask else @splat(-1);
                         for (0..wh) |y| {
                             const k = y * rl + x;
-                            iwin[k..][0..B].* = ci.next(u8, isrc + (y + 1) * pm.stride + x, cn, wv, w_bits - 5);
-                            const gx = cx.next(i16, dbuf.ptr + (y + 1) * pcols + x, cn, wv, w_bits) & m;
-                            const gy = cy.next(i16, dbuf.ptr + pcols * prows + (y + 1) * pcols + x, cn, wv, w_bits) & m;
+                            iwin[k..][0..B].* = ci.next(u8, isrc + (y + 1) * istride + x, cn, wv, w_bits - 5);
+                            const gx = cx.next(i16, dxp + (y + 1) * dstride + x, cn, wv, w_bits) & m;
+                            const gy = cy.next(i16, dyp + (y + 1) * dstride + x, cn, wv, w_bits) & m;
                             ixw[k..][0..B].* = gx;
                             iyw[k..][0..B].* = gy;
                             s11 += dot(gx, gx);
@@ -690,15 +795,15 @@ fn trackChunk(prev: *const FlowPyramid, next: *const FlowPyramid, prev_pts: []co
                         }
                     }
                 } else for (0..wh) |y| {
-                    const src = isrc + y * pm.stride;
-                    const dxs = dbuf.ptr + y * pcols;
-                    const dys = dbuf.ptr + pcols * prows + y * pcols;
+                    const src = isrc + y * istride;
+                    const dxs = dxp + y * dstride;
+                    const dys = dyp + y * dstride;
                     for (0..nv) |v| {
                         const x = v * B;
                         const k = y * rl + x;
-                        iwin[k..][0..B].* = sample(u8, src, pm.stride, x, cn, wv, w_bits - 5);
-                        var gx = sample(i16, dxs, pcols, x, cn, wv, w_bits);
-                        var gy = sample(i16, dys, pcols, x, cn, wv, w_bits);
+                        iwin[k..][0..B].* = sample(u8, src, istride, x, cn, wv, w_bits - 5);
+                        var gx = sample(i16, dxs, dstride, x, cn, wv, w_bits);
+                        var gy = sample(i16, dys, dstride, x, cn, wv, w_bits);
                         if (v == nv - 1) {
                             gx &= tmask;
                             gy &= tmask;
