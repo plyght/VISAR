@@ -192,17 +192,32 @@ pub const Pointwise = struct {
             switch (nb) {
                 inline 1...vec.max_nb => |NB| {
                     const R = comptime vec.tileR(NB);
+                    // As few tiles as R allows, of near-equal widths: a
+                    // narrow tile (a streamed 13- or 26-pixel row's last
+                    // one or two pixels) is bound by FMA latency, not
+                    // throughput. (Widths from `lo` get a tile of their
+                    // own; narrower ones, from short rows, halving tiles.)
+                    const lo = comptime @max((R + 1) / 2, R -| 3);
+                    const n = p1 - p0;
+                    const nt = (n + R - 1) / R;
                     var px = p0;
-                    while (px + R <= p1) : (px += R) k.tile(R, NB, ak, x, xs, out, os, res, rs, cob, px);
-                    // Remainder in halving tiles (a one-pixel tile is bound by
-                    // FMA latency, not throughput).
-                    inline for (.{ 8, 4, 2, 1 }) |T| {
-                        if (T < R and px + T <= p1) {
-                            k.tile(T, NB, ak, x, xs, out, os, res, rs, cob, px);
-                            px += T;
+                    for (0..nt) |i| {
+                        const sz = n / nt + @intFromBool(i < n % nt);
+                        switch (sz) {
+                            inline lo...R => |T| k.tile(T, NB, ak, x, xs, out, os, res, rs, cob, px),
+                            else => {
+                                var q = px;
+                                inline for (.{ 8, 4, 2, 1 }) |T| {
+                                    if (T < lo and q + T <= px + sz) {
+                                        k.tile(T, NB, ak, x, xs, out, os, res, rs, cob, q);
+                                        q += T;
+                                    }
+                                }
+                                while (q < px + sz) : (q += 1) k.tile(1, NB, ak, x, xs, out, os, res, rs, cob, q);
+                            },
                         }
+                        px += sz;
                     }
-                    while (px < p1) : (px += 1) k.tile(1, NB, ak, x, xs, out, os, res, rs, cob, px);
                 },
                 else => unreachable,
             }
