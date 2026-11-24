@@ -262,7 +262,15 @@ Metadata: EXIF, XMP, ICC profiles, and IPTC are read and preserved on re-encode 
 - Additional weight and model formats: safetensors, GGUF, TFLite flatbuffers, and a native VISAR model format (memory-mappable, aligned, quantization-aware).
 - Graph optimizer: constant folding, operator fusion (conv+bn+act, attention, layernorm, GELU, …), layout selection (NCHW, NHWC, blocked), memory planning with in-place reuse, dynamic shapes with shape specialization caching.
 - Quantization: post-training INT8 and INT4 (per-tensor, per-channel, per-group), FP8, FP16/BF16 mixed precision, calibration toolkit, and weight-only quantization for transformer-style vision models.
-- Runs on every backend in §9.2. Falls back per-operation from NPU to GPU to CPU when a device can't run an op.
+- Runs on every backend in §9.2. A backend takes a whole planned graph (or a few large partitions) and keeps every intermediate tensor resident on its device, one submission per inference; there is no per-operation bouncing between devices. On Apple silicon models run GPU-first (Metal, then Core ML / Neural Engine), since camera and decoder frames already live in memory the GPU reads directly. The CPU executor is a complete backend, not a fallback: it serves machines without a usable GPU, tiny models where GPU launch latency dominates, and is the numerical reference the other backends are checked against.
+- Precision: models run at their trained precision (f32) by default. FP16 (what the Neural Engine computes in) and INT8 are used only where VISAR's own accuracy check against the f32 model on reference data shows negligible loss.
+- Models compile ahead of time: each model is planned once for its input shape (fusion, layout, static memory plan, packed weights), and small models can be generated into specialised Zig code at build time.
+
+**Real-time inference (`visar.nn.realtime`)**
+Real-time speed comes from not running the model more than needed, not only from faster kernels:
+- Detect-then-track: the detector runs at its own rate; VISAR's trackers (MOSSE, pyramidal LK, motion tracker, about 1 ms per frame) carry every frame in between, so tracked output runs at camera rate.
+- Change-driven inference: frames that did not change reuse the previous result; otherwise the model runs only on crops around moving regions and tracked objects, with a periodic full-frame pass to catch new still objects. Later, incremental inference that keeps per-layer activations and recomputes only regions reached by changed pixels (DeltaCNN-style; same trained model, measured against full runs, periodic refresh).
+- Resolution strategy: detect on a downscaled frame, refine boxes and landmarks on full-resolution crops; tile full resolution only where small, distant objects are expected.
 - Model zoo with reference accuracy for each: classification, detection (YOLO-class, RT-DETR-class), instance and semantic segmentation (incl. SAM-class promptable segmentation), depth estimation, pose and keypoints, face detection and recognition, OCR, tracking, optical flow (RAFT-class), super-resolution, CLIP-class embeddings, and feature matching. Weights are fetched at run time, never bundled.
 
 **Training (`visar.nn.train`)**
@@ -366,6 +374,7 @@ Metadata: EXIF, XMP, ICC profiles, and IPTC are read and preserved on re-encode 
 | JPEG and PNG codec throughput vs. libjpeg-turbo and libspng | ≥ 1.0×, target 1.3× |
 | AV1 and HEVC software decode vs. dav1d and FFmpeg native | ≥ 0.9× (stretch 1.0×) on equal threads |
 | DNN inference vs. ONNX Runtime (CPU EP) and TensorRT (NVIDIA) on the model zoo | ≥ 1.0× ORT median. ≥ 0.9× TensorRT median |
+| Real-time face detection and tracking, end to end (capture or hardware decode → detect → track → display) | 4K at 120 fps on an Apple M3 with a 4K120 source (north-star target; met through §8.6 real-time inference, zero-copy frames and hardware decode, not by running the detector on full 4K frames) |
 | Training throughput vs. PyTorch (eager and `torch.compile`) on reference vision models | ≥ 1.0× eager. ≥ 0.9× compiled |
 | Pipeline fusion gain on multi-op image pipelines vs. op-by-op | ≥ 2× median |
 | Cold start (load library, first `resize` call) | ≤ 5 ms desktop, ≤ 1 ms MCU |
