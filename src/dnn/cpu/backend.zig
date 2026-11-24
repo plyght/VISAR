@@ -22,6 +22,7 @@ const Kernel = union(enum) {
     pointwise: conv.Pointwise,
     depthwise: conv.Depthwise,
     direct: conv.Direct,
+    blocked: conv.Blocked,
     reference: conv.Reference,
     pool: ops.Pool,
     global_avg: ops.GlobalAvg,
@@ -34,6 +35,8 @@ const Kernel = union(enum) {
     extract: ops.Extract,
     concat: ops.Concat,
     softmax: ops.Softmax,
+    gather: ops.Gather,
+    slice: ops.Slice,
 };
 
 pub const Options = struct {
@@ -211,7 +214,7 @@ pub fn streamable(p: *const Plan, i: usize, first: bool) bool {
     return switch (s.op) {
         .conv => switch (convKind(p, s)) {
             .pointwise, .depthwise => true,
-            .direct => first,
+            .direct, .blocked => first,
             .reference => false,
         },
         .max_pool, .average_pool => x.layout == .blocked,
@@ -268,6 +271,7 @@ const Chain = struct {
                 },
                 .pointwise => |d| st.res = d.io.res,
                 .direct => |d| st.res = d.io.res,
+                .blocked => |d| st.res = d.io.res,
                 .pool => |d| {
                     st.span = (d.p.kernel[0] - 1) * d.p.dilation[0] + 1;
                     st.stride = d.p.stride[0];
@@ -363,6 +367,9 @@ const Chain = struct {
                 .direct => |*k| switch (vec.actKind(k.epi.act)) {
                     inline else => |ak| k.streamRow(ak, st.base, dst, res, y),
                 },
+                .blocked => |*k| switch (vec.actKind(k.epi.act)) {
+                    inline else => |ak| k.streamRow(ak, st.base, dst, res, y),
+                },
                 .pool => |*k| k.streamRow(src, dst, y),
                 else => unreachable,
             }
@@ -376,7 +383,7 @@ fn ref(p: *const Plan, t: TensorId) ops.Ref {
     return .{ .off = p.offset(t) / @sizeOf(f32) };
 }
 
-const ConvKind = enum { pointwise, depthwise, direct, reference };
+const ConvKind = enum { pointwise, depthwise, direct, blocked, reference };
 
 fn convKind(p: *const Plan, s: plan_mod.Step) ConvKind {
     const c = s.op.conv;
@@ -389,7 +396,7 @@ fn convKind(p: *const Plan, s: plan_mod.Step) ConvKind {
     if (c.group == 1 and !plain and c.kernel[0] == 1 and c.kernel[1] == 1 and c.stride[0] == 1 and c.stride[1] == 1 and std.mem.allEqual(u32, &c.pad, 0))
         return .pointwise;
     if (c.group == cin and cout == cin and !plain) return .depthwise;
-    if (c.group == 1) return .direct;
+    if (c.group == 1) return if (plain) .direct else .blocked;
     return .reference;
 }
 
@@ -431,6 +438,7 @@ fn prepare(arena: Allocator, p: *const Plan, s: plan_mod.Step) (Allocator.Error 
                 .pointwise => .{ .pointwise = try .init(arena, g, io, c, wd, bias) },
                 .depthwise => .{ .depthwise = try .init(arena, g, io, c, wd, bias) },
                 .direct => .{ .direct = try .init(arena, g, io, c, wd, bias) },
+                .blocked => .{ .blocked = try .init(arena, g, io, c, wd, bias) },
                 .reference => .{ .reference = try .init(arena, g, io, c, wd, bias) },
             };
         },
@@ -487,5 +495,19 @@ fn prepare(arena: Allocator, p: *const Plan, s: plan_mod.Step) (Allocator.Error 
             return .{ .concat = .{ .ins = rs, .in_shapes = ss, .out = ref(p, s.outputs[0]), .os = o.shape, .axis = axis, .blocked = o.layout == .blocked } };
         },
         .softmax => |axis| return .{ .softmax = .{ .in = ref(p, s.inputs[0]), .out = ref(p, s.outputs[0]), .s = T[s.inputs[0]].shape, .axis = axis } },
+        .gather => |ga| {
+            const rs = try arena.alloc(ops.Ref, s.inputs.len);
+            const ss = try arena.alloc(ir.Shape, s.inputs.len);
+            for (s.inputs, rs, ss) |t, *r, *sh| {
+                r.* = ref(p, t);
+                sh.* = T[t].shape;
+            }
+            const o = T[s.outputs[0]];
+            return .{ .gather = try .init(arena, ga.map, ga.act, rs, ss, ref(p, s.outputs[0]), o.shape, o.layout == .blocked) };
+        },
+        .slice => |st| {
+            if (T[s.inputs[0]].layout != .plain) return error.Unsupported;
+            return .{ .slice = .{ .in = ref(p, s.inputs[0]), .out = ref(p, s.outputs[0]), .s = T[s.inputs[0]].shape, .st = st } };
+        },
     }
 }

@@ -73,6 +73,8 @@ pub const Pool = struct {
     ow: usize,
 
     const Ctx = struct { k: *const Pool, base: [*]f32 };
+    /// Widest row the separable max path buffers on the stack.
+    const sep_max_w = 256;
 
     pub fn run(k: *const Pool, exec: anytype, base: [*]f32) void {
         const planes = k.n * (if (k.plain) k.c else cb(k.c));
@@ -109,6 +111,37 @@ pub const Pool = struct {
         const fast2 = k.kind == .max and p.kernel[0] == 2 and p.kernel[1] == 2 and p.stride[0] == 2 and p.stride[1] == 2 and
             p.pad[0] == 0 and p.pad[1] == 0 and p.dilation[0] == 1 and p.dilation[1] == 1 and 2 * oy + 1 < k.h;
         var ox: usize = 0;
+        if (k.kind == .max and p.stride[0] == 1 and p.stride[1] == 1 and p.dilation[0] == 1 and p.dilation[1] == 1 and k.w <= sep_max_w) {
+            // Separable: the column maxima over the window's rows, then
+            // the maxima over each window's columns.
+            var colmax: [sep_max_w * L]f32 = undefined;
+            const y0 = @as(isize, @intCast(oy)) - @as(isize, @intCast(p.pad[0]));
+            const ylo: usize = @intCast(@max(y0, 0));
+            const yhi: usize = @intCast(@min(y0 + @as(isize, @intCast(p.kernel[0])), @as(isize, @intCast(k.h))));
+            if (ylo >= yhi) {
+                for (0..k.ow) |o| stL(L, out + o * L, spL(L, 0));
+                return;
+            }
+            const first = src.at(pc, ylo);
+            @memcpy(colmax[0 .. k.w * L], first[0 .. k.w * L]);
+            for (ylo + 1..yhi) |iy| {
+                const rp = src.at(pc, iy);
+                for (0..k.w) |ix| stL(L, colmax[ix * L ..].ptr, @max(ldL(L, colmax[ix * L ..].ptr), ldL(L, rp + ix * L)));
+            }
+            for (0..k.ow) |o| {
+                const x0 = @as(isize, @intCast(o)) - @as(isize, @intCast(p.pad[1]));
+                const xlo: usize = @intCast(@max(x0, 0));
+                const xhi: usize = @intCast(@min(x0 + @as(isize, @intCast(p.kernel[1])), @as(isize, @intCast(k.w))));
+                if (xlo >= xhi) {
+                    stL(L, out + o * L, spL(L, 0));
+                    continue;
+                }
+                var acc = ldL(L, colmax[xlo * L ..].ptr);
+                for (xlo + 1..xhi) |ix| acc = @max(acc, ldL(L, colmax[ix * L ..].ptr));
+                stL(L, out + o * L, acc);
+            }
+            return;
+        }
         if (fast2) {
             const r0 = src.at(pc, 2 * oy);
             const r1 = src.at(pc, 2 * oy + 1);
@@ -554,7 +587,56 @@ pub const Transpose = struct {
     s: Shape,
     perm: [ir.max_rank]u8,
 
-    pub fn run(k: *const Transpose, base: [*]f32) void {
+    const tile = 16;
+    const Ctx = struct { k: *const Transpose, base: [*]f32 };
+
+    /// Swaps only the last two axes (a batch of matrix transposes).
+    fn swapsLast2(k: *const Transpose) bool {
+        const r = k.s.rank;
+        if (r < 2 or k.perm[r - 2] != r - 1 or k.perm[r - 1] != r - 2) return false;
+        for (0..r - 2) |a| {
+            if (k.perm[a] != a) return false;
+        }
+        return true;
+    }
+
+    pub fn run(k: *const Transpose, exec: anytype, base: [*]f32) void {
+        const r = k.s.rank;
+        if (k.swapsLast2()) {
+            var batch: usize = 1;
+            for (0..r - 2) |a| batch *= k.s.d[a];
+            exec.parallelFor(batch * ((k.s.d[r - 2] + tile - 1) / tile), 4, Ctx{ .k = k, .base = base }, struct {
+                fn f(c: Ctx, s0: usize, e0: usize) void {
+                    const rr = c.k.s.rank;
+                    const rows = c.k.s.d[rr - 2];
+                    const cols = c.k.s.d[rr - 1];
+                    const bands = (rows + tile - 1) / tile;
+                    for (s0..e0) |u| {
+                        const b = u / bands;
+                        const r0 = (u % bands) * tile;
+                        const r1 = @min(rows, r0 + tile);
+                        const x = c.k.in.ptr(c.base) + b * rows * cols;
+                        const o = c.k.out.ptr(c.base) + b * rows * cols;
+                        var c0: usize = 0;
+                        while (c0 < cols) : (c0 += tile) {
+                            const c1 = @min(cols, c0 + tile);
+                            for (c0..c1) |j| for (r0..r1) |i| {
+                                o[j * rows + i] = x[i * cols + j];
+                            };
+                        }
+                    }
+                }
+            }.f);
+            return;
+        }
+        exec.parallelFor(1, 1, Ctx{ .k = k, .base = base }, struct {
+            fn f(c: Ctx, _: usize, _: usize) void {
+                c.k.runGeneric(c.base);
+            }
+        }.f);
+    }
+
+    fn runGeneric(k: *const Transpose, base: [*]f32) void {
         const x = k.in.ptr(base);
         const o = k.out.ptr(base);
         const r = k.s.rank;
@@ -705,5 +787,135 @@ pub const Softmax = struct {
             }
             for (0..d) |i| o[at + i * inner] /= sum;
         };
+    }
+};
+
+/// Output channel k = channel `map[k]` of one of several rank-4 inputs of
+/// equal N, H, W (both blocked or both plain).
+pub const Gather = struct {
+    ins: []const Ref,
+    /// Per output channel: input index and element offset of the channel
+    /// within one image of that input.
+    src: []const u32,
+    off: []const usize,
+    /// Elements per image of each input.
+    in_img: []const usize,
+    out: Ref,
+    n: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    blocked: bool,
+    act: ir.Act,
+
+    pub fn init(arena: Allocator, map: []const ir.ChannelSrc, act: ir.Act, ins: []const Ref, in_shapes: []const Shape, out: Ref, os: Shape, blocked: bool) Allocator.Error!Gather {
+        const hw = os.d[2] * os.d[3];
+        const src = try arena.alloc(u32, map.len);
+        const off = try arena.alloc(usize, map.len);
+        for (map, src, off) |m, *s, *o| {
+            s.* = m.input;
+            o.* = if (blocked) (m.channel / B) * hw * B + m.channel % B else m.channel * hw;
+        }
+        const in_img = try arena.alloc(usize, ins.len);
+        for (in_img, in_shapes) |*o, s| o.* = if (blocked) cb(s.d[1]) * B * hw else s.d[1] * hw;
+        return .{ .ins = ins, .src = src, .off = off, .in_img = in_img, .out = out, .n = os.d[0], .c = os.d[1], .h = os.d[2], .w = os.d[3], .blocked = blocked, .act = act };
+    }
+
+    const Ctx = struct { k: *const Gather, base: [*]f32 };
+
+    pub fn run(k: *const Gather, exec: anytype, base: [*]f32) void {
+        const planes = k.n * (if (k.blocked) cb(k.c) else k.c);
+        exec.parallelFor(planes * k.h, 8, Ctx{ .k = k, .base = base }, struct {
+            fn f(c: Ctx, s: usize, e: usize) void {
+                for (s..e) |r| c.k.row(c.base, r);
+            }
+        }.f);
+    }
+
+    fn row(k: *const Gather, base: [*]f32, r: usize) void {
+        const y = r % k.h;
+        const plane = r / k.h;
+        const per = if (k.blocked) cb(k.c) else k.c;
+        const img = plane / per;
+        const p = plane % per;
+        const o = k.out.ptr(base);
+        if (!k.blocked) {
+            const s = k.ins[k.src[p]].ptr(base) + img * k.in_img[k.src[p]] + k.off[p] + y * k.w;
+            const d = o[((img * k.c + p) * k.h + y) * k.w ..][0..k.w];
+            if (k.act == .none) {
+                @memcpy(d, s[0..k.w]);
+            } else for (d, s[0..k.w]) |*a, b| {
+                a.* = k.act.apply(b);
+            }
+            return;
+        }
+        const dst = o + ((plane * k.h) + y) * k.w * B;
+        const lanes = @min(B, k.c - p * B);
+        var srcs: [B][*]const f32 = undefined;
+        for (0..lanes) |l| {
+            const ch = p * B + l;
+            srcs[l] = k.ins[k.src[ch]].ptr(base) + img * k.in_img[k.src[ch]] + k.off[ch] + y * k.w * B;
+        }
+        const mask = vec.laneMask(lanes);
+        for (0..k.w) |x| {
+            var v: [B]f32 = @splat(0);
+            for (0..lanes) |l| v[l] = srcs[l][x * B];
+            if (k.act == .none) {
+                dst[x * B ..][0..B].* = v;
+            } else {
+                vec.store(dst + x * B, @select(f32, mask, vec.actGeneric(k.act, v), vec.splat(0)));
+            }
+        }
+    }
+};
+
+/// A strided window of a plain tensor.
+pub const Slice = struct {
+    in: Ref,
+    out: Ref,
+    /// Input shape and the window.
+    s: Shape,
+    st: ir.Strided,
+
+    const Ctx = struct { k: *const Slice, base: [*]f32 };
+
+    pub fn run(k: *const Slice, exec: anytype, base: [*]f32) void {
+        const r = k.s.rank;
+        var rows: usize = 1;
+        for (0..r -| 1) |a| rows *= k.st.len[a];
+        exec.parallelFor(rows, 64, Ctx{ .k = k, .base = base }, struct {
+            fn f(c: Ctx, s: usize, e: usize) void {
+                for (s..e) |i| c.k.row(c.base, i);
+            }
+        }.f);
+    }
+
+    fn row(k: *const Slice, base: [*]f32, i: usize) void {
+        const r = k.s.rank;
+        if (r == 0) {
+            k.out.ptr(base)[0] = k.in.ptr(base)[0];
+            return;
+        }
+        // Source offset of output row i (all axes but the last).
+        var src: usize = 0;
+        var stride: usize = k.s.d[r - 1];
+        var rem = i;
+        var a = r - 1;
+        while (a > 0) {
+            a -= 1;
+            const idx = rem % k.st.len[a];
+            rem /= k.st.len[a];
+            src += (k.st.start[a] + idx * k.st.step[a]) * stride;
+            stride *= k.s.d[a];
+        }
+        const n = k.st.len[r - 1];
+        const x = k.in.ptr(base) + src + k.st.start[r - 1];
+        const o = k.out.ptr(base) + i * n;
+        const step = k.st.step[r - 1];
+        if (step == 1) {
+            @memcpy(o[0..n], x[0..n]);
+        } else {
+            for (0..n) |j| o[j] = x[j * step];
+        }
     }
 };

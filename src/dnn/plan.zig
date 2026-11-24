@@ -28,6 +28,9 @@ pub const Tensor = struct {
     data: ?[]const f32 = null,
     /// Index into `Plan.storages` (views share their base's storage).
     storage: u32 = std.math.maxInt(u32),
+    /// Byte offset within the storage (a view of whole channel blocks of
+    /// a blocked tensor, or a concatenation input written in place).
+    view_offset: usize = 0,
 
     /// Elements stored, including blocked padding channels.
     pub fn storedCount(t: Tensor, block: usize) usize {
@@ -68,6 +71,11 @@ pub const Op = union(enum) {
     /// Blocked input -> plain NCHW of channels [c0, c1) with an activation.
     extract: Extract,
     softmax: usize,
+    /// Rank-4 inputs (all in the output's layout) -> output channel k is
+    /// channel `map[k].channel` of input `map[k].input`.
+    gather: Gather,
+    /// Plain tensors only: a strided window of the input.
+    slice: ir.Strided,
     /// Copies between layouts (the input and output tensors say which).
     reorder,
 };
@@ -81,6 +89,8 @@ pub const Streamable = *const fn (p: *const Plan, step: usize, first: bool) bool
 pub const max_group = 24;
 
 pub const Extract = struct { c0: usize, c1: usize, act: ir.Act = .none };
+
+pub const Gather = struct { map: []const ir.ChannelSrc, act: ir.Act = .none };
 
 pub const Step = struct {
     name: []const u8,
@@ -118,7 +128,17 @@ pub const Plan = struct {
     }
 
     pub fn offset(p: *const Plan, t: TensorId) usize {
-        return p.storages[p.tensors[t].storage].offset;
+        return p.storages[p.tensors[t].storage].offset + p.tensors[t].view_offset;
+    }
+
+    /// Whether another tensor shares `t`'s storage (a view of it, or it of
+    /// another).
+    pub fn shared(p: *const Plan, t: TensorId) bool {
+        const st = p.tensors[t].storage;
+        for (p.tensors, 0..) |x, i| {
+            if (i != t and x.data == null and x.storage == st) return true;
+        }
+        return false;
     }
 
     pub fn dump(p: *const Plan, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -158,6 +178,8 @@ const Builder = struct {
     /// Values not materialised yet: a channel range of a blocked tensor
     /// with an activation, made concrete by whichever consumer reads them.
     lazy: []?Lazy,
+    /// Storages of the graph inputs (never aliased).
+    inputs: []const u32 = &.{},
 
     const Lazy = struct { base: TensorId, e: Extract };
 
@@ -198,6 +220,27 @@ const Builder = struct {
         const val = b.g.value(v);
         if (val.data != null) return b.constTensor(v);
         if (val.dtype != .f32) return error.Unsupported;
+        if (b.lazy[v]) |lz| blk: {
+            if (layout != .blocked or val.shape.rank != 4 or b.block == 0) break :blk;
+            // A blocked channel range: a view when it is whole blocks of a
+            // single image, else a gather (which applies the activation).
+            const base = b.tensors.items[lz.base];
+            const bs = base.shape;
+            const B = b.block;
+            const t = if (lz.e.act == .none and bs.d[0] == 1 and lz.e.c0 % B == 0 and (lz.e.c1 % B == 0 or lz.e.c1 == bs.d[1])) v: {
+                try b.tensors.append(b.arena, .{ .name = val.name, .shape = val.shape, .layout = .blocked, .storage = base.storage, .view_offset = base.view_offset + (lz.e.c0 / B) * bs.d[2] * bs.d[3] * B * @sizeOf(f32) });
+                break :v @as(TensorId, @intCast(b.tensors.items.len - 1));
+            } else v: {
+                const t = try b.newTensor(val.name, val.shape, .blocked);
+                const map = try b.arena.alloc(ir.ChannelSrc, lz.e.c1 - lz.e.c0);
+                for (map, lz.e.c0..) |*m, c| m.* = .{ .input = 0, .channel = @intCast(c) };
+                try b.step("slice", .{ .gather = .{ .map = map, .act = lz.e.act } }, &.{lz.base}, &.{t});
+                break :v t;
+            };
+            b.blocked[v] = t;
+            b.lazy[v] = null;
+            return t;
+        }
         if (b.lazy[v]) |lz| {
             const t = try b.newTensor(val.name, val.shape, .plain);
             try b.step("extract", .{ .extract = lz.e }, &.{lz.base}, &.{t});
@@ -226,6 +269,34 @@ const Builder = struct {
         const t = try b.newTensor(val.name, val.shape, l);
         if (l == .plain) b.plain[v] = t else b.blocked[v] = t;
         return t;
+    }
+
+    /// Makes the inputs of a blocked single-image channel concatenation
+    /// views into its output, so their producers write it in place and no
+    /// copy runs. Only inputs owning their storage alone qualify (not
+    /// graph inputs, views, or values already placed in another concat).
+    fn concatInPlace(b: *Builder, ins: []const TensorId, out: TensorId) bool {
+        const T = b.tensors.items;
+        for (ins, 0..) |t, k| {
+            if (T[t].data != null or T[t].layout != .blocked or T[t].view_offset != 0) return false;
+            for (b.inputs) |gi| {
+                if (gi == T[t].storage) return false;
+            }
+            for (T, 0..) |x, i| {
+                if (i != t and x.data == null and x.storage == T[t].storage) return false;
+            }
+            for (ins[0..k]) |u| {
+                if (T[u].storage == T[t].storage) return false;
+            }
+        }
+        const os = T[out].shape;
+        var at: usize = 0;
+        for (ins) |t| {
+            T[t].storage = T[out].storage;
+            T[t].view_offset = at * os.d[2] * os.d[3] * @sizeOf(f32);
+            at += ceilDiv(T[t].shape.d[1], b.block) * b.block;
+        }
+        return true;
     }
 
     fn isConst(b: *Builder, v: ir.ValueId) bool {
@@ -337,6 +408,7 @@ const Builder = struct {
                 var ins: std.ArrayList(TensorId) = .empty;
                 for (n.inputs) |i| try ins.append(b.arena, if (b.isConst(i)) try b.constTensor(i) else try b.get(i, l));
                 const out = try b.define(out_v, l);
+                if (l == .blocked and os.d[0] == 1 and b.concatInPlace(ins.items, out)) return;
                 try b.step(n.name, .{ .concat = a }, ins.items, &.{out});
             },
             .transpose => |perm| {
@@ -363,6 +435,15 @@ const Builder = struct {
                         return;
                     }
                 }
+                if (b.layoutOf(x) == .plain) {
+                    // Plain plans: a channel range is a plain gather.
+                    const in = try b.get(x, .plain);
+                    const out = try b.define(out_v, .plain);
+                    const map = try b.arena.alloc(ir.ChannelSrc, r[1] - r[0]);
+                    for (map, r[0]..) |*m, c| m.* = .{ .input = 0, .channel = @intCast(c) };
+                    try b.step(n.name, .{ .gather = .{ .map = map } }, &.{in}, &.{out});
+                    return;
+                }
                 const in = try b.get(x, .blocked);
                 const out = try b.define(out_v, .plain);
                 try b.step(n.name, .{ .extract = .{ .c0 = r[0], .c1 = r[1] } }, &.{in}, &.{out});
@@ -372,13 +453,28 @@ const Builder = struct {
                 const out = try b.define(out_v, .plain);
                 try b.step(n.name, .{ .softmax = try normAxis(axis, xs.rank) }, &.{in}, &.{out});
             },
+            .channel_gather => |map| {
+                var l: Layout = if (b.block > 0) .blocked else .plain;
+                for (n.inputs) |i| {
+                    if (b.isConst(i)) l = .plain;
+                }
+                var ins: std.ArrayList(TensorId) = .empty;
+                for (n.inputs) |i| try ins.append(b.arena, if (b.isConst(i)) try b.constTensor(i) else try b.get(i, l));
+                const out = try b.define(out_v, l);
+                try b.step(n.name, .{ .gather = .{ .map = map } }, ins.items, &.{out});
+            },
+            .strided_slice => |st| {
+                const in = if (b.isConst(x)) try b.constTensor(x) else try b.get(x, .plain);
+                const out = try b.define(out_v, .plain);
+                try b.step(n.name, .{ .slice = st }, &.{in}, &.{out});
+            },
             .reshape, .flatten, .squeeze, .unsqueeze, .identity => {
                 // Views of the same plain bytes.
                 const in = try b.get(x, .plain);
                 const t = try b.view(in, g.value(out_v).name, g.value(out_v).shape);
                 b.plain[out_v] = t;
             },
-            .shape, .gather, .cast, .slice => return error.Unsupported, // only constant-foldable
+            .shape, .gather, .cast, .slice, .split => return error.Unsupported, // only constant-foldable
         }
     }
 };
@@ -407,6 +503,9 @@ pub fn build(arena: Allocator, g: *ir.Graph, block: usize, streamable: ?Streamab
     @memset(b.blocked, none);
     const inputs = try arena.alloc(TensorId, g.inputs.len);
     for (g.inputs, inputs) |v, *t| t.* = try b.define(v, .plain);
+    const in_st = try arena.alloc(u32, inputs.len);
+    for (inputs, in_st) |t, *s| s.* = b.tensors.items[t].storage;
+    b.inputs = in_st;
     for (g.nodes.items) |n| {
         if (n.dead) continue;
         try b.node(n);
@@ -452,7 +551,9 @@ fn findGroups(p: *const Plan, arena: Allocator, f: Streamable) Allocator.Error![
                 if (prev.op == .max_pool or prev.op == .average_pool) break;
                 if (!f(p, j, false)) break;
                 const t = prev.outputs[0];
-                if (p.steps[j].inputs[0] != t or p.readers(t) != 1) break;
+                // A tensor sharing its storage (a view, or viewed) is
+                // always materialised.
+                if (p.steps[j].inputs[0] != t or p.readers(t) != 1 or p.shared(t)) break;
                 // Other inputs (residuals) must come from outside the run.
                 var inside = false;
                 for (p.steps[j].inputs[1..]) |x| {
@@ -477,7 +578,7 @@ fn assignMemory(p: *Plan, arena: Allocator) Allocator.Error!void {
     for (p.tensors) |t| {
         if (t.data != null) continue;
         const s = &p.storages[t.storage];
-        s.bytes = @max(s.bytes, std.mem.alignForward(usize, t.storedCount(p.block) * @sizeOf(f32), align_bytes));
+        s.bytes = @max(s.bytes, std.mem.alignForward(usize, t.view_offset + t.storedCount(p.block) * @sizeOf(f32), align_bytes));
     }
     // Steps of a group count as one long step; tensors passed from one
     // member to the next never exist.

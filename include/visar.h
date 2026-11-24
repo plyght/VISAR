@@ -182,6 +182,25 @@ int visar_face_detector_set_input_size(visar_face_detector *d, int width, int he
 void visar_face_detector_set_thresholds(visar_face_detector *d, float score_threshold, float nms_threshold, int top_k);
 int visar_face_detector_detect(visar_face_detector *d, const visar_image *img, float *out, size_t cap, size_t *count);
 
+/* Object detection with the OpenCV Model Zoo's NanoDet and YOLOX models (COCO classes), matching
+   the zoo's Python pipelines. arch: -1 detect from the model, 0 NanoDet, 1 YOLOX; a negative
+   threshold selects the zoo demo's default. detect() takes a BGR VISAR_8U image of any size and
+   writes up to cap detections in decreasing score order; *count receives the number found. */
+typedef struct visar_object_detector visar_object_detector;
+typedef struct {
+    float box[4]; /* x, y, width, height in image pixels */
+    float score;
+    int class_id; /* COCO class index, see visar_coco_class_name */
+} visar_detection;
+int visar_object_detector_create(const void *model, size_t len, int arch, float score_threshold, float nms_threshold,
+                                 visar_object_detector **out);
+void visar_object_detector_free(visar_object_detector *d);
+int visar_object_detector_arch(visar_object_detector *d);
+void visar_object_detector_set_thresholds(visar_object_detector *d, float score_threshold, float nms_threshold);
+int visar_object_detector_detect(visar_object_detector *d, const visar_image *img, visar_detection *out, size_t cap,
+                                 size_t *count);
+const char *visar_coco_class_name(int i);
+
 #ifdef __cplusplus
 }
 #endif

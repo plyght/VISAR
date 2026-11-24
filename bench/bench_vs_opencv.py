@@ -118,8 +118,25 @@ def cases(h, w):
 
 
 def dnn_cases():
-    """YuNet face detection (skipped when VISAR_MODELS has no model)."""
+    """YuNet face detection, NanoDet and YOLOX networks (each skipped when
+    VISAR_MODELS lacks its model)."""
     d = os.environ.get("VISAR_MODELS", "")
+    for name, file, size in [("NanoDet", "object_detection_nanodet_2022nov.onnx", 416),
+                             ("YOLOX-S", "object_detection_yolox_2022nov.onnx", 640)]:
+        p = os.path.join(d, file)
+        if not d or not os.path.isfile(p):
+            continue
+        img = cv2.resize(natural(480, 640, 3), (size, size), interpolation=cv2.INTER_AREA)
+        blob = cv2.dnn.blobFromImage(img.astype(np.float32))
+        ours = vs.Net(open(p, "rb").read())
+        ours.plan(blob.shape)
+        theirs = cv2.dnn.readNet(p)
+        names = theirs.getUnconnectedOutLayersNames()
+
+        def run_cv(t=theirs, b=blob, n=names):
+            t.setInput(b)
+            return t.forward(n)
+        yield f"{name} {size} net", (lambda o=ours, b=blob: o.forward(b)), run_cv
     path = next((os.path.join(d, n) for n in ("face_detection_yunet_2023mar.onnx", "y.onnx")
                  if d and os.path.isfile(os.path.join(d, n))), None)
     if path is None:

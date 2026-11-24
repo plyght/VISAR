@@ -174,23 +174,53 @@ fn linearCoord(d: usize, scale: f64, len: u32, area: bool) struct { i: u32, f: f
     return .{ .i = @intCast(sx), .f = f };
 }
 
+/// OpenCV's 8-bit bilinear taps (resizeGeneric_ with fixed-point
+/// coefficients): the source coordinate in f32, each weight rounded to 11
+/// bits on its own. Along x a tap outside the source pins to the edge
+/// sample with weight 1; along y only the row indices are clamped, so the
+/// first and last rows keep their fractional weights.
+fn linearTapU8(d: usize, ssize: u32, dsize: u32, area: bool, pin: bool) ru8.Tap(2) {
+    const inv = @as(f64, @floatFromInt(dsize)) / @as(f64, @floatFromInt(ssize));
+    const scale = 1.0 / inv;
+    const df: f64 = @floatFromInt(d);
+    var sx: i64 = undefined;
+    var fx: f32 = undefined;
+    if (area) {
+        sx = @intFromFloat(@floor(df * scale));
+        fx = @floatCast((df + 1) - @as(f64, @floatFromInt(sx + 1)) * inv);
+        fx = if (fx <= 0) 0 else fx - @floor(fx);
+    } else {
+        fx = @floatCast((df + 0.5) * scale - 0.5);
+        const fl = @floor(fx);
+        sx = @intFromFloat(fl);
+        fx -= fl;
+    }
+    const last = @as(i64, ssize) - 1;
+    if (pin and sx < 0) {
+        sx = 0;
+        fx = 0;
+    }
+    if (pin and sx >= last) {
+        sx = last;
+        fx = 0;
+    }
+    const w0: i32 = sat.cast(i16, (1.0 - fx) * coef_scale);
+    const w1: i32 = sat.cast(i16, fx * coef_scale);
+    return .{ .o = .{ @intCast(std.math.clamp(sx, 0, last)), @intCast(std.math.clamp(sx + 1, 0, last)) }, .w = .{ w0, w1 } };
+}
+
 fn linearU8(exec: Exec, gpa: Allocator, src: Image(u8), dst: Image(u8), area: bool) Error!void {
     const cn: u32 = src.channels;
-    const scale_x = @as(f64, @floatFromInt(src.width)) / @as(f64, @floatFromInt(dst.width));
-    const scale_y = @as(f64, @floatFromInt(src.height)) / @as(f64, @floatFromInt(dst.height));
-    const W = Weights(u8);
     const xt = try gpa.alloc(ru8.Tap(2), dst.width);
     defer gpa.free(xt);
     const yt = try gpa.alloc(ru8.Tap(2), dst.height);
     defer gpa.free(yt);
     for (xt, 0..) |*t, x| {
-        const c = linearCoord(x, scale_x, src.width, area);
-        t.* = .{ .o = .{ c.i * cn, @min(c.i + 1, src.width - 1) * cn }, .w = W.coef(c.f) };
+        t.* = linearTapU8(x, src.width, dst.width, area, true);
+        t.o[0] *= cn;
+        t.o[1] *= cn;
     }
-    for (yt, 0..) |*t, y| {
-        const c = linearCoord(y, scale_y, src.height, area);
-        t.* = .{ .o = .{ c.i, @min(c.i + 1, src.height - 1) }, .w = W.coef(c.f) };
-    }
+    for (yt, 0..) |*t, y| t.* = linearTapU8(y, src.height, dst.height, area, false);
     if (!area and dst.width == 2 * src.width and dst.height == 2 * src.height and src.width >= 2) {
         const beta = try gpa.alloc([2]i32, dst.height);
         defer gpa.free(beta);
@@ -259,24 +289,39 @@ fn linear(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), area: boo
     const alpha = try gpa.alloc([2]W.Coef, dst.rowLen());
     defer gpa.free(alpha);
     for (0..dst.width) |x| {
-        const c = linearCoord(x, scale_x, src.width, area);
-        const a = W.coef(c.f);
+        var i: u32 = undefined;
+        var a: [2]W.Coef = undefined;
+        if (T == u8) {
+            const t = linearTapU8(x, src.width, dst.width, area, true);
+            i = t.o[0];
+            a = t.w;
+        } else {
+            const c = linearCoord(x, scale_x, src.width, area);
+            i = c.i;
+            a = W.coef(c.f);
+        }
         for (0..cn) |ch| {
-            xofs[x * cn + ch] = @intCast(c.i * cn + ch);
+            xofs[x * cn + ch] = @intCast(i * cn + ch);
             alpha[x * cn + ch] = a;
         }
     }
     const step_x: u32 = @intCast(cn);
-    const yofs = try gpa.alloc(u32, dst.height);
+    const yofs = try gpa.alloc([2]u32, dst.height);
     defer gpa.free(yofs);
     const beta = try gpa.alloc([2]W.Coef, dst.height);
     defer gpa.free(beta);
     for (0..dst.height) |y| {
-        const c = linearCoord(y, scale_y, src.height, area);
-        yofs[y] = c.i;
-        beta[y] = W.coef(c.f);
+        if (T == u8) {
+            const t = linearTapU8(y, src.height, dst.height, area, false);
+            yofs[y] = t.o;
+            beta[y] = t.w;
+        } else {
+            const c = linearCoord(y, scale_y, src.height, area);
+            yofs[y] = .{ c.i, @min(c.i + 1, src.height - 1) };
+            beta[y] = W.coef(c.f);
+        }
     }
-    const Ctx = struct { s: Image(T), d: Image(T), xofs: []const u32, alpha: []const [2]W.Coef, yofs: []const u32, beta: []const [2]W.Coef, step: u32, gpa: Allocator };
+    const Ctx = struct { s: Image(T), d: Image(T), xofs: []const u32, alpha: []const [2]W.Coef, yofs: []const [2]u32, beta: []const [2]W.Coef, step: u32, gpa: Allocator };
     const ctx = Ctx{ .s = src, .d = dst, .xofs = xofs, .alpha = alpha, .yofs = yofs, .beta = beta, .step = step_x, .gpa = gpa };
     exec.parallelFor(dst.height, 8, ctx, struct {
         fn run(c: Ctx, y0: usize, y1: usize) void {
@@ -291,8 +336,8 @@ fn linear(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), area: boo
             var have: [2]i64 = .{ -1, -1 };
             const last_x = c.s.rowLen() - c.step;
             for (y0..y1) |y| {
-                const sy = c.yofs[y];
-                const sy1 = @min(sy + 1, c.s.height - 1);
+                const sy = c.yofs[y][0];
+                const sy1 = c.yofs[y][1];
                 // Reuse horizontally resampled rows when they carry over.
                 if (have[0] != sy) {
                     if (have[1] == sy) {

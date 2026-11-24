@@ -17,10 +17,18 @@ pub const Options = struct {
 pub fn run(g: *Graph, arena: Allocator, opts: Options) ir.Error!void {
     markConstNodesDead(g);
     removeIdentities(g);
+    // Rewrites that make the graph runnable by the blocked kernels at all
+    // (a rank-5 channel shuffle has no blocked form), fusion or not.
+    try fuseChannelShuffles(g, arena);
     if (opts.fuse) {
+        fuseSilu(g);
+        composeSlices(g);
+        try composeGathers(g, arena);
+        try transposeToNhwc(g, arena);
         try foldBatchNorm(g, arena);
         try mergeSiblingConvs(g, arena);
         try mergeSlicedDepthwise(g, arena);
+        hoistSliceActs(g);
         try pushActsUp(g, arena);
         try fuseEpilogues(g, arena);
     }
@@ -367,6 +375,246 @@ fn pushActsUp(g: *Graph, arena: Allocator) ir.Error!void {
             g.nodes.items[ia] = p2;
             changed = true;
         }
+    }
+}
+
+/// A conv read only through channel slices that each apply the same
+/// activation (sibling convs merged by `mergeSiblingConvs`, as in CSP
+/// blocks) applies it in its own epilogue instead, so the slices stay
+/// plain views of its output.
+fn hoistSliceActs(g: *Graph) void {
+    for (g.nodes.items) |*n| {
+        if (n.dead or n.op != .conv or n.op.conv.act != .none or n.op.conv.residual) continue;
+        const y = n.outputs[0];
+        if (g.isOutput(y)) continue;
+        var act: ?ir.Act = null;
+        var ok = true;
+        var count: usize = 0;
+        for (g.nodes.items) |s| {
+            if (s.dead or std.mem.indexOfScalar(ValueId, s.inputs, y) == null) continue;
+            count += 1;
+            if (s.op != .channel_slice) {
+                ok = false;
+                break;
+            }
+            const a = soleConsumer(g, s.outputs[0]) orelse {
+                ok = false;
+                break;
+            };
+            if (a.op != .act or g.isOutput(a.outputs[0]) or (act != null and !std.meta.eql(act.?, a.op.act))) {
+                ok = false;
+                break;
+            }
+            act = a.op.act;
+        }
+        if (!ok or count == 0) continue;
+        n.op.conv.act = act.?;
+        for (g.nodes.items) |s| {
+            if (s.dead or s.op != .channel_slice or s.inputs[0] != y) continue;
+            const a = soleConsumer(g, s.outputs[0]).?;
+            a.dead = true;
+            g.replaceUses(a.outputs[0], s.outputs[0]);
+        }
+    }
+}
+
+/// A strided slice of a strided slice (read by nothing else) is one slice
+/// of the original (YOLOX's space-to-depth: rows then columns).
+fn composeSlices(g: *Graph) void {
+    for (g.nodes.items) |*n| {
+        if (n.dead or n.op != .strided_slice) continue;
+        const x = n.inputs[0];
+        if (g.isOutput(x) or g.consumers(x) != 1) continue;
+        const ip = g.producer(x) orelse continue;
+        const p = &g.nodes.items[ip];
+        if (p.op != .strided_slice) continue;
+        const a = p.op.strided_slice;
+        var c = n.op.strided_slice;
+        for (0..g.value(x).shape.rank) |i| {
+            c.start[i] = a.start[i] + a.step[i] * c.start[i];
+            c.step[i] = a.step[i] * c.step[i];
+        }
+        n.op = .{ .strided_slice = c };
+        n.inputs[0] = p.inputs[0];
+        p.dead = true;
+    }
+}
+
+/// x * Sigmoid(x) becomes one SiLU activation (which then joins the
+/// producing conv's epilogue).
+fn fuseSilu(g: *Graph) void {
+    for (g.nodes.items) |*m| {
+        if (m.dead or m.op != .binary or m.op.binary != .mul or m.inputs.len != 2) continue;
+        for (0..2) |k| {
+            const sv = m.inputs[k];
+            const x = m.inputs[1 - k];
+            if (g.isOutput(sv) or g.consumers(sv) != 1) continue;
+            const ip = g.producer(sv) orelse continue;
+            const sn = &g.nodes.items[ip];
+            if (sn.op != .act or sn.op.act != .sigmoid or sn.inputs[0] != x) continue;
+            if (!g.value(x).shape.eql(g.value(m.outputs[0]).shape)) continue;
+            sn.dead = true;
+            m.op = .{ .act = .silu };
+            m.inputs = m.inputs[0..1];
+            m.inputs[0] = x;
+            break;
+        }
+    }
+}
+
+/// Reshape [N,C,H,W] -> [N,g,C/g,H,W], Transpose (0,2,1,3,4), Reshape back
+/// to [N,C,H,W] (ShuffleNet's channel shuffle) becomes one channel gather:
+/// output channel j = input channel (j % g) * (C/g) + j / g.
+fn fuseChannelShuffles(g: *Graph, arena: Allocator) Allocator.Error!void {
+    for (g.nodes.items) |*r2| {
+        if (r2.dead or r2.op != .reshape) continue;
+        const t_out = r2.inputs[0];
+        if (g.isOutput(t_out) or g.consumers(t_out) != 1) continue;
+        const it = g.producer(t_out) orelse continue;
+        const t = g.nodes.items[it];
+        if (t.op != .transpose) continue;
+        const r1_out = t.inputs[0];
+        if (g.isOutput(r1_out) or g.consumers(r1_out) != 1) continue;
+        const ir1 = g.producer(r1_out) orelse continue;
+        const r1 = g.nodes.items[ir1];
+        if (r1.op != .reshape) continue;
+        const x = r1.inputs[0];
+        const xs = g.value(x).shape;
+        const ms = g.value(r1_out).shape;
+        const os = g.value(r2.outputs[0]).shape;
+        if (xs.rank != 4 or ms.rank != 5 or !os.eql(xs)) continue;
+        if (!std.mem.eql(u8, t.op.transpose[0..5], &.{ 0, 2, 1, 3, 4 })) continue;
+        if (ms.d[0] != xs.d[0] or ms.d[1] * ms.d[2] != xs.d[1] or ms.d[3] != xs.d[2] or ms.d[4] != xs.d[3]) continue;
+        const groups = ms.d[1];
+        const per = ms.d[2];
+        const map = try arena.alloc(ir.ChannelSrc, xs.d[1]);
+        for (map, 0..) |*m, j| m.* = .{ .input = 0, .channel = @intCast((j % groups) * per + j / groups) };
+        g.nodes.items[ir1].dead = true;
+        g.nodes.items[it].dead = true;
+        r2.op = .{ .channel_gather = map };
+        r2.inputs = try arena.dupe(ValueId, &.{x});
+    }
+}
+
+/// The channel map of a node that only moves whole channels of rank-4
+/// tensors (concat along channels, channel slice, channel gather), in
+/// terms of its inputs.
+fn channelMap(g: *Graph, arena: Allocator, n: ir.Node) Allocator.Error!?[]const ir.ChannelSrc {
+    switch (n.op) {
+        .channel_gather => |m| return m,
+        .channel_slice => |r| {
+            const m = try arena.alloc(ir.ChannelSrc, r[1] - r[0]);
+            for (m, r[0]..) |*o, c| o.* = .{ .input = 0, .channel = @intCast(c) };
+            return m;
+        },
+        .concat => |axis| {
+            const os = g.value(n.outputs[0]).shape;
+            if (os.rank != 4 or (axis != 1 and axis != -3)) return null;
+            const m = try arena.alloc(ir.ChannelSrc, os.d[1]);
+            var at: usize = 0;
+            for (n.inputs, 0..) |i, k| {
+                if (g.value(i).data != null) return null;
+                for (0..g.value(i).shape.d[1]) |c| {
+                    m[at] = .{ .input = @intCast(k), .channel = @intCast(c) };
+                    at += 1;
+                }
+            }
+            return m;
+        },
+        else => return null,
+    }
+}
+
+/// Channel gathers absorb the channel moves around them: a gather reads
+/// through a concatenation only it consumes, and a slice (or gather) of a
+/// gather reads that gather's sources directly. ShuffleNet's concat ->
+/// shuffle -> split becomes one gather per split output.
+fn composeGathers(g: *Graph, arena: Allocator) Allocator.Error!void {
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (g.nodes.items) |*n| {
+            if (n.dead) continue;
+            if (n.op != .channel_gather and n.op != .channel_slice) continue;
+            const map = try channelMap(g, arena, n.*) orelse continue;
+            // Inputs replaced by their producer's inputs, and where each
+            // input's channels now start.
+            var ins: std.ArrayList(ValueId) = .empty;
+            const input_maps = try arena.alloc(?[]const ir.ChannelSrc, n.inputs.len);
+            const input_base = try arena.alloc(u32, n.inputs.len);
+            var any = false;
+            for (n.inputs, 0..) |i, k| {
+                input_maps[k] = null;
+                input_base[k] = @intCast(ins.items.len);
+                if (g.producer(i)) |pi| {
+                    const p = g.nodes.items[pi];
+                    const absorb = switch (p.op) {
+                        .channel_gather => true,
+                        .concat => n.op == .channel_gather and !g.isOutput(i) and g.consumers(i) == 1,
+                        else => false,
+                    };
+                    if (absorb) {
+                        if (try channelMap(g, arena, p)) |pm| {
+                            input_maps[k] = pm;
+                            try ins.appendSlice(arena, p.inputs);
+                            any = true;
+                            continue;
+                        }
+                    }
+                }
+                try ins.append(arena, i);
+            }
+            if (!any) continue;
+            const remap = try arena.alloc(ir.ChannelSrc, map.len);
+            for (map, remap) |m, *o| {
+                if (input_maps[m.input]) |pm| {
+                    const src = pm[m.channel];
+                    o.* = .{ .input = input_base[m.input] + src.input, .channel = src.channel };
+                } else o.* = .{ .input = input_base[m.input], .channel = m.channel };
+            }
+            // One input per distinct value.
+            var uniq: std.ArrayList(ValueId) = .empty;
+            const pos = try arena.alloc(u32, ins.items.len);
+            for (ins.items, pos) |v, *p| {
+                p.* = @intCast(std.mem.indexOfScalar(ValueId, uniq.items, v) orelse blk: {
+                    try uniq.append(arena, v);
+                    break :blk uniq.items.len - 1;
+                });
+            }
+            for (remap) |*o| o.input = pos[o.input];
+            n.op = .{ .channel_gather = remap };
+            n.inputs = uniq.items;
+            changed = true;
+        }
+        eliminateDead(g);
+    }
+}
+
+/// Reshape [N,C,H,W] -> [N,C,H*W] then Transpose (0,2,1) is NHWC data:
+/// rewritten as Transpose (0,2,3,1) then Reshape [N,H*W,C], which the
+/// planner lowers to one blocked-to-NHWC copy.
+fn transposeToNhwc(g: *Graph, arena: Allocator) Allocator.Error!void {
+    for (0..g.nodes.items.len) |it| {
+        const t = g.nodes.items[it];
+        if (t.dead or t.op != .transpose) continue;
+        const r_out = t.inputs[0];
+        if (g.isOutput(r_out) or g.consumers(r_out) != 1) continue;
+        const ri = g.producer(r_out) orelse continue;
+        const r = g.nodes.items[ri];
+        if (r.op != .reshape) continue;
+        const xs = g.value(r.inputs[0]).shape;
+        const rs = g.value(r_out).shape;
+        if (xs.rank != 4 or rs.rank != 3 or rs.d[0] != xs.d[0] or rs.d[1] != xs.d[1] or rs.d[2] != xs.d[2] * xs.d[3]) continue;
+        if (!std.mem.eql(u8, t.op.transpose[0..3], &.{ 0, 2, 1 })) continue;
+        const nhwc = try g.addValue(arena, .{ .name = "", .shape = .init(&.{ xs.d[0], xs.d[2], xs.d[3], xs.d[1] }), .shaped = true });
+        const dims = try arena.dupe(i64, &.{ @intCast(xs.d[0]), @intCast(xs.d[2] * xs.d[3]), @intCast(xs.d[1]) });
+        const shp = try g.addValue(arena, .{ .name = "", .dtype = .i64, .shape = .init(&.{3}), .shaped = true, .data = .{ .i64 = dims } });
+        var perm: [ir.max_rank]u8 = @splat(255);
+        @memcpy(perm[0..4], &[4]u8{ 0, 2, 3, 1 });
+        // The transpose takes the reshape's place in the order and the
+        // reshape the transpose's, so producers still come first.
+        g.nodes.items[ri] = .{ .name = t.name, .op = .{ .transpose = perm }, .inputs = try arena.dupe(ValueId, &.{r.inputs[0]}), .outputs = try arena.dupe(ValueId, &.{nhwc}) };
+        g.nodes.items[it] = .{ .name = r.name, .op = .{ .reshape = false }, .inputs = try arena.dupe(ValueId, &.{ nhwc, shp }), .outputs = try arena.dupe(ValueId, &.{t.outputs[0]}) };
     }
 }
 

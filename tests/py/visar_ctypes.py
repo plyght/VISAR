@@ -668,3 +668,58 @@ class FaceDetector:
             if cnt.value <= len(self._out):
                 return self._out[:cnt.value].copy()
             self._out = np.empty((cnt.value, 15), np.float32)
+
+
+class Detection(ctypes.Structure):
+    _fields_ = [("box", ctypes.c_float * 4), ("score", ctypes.c_float), ("class_id", ctypes.c_int)]
+
+
+if hasattr(lib, "visar_object_detector_free"):
+    lib.visar_object_detector_free.argtypes = [_vp]
+    lib.visar_coco_class_name.restype = ctypes.c_char_p
+
+
+class ObjectDetector:
+    """NanoDet / YOLOX object detector (OpenCV Model Zoo models).
+
+    detect() returns (boxes [N, 4] x, y, w, h; scores [N]; class ids [N])."""
+
+    def __init__(self, model_bytes, arch=-1, score_threshold=-1.0, nms_threshold=-1.0):
+        self._h = _vp()
+        _check(lib.visar_object_detector_create(model_bytes, _sz(len(model_bytes)), int(arch),
+                                                ctypes.c_float(score_threshold), ctypes.c_float(nms_threshold),
+                                                ctypes.byref(self._h)))
+        self._out = (Detection * 64)()
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib.visar_object_detector_free(self._h)
+            self._h = None
+
+    @property
+    def arch(self):
+        return ("nanodet", "yolox")[lib.visar_object_detector_arch(self._h)]
+
+    def set_thresholds(self, score_threshold, nms_threshold):
+        lib.visar_object_detector_set_thresholds(self._h, ctypes.c_float(score_threshold), ctypes.c_float(nms_threshold))
+
+    def detect(self, img):
+        d = desc(img)
+        cnt = _sz()
+        while True:
+            _check(lib.visar_object_detector_detect(self._h, ctypes.byref(d), self._out, _sz(len(self._out)),
+                                                    ctypes.byref(cnt)))
+            if cnt.value <= len(self._out):
+                break
+            self._out = (Detection * cnt.value)()
+        n = cnt.value
+        arr = np.ctypeslib.as_array(ctypes.cast(self._out, ctypes.POINTER(ctypes.c_float)), shape=(len(self._out) * 6,))
+        rows = arr[:n * 6].reshape(n, 6)
+        boxes = rows[:, :4].copy()
+        scores = rows[:, 4].copy()
+        ids = rows[:, 5].copy().view(np.int32)
+        return boxes, scores, ids
+
+
+def coco_class_name(i):
+    return lib.visar_coco_class_name(int(i)).decode()
