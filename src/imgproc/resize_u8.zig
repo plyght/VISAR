@@ -59,6 +59,8 @@ const neon = struct {
     extern fn @"llvm.aarch64.neon.uaddlp.v8i16.v16i8"(V) @Vector(8, u16);
     extern fn @"llvm.aarch64.neon.addp.v8i16"(@Vector(8, u16), @Vector(8, u16)) @Vector(8, u16);
     extern fn @"llvm.aarch64.neon.sqdmulh.v8i16"(@Vector(8, i16), @Vector(8, i16)) @Vector(8, i16);
+    extern fn @"llvm.aarch64.neon.uhsub.v8i16"(@Vector(8, u16), @Vector(8, u16)) @Vector(8, u16);
+    extern fn @"llvm.aarch64.neon.sqrshrun.v8i8"(@Vector(8, i16), i32) @Vector(8, u8);
     inline fn tbl(comptime k: usize, t: [k]V, idx: V) V {
         return switch (k) {
             1 => @"llvm.aarch64.neon.tbl1.v16i8"(t[0], idx),
@@ -100,12 +102,17 @@ pub const Group = struct {
     /// groups of a row): fewer table registers when the pixels are close.
     win: u8,
     ok: bool,
+    /// NEON only: the group is 16 consecutive samples of a row whose taps
+    /// all have w0 + w1 = 2048 and w1 < 2048 (see sumGroups and
+    /// hrowSumNeon), not `n` whole pixels.
+    sum: bool = false,
 };
 
 /// Builds the groups for a bilinear row of `rowlen` source samples. Uses
 /// as many pixels per group as fit 16 samples, fewer when strong
 /// downscaling would make most windows overflow.
 pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allocator.Error![]Group {
+    if (planar) if (try sumGroups(gpa, xt, cn, rowlen)) |g| return g;
     var n: usize = 16 / cn;
     while (n > 1) : (n -= 1) {
         // Fits when the span of n pixels (plus the right tap) is in 64 bytes.
@@ -159,6 +166,52 @@ pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allo
                     gr.w[pair] = @intCast(t.w[tap]);
                 }
             };
+        }
+    }
+    return g;
+}
+
+/// NEON groups of 16 consecutive samples (whole pixels or not), when
+/// every tap pair sums to 2048 and the windows fit: then
+/// (s0 w0 + s1 w1) >> 4 = 128 s0 + floor((s1 - s0) w1 / 16), one sqdmulh
+/// per 8 samples (hrowSumNeon). Null when the row does not qualify.
+fn sumGroups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allocator.Error!?[]Group {
+    for (xt) |t| if (t.w[0] + t.w[1] != coef_scale or t.w[1] >= coef_scale or t.w[1] < 0) return null;
+    const ng = xt.len * cn / 16;
+    if (ng == 0) return null;
+    const Span = struct {
+        fn of(x: []const Tap(2), c: usize, gi: usize) [2]usize {
+            var lo: usize = std.math.maxInt(usize);
+            var hi: usize = 0;
+            for (gi * 16..gi * 16 + 16) |i| {
+                const t = x[i / c];
+                lo = @min(lo, t.o[0] + i % c);
+                hi = @max(hi, t.o[1] + i % c + 1);
+            }
+            return .{ lo, hi - lo };
+        }
+    };
+    var bad: usize = 0;
+    var win: usize = 16;
+    for (0..ng) |gi| {
+        const span = Span.of(xt, cn, gi)[1];
+        if (span > 64) bad += 1 else win = @max(win, @as(usize, if (span <= 16) 16 else if (span <= 32) 32 else 64));
+    }
+    if (bad * 16 > ng) return null;
+    const g = try gpa.alloc(Group, ng);
+    for (g, 0..) |*gr, gi| {
+        const base = Span.of(xt, cn, gi)[0];
+        gr.* = .{ .idx = @splat(0xff), .w = @splat(0), .base = @intCast(base), .n = 0, .win = @intCast(win), .ok = base + win <= rowlen, .sum = true };
+        for (0..16) |l| {
+            const i = gi * 16 + l;
+            const t = xt[i / cn];
+            // Lane l of the 16-bit tap vectors takes its sample as the high
+            // byte (s << 8); index 0xff (out of range) zeroes the low byte.
+            for (0..2) |tap| {
+                const off = t.o[tap] + i % cn - base;
+                if (off >= win) gr.ok = false else gr.idx[tap * 32 + 2 * l + 1] = @intCast(off);
+            }
+            gr.w[l] = @intCast(t.w[1] << 4);
         }
     }
     return g;
@@ -233,6 +286,30 @@ inline fn hrowGroupNeon(comptime R: usize, comptime W: usize, s: [R][]const u8, 
         const hi = s0 * h0 + s1 * h1;
         const lo = s0 * l0 + s1 * l1;
         out[r][0..16].* = @bitCast(hi + (lo >> @splat(4)));
+    }
+}
+
+/// NEON bilinear sum group (see sumGroups) over R rows: with a = s0 << 8
+/// and b = s1 << 8 in u16 lanes, uhsub(b, a) = (s1 - s0) << 7 exactly as
+/// i16, sqdmulh by w1 << 4 gives floor((s1 - s0) w1 / 16), and adding
+/// a >> 1 = 128 s0 (usra) gives (s0 w0 + s1 w1) >> 4 for w0 = 2048 - w1.
+inline fn hrowSumNeon(comptime R: usize, comptime W: usize, s: [R][]const u8, out: [R][*]i16, g: *const Group) void {
+    const H = @Vector(8, u16);
+    var ix: [4]neon.V = undefined;
+    inline for (0..4) |k| ix[k] = g.idx[k * 16 ..][0..16].*;
+    const wv = [2]@Vector(8, i16){ g.w[0..8].*, g.w[8..16].* };
+    const base = g.base;
+    inline for (0..R) |r| {
+        const w = s[r][base..][0..W];
+        var t: [W / 16]neon.V = undefined;
+        inline for (0..W / 16) |k| t[k] = w[k * 16 ..][0..16].*;
+        inline for (0..2) |h| {
+            const a: H = @bitCast(neon.tbl(W / 16, t, ix[h]));
+            const b: H = @bitCast(neon.tbl(W / 16, t, ix[2 + h]));
+            const d: @Vector(8, i16) = @bitCast(neon.@"llvm.aarch64.neon.uhsub.v8i16"(b, a));
+            const m: H = @bitCast(neon.@"llvm.aarch64.neon.sqdmulh.v8i16"(d, wv[h]));
+            out[r][8 * h ..][0..8].* = @bitCast(m +% (a >> @splat(1)));
+        }
     }
 }
 
@@ -373,6 +450,7 @@ pub fn separable(comptime K: usize, comptime kind: Kind, exec: Exec, gpa: Alloca
 }
 
 fn rows(comptime K: usize, comptime kind: Kind, comptime cn: usize, c: anytype, y0: usize, y1: usize) void {
+    if (K == 2 and kind == .linear and planar and c.gs.len > 0) return rowsNeon(cn, c, y0, y1);
     const n = c.d.rowLen();
     const stride = n + 16; // room for the 16-lane store of the last group
     // Bilinear rows keep acc >> 4 (all the vertical step uses) as i16.
@@ -391,12 +469,6 @@ fn rows(comptime K: usize, comptime kind: Kind, comptime cn: usize, c: anytype, 
                 have[k] = b;
                 keep[b] = true;
             };
-        }
-        if (K == 2 and kind == .linear and planar and c.gs.len > 0 and have[0] == null and have[1] == null and t.o[0] != t.o[1]) {
-            // Both rows are new: one pass over the groups for the two.
-            tag = .{ t.o[0], t.o[1] };
-            hrow2(cn, .{ c.s.row(t.o[0]), c.s.row(t.o[1]) }, .{ buf[0..stride], buf[stride..][0..stride] }, c.xt, c.gs);
-            have = .{ 0, 1 };
         }
         for (0..K) |k| {
             if (have[k] == null) {
@@ -448,19 +520,105 @@ fn hrow(comptime K: usize, comptime cn: usize, comptime E: type, s: []const u8, 
     hrowPixels(K, cn, E, s, out, xt, 0, xt.len);
 }
 
-/// Two rows of the NEON bilinear horizontal pass at once.
-fn hrow2(comptime cn: usize, s: [2][]const u8, out: [2][]i16, xt: []const Tap(2), gs: []const Group) void {
-    const gn: usize = gs[0].n;
-    const step = gn * cn;
+/// NEON bilinear rows with a four-row cache. Source rows are resampled
+/// horizontally two at a time: when an output row needs only one new row,
+/// the next new row the following output row needs goes with it, so each
+/// group's indices and weights are loaded once for two rows.
+fn rowsNeon(comptime cn: usize, c: anytype, y0: usize, y1: usize) void {
+    const S = 4;
+    const n = c.d.rowLen();
+    const stride = n + 16;
+    const buf = c.gpa.alloc(i16, S * stride) catch @panic("out of memory");
+    defer c.gpa.free(buf);
+    var tag: [S]i64 = @splat(-1);
+    const Find = struct {
+        fn slot(tg: [S]i64, row: i64) ?usize {
+            for (tg, 0..) |v, i| if (v == row) return i;
+            return null;
+        }
+    };
+    for (y0..y1) |y| {
+        const t = c.yt[y];
+        const need = [2]i64{ t.o[0], t.o[1] };
+        var todo: [2]i64 = undefined;
+        var nt: usize = 0;
+        for (need, 0..) |r, k| {
+            if (Find.slot(tag, r) == null and !(k == 1 and r == need[0])) {
+                todo[nt] = r;
+                nt += 1;
+            }
+        }
+        if (nt == 1 and y + 1 < y1) {
+            for (c.yt[y + 1].o) |r| {
+                if (r != todo[0] and Find.slot(tag, r) == null) {
+                    todo[1] = r;
+                    nt = 2;
+                    break;
+                }
+            }
+        }
+        // Evict the lowest rows the current output row does not read.
+        var dst: [2][]i16 = undefined;
+        for (0..nt) |k| {
+            var best: ?usize = null;
+            for (tag, 0..) |v, i| {
+                if (v == need[0] or v == need[1] or (k == 1 and v == todo[0])) continue;
+                if (best == null or v < tag[best.?]) best = i;
+            }
+            tag[best.?] = todo[k];
+            dst[k] = buf[best.? * stride ..][0..stride];
+        }
+        switch (nt) {
+            2 => hrowNeon(2, cn, .{ c.s.row(@intCast(todo[0])), c.s.row(@intCast(todo[1])) }, dst, c.xt, c.gs),
+            1 => hrowNeon(1, cn, .{c.s.row(@intCast(todo[0]))}, .{dst[0]}, c.xt, c.gs),
+            else => {},
+        }
+        const p0 = buf[Find.slot(tag, need[0]).? * stride ..][0..n];
+        const p1 = buf[Find.slot(tag, need[1]).? * stride ..][0..n];
+        vlinear(p0, p1, t.w, c.d.row(y));
+    }
+}
+
+/// R rows of the NEON bilinear horizontal pass over the groups.
+fn hrowNeon(comptime R: usize, comptime cn: usize, s: [R][]const u8, out: [R][]i16, xt: []const Tap(2), gs: []const Group) void {
     switch (gs[0].win) {
-        inline 16, 32, 64 => |W| for (gs, 0..) |*g, k| {
-            if (g.ok) {
-                hrowGroupNeon(2, W, s, .{ out[0][k * step ..], out[1][k * step ..] }, g);
-            } else for (0..2) |r| hrowPixels(2, cn, i16, s[r], out[r], xt, k * gn, k * gn + gn);
+        inline 16, 32, 64 => |W| {
+            if (gs[0].sum) {
+                var o: [R][*]i16 = undefined;
+                inline for (0..R) |r| o[r] = out[r].ptr;
+                for (gs, 0..) |*g, k| {
+                    if (g.ok) {
+                        hrowSumNeon(R, W, s, o, g);
+                    } else for (0..R) |r| hrowSamples(cn, s[r], out[r], xt, k * 16, k * 16 + 16);
+                    inline for (0..R) |r| o[r] += 16;
+                }
+                for (0..R) |r| hrowSamples(cn, s[r], out[r], xt, gs.len * 16, xt.len * cn);
+                return;
+            }
+            if (R == 1) return hrow(2, cn, i16, s[0], out[0], xt, gs);
+            const gn: usize = gs[0].n;
+            const step = gn * cn;
+            for (gs, 0..) |*g, k| {
+                if (g.ok) {
+                    var o: [R][]i16 = undefined;
+                    inline for (0..R) |r| o[r] = out[r][k * step ..];
+                    hrowGroupNeon(R, W, s, o, g);
+                } else for (0..R) |r| hrowPixels(2, cn, i16, s[r], out[r], xt, k * gn, k * gn + gn);
+            }
+            for (0..R) |r| hrowPixels(2, cn, i16, s[r], out[r], xt, gs.len * gn, xt.len);
         },
         else => unreachable,
     }
-    for (0..2) |r| hrowPixels(2, cn, i16, s[r], out[r], xt, gs.len * gn, xt.len);
+}
+
+/// Samples [from, to) of a bilinear row, one at a time.
+noinline fn hrowSamples(comptime cn: usize, s: []const u8, out: []i16, xt: []const Tap(2), from: usize, to: usize) void {
+    for (from..to) |i| {
+        const t = xt[i / cn];
+        const ch = i % cn;
+        const acc = @as(i32, s[t.o[0] + ch]) * t.w[0] + @as(i32, s[t.o[1] + ch]) * t.w[1];
+        out[i] = @intCast(acc >> 4);
+    }
 }
 
 fn hrowPixels(comptime K: usize, comptime cn: usize, comptime E: type, s: []const u8, out: []E, xt: []const Tap(K), x0: usize, x1: usize) void {
@@ -505,21 +663,10 @@ fn vlinear(r0: []const i16, r1: []const i16, b: [2]i32, d: []u8) void {
     var x: usize = 0;
     if (comptime arm_tbl) {
         // mulhi(a, b) = sqdmulh(a, b) >> 1: (2ab) >> 16 never saturates
-        // for |a| < 2^15 and |b| <= 2^11, and the floors nest.
-        const H = @Vector(8, i16);
-        const c0: H = @splat(@intCast(b[0]));
-        const c1: H = @splat(@intCast(b[1]));
-        while (x + N <= d.len) : (x += N) {
-            var t: [N]i16 = undefined;
-            inline for (0..N / 8) |k| {
-                const m0 = neon.@"llvm.aarch64.neon.sqdmulh.v8i16"(r0[x + 8 * k ..][0..8].*, c0) >> @splat(1);
-                const m1 = neon.@"llvm.aarch64.neon.sqdmulh.v8i16"(r1[x + 8 * k ..][0..8].*, c1) >> @splat(1);
-                t[8 * k ..][0..8].* = (m0 + m1 + @as(H, @splat(2))) >> @splat(2);
-            }
-            const tv: V = t;
-            const cl = @max(@min(tv, @as(V, @splat(255))), @as(V, @splat(0)));
-            d[x..][0..N].* = simd.narrow(u8, cl);
-        }
+        // for |a| < 2^15 and |b| <= 2^11, and the floors nest. With b even
+        // it is sqdmulh(a, b / 2). (t + 2) >> 2 and the clamp to u8 are
+        // one sqrshrun.
+        x = if ((b[0] | b[1]) & 1 == 0) vlinearNeon(true, r0, r1, b, d) else vlinearNeon(false, r0, r1, b, d);
     }
     while (x + N <= d.len) : (x += N) {
         const a: V = r0[x..][0..N].*;
@@ -534,6 +681,33 @@ fn vlinear(r0: []const i16, r1: []const i16, b: [2]i32, d: []u8) void {
         const t = ((@as(i32, r0[x]) * b[0]) >> 16) + ((@as(i32, r1[x]) * b[1]) >> 16);
         d[x] = sat.cast(u8, (t + 2) >> 2);
     }
+}
+
+fn vlinearNeon(comptime even: bool, r0: []const i16, r1: []const i16, b: [2]i32, d: []u8) usize {
+    const H = @Vector(8, i16);
+    const sh = @intFromBool(even);
+    const c0: H = @splat(@intCast(b[0] >> sh));
+    const c1: H = @splat(@intCast(b[1] >> sh));
+    var x: usize = 0;
+    while (x + 32 <= d.len) : (x += 32) {
+        // All loads before the stores (u8 stores may alias the rows).
+        var a: [4]H = undefined;
+        var c: [4]H = undefined;
+        inline for (0..4) |k| {
+            a[k] = r0[x + 8 * k ..][0..8].*;
+            c[k] = r1[x + 8 * k ..][0..8].*;
+        }
+        var o: [4]@Vector(8, u8) = undefined;
+        inline for (0..4) |k| {
+            const m0 = neon.@"llvm.aarch64.neon.sqdmulh.v8i16"(a[k], c0);
+            const m1 = neon.@"llvm.aarch64.neon.sqdmulh.v8i16"(c[k], c1);
+            const t = if (even) m0 + m1 else (m0 >> @splat(1)) + (m1 >> @splat(1));
+            o[k] = neon.@"llvm.aarch64.neon.sqrshrun.v8i8"(t, 2);
+        }
+        d[x..][0..16].* = std.simd.join(o[0], o[1]);
+        d[x + 16 ..][0..16].* = std.simd.join(o[2], o[3]);
+    }
+    return x;
 }
 
 /// OpenCV's VResizeCubicVec_32s8u: float fma chain with the weights scaled

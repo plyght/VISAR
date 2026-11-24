@@ -664,7 +664,10 @@ test "u8 fast paths match the generic fixed-point kernels" {
         // Halving, exact 2x, and a generic ratio (VBMI groups when present).
         // Generic ratios cover every group size, strong downscales (smaller
         // groups, window overflows) and upscales.
-        for ([_][2]u32{ .{ 75, 32 }, .{ 300, 128 }, .{ 113, 47 }, .{ 120, 90 }, .{ 112, 48 }, .{ 37, 20 }, .{ 20, 9 }, .{ 9, 5 }, .{ 199, 70 }, .{ 151, 64 }, .{ 1, 1 }, .{ 2, 64 } }) |sz| {
+        // NEON: 3/4 and 2/3 (sample groups, two-row passes with lookahead,
+        // even and odd vertical weights), 1.5x up, and widths with group
+        // tails.
+        for ([_][2]u32{ .{ 75, 32 }, .{ 300, 128 }, .{ 113, 47 }, .{ 120, 90 }, .{ 112, 48 }, .{ 37, 20 }, .{ 20, 9 }, .{ 9, 5 }, .{ 199, 70 }, .{ 151, 64 }, .{ 1, 1 }, .{ 2, 64 }, .{ 112, 42 }, .{ 100, 43 }, .{ 225, 96 }, .{ 141, 61 }, .{ 6, 40 } }) |sz| {
             var a = try Image(u8).init(gpa, sz[0], sz[1], cn);
             defer a.deinit(gpa);
             var b = try Image(u8).init(gpa, sz[0], sz[1], cn);
