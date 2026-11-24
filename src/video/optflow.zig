@@ -401,7 +401,7 @@ fn Patch(comptime T: type) type {
 /// ever read, so computing them per window gives the same values without
 /// full-size buffers.
 fn scharrPatch(m: Patch(u8), cn: usize, cols: usize, rows: usize, d: []i16) void {
-    const M = 16;
+    const M = B;
     const V = @Vector(M, i16);
     const mc = cols + 2 * cn;
     // Vertical sums of one row: smoothing in tv[0..mc], difference after.
@@ -410,25 +410,24 @@ fn scharrPatch(m: Patch(u8), cn: usize, cols: usize, rows: usize, d: []i16) void
         const a = m.ptr + r * m.stride;
         const b = a + m.stride;
         const c = b + m.stride;
+        // Each output depends only on the inputs, so the last step is
+        // simply moved back to end at the last element (overlapping the
+        // previous one) instead of finishing with scalar code.
         var x: usize = 0;
-        while (x + M <= mc) : (x += M) {
+        while (true) : (x += M) {
+            if (x + M > mc) x = mc - M;
             const va: V = @as(@Vector(M, u8), a[x..][0..M].*);
             const vb: V = @as(@Vector(M, u8), b[x..][0..M].*);
             const vc: V = @as(@Vector(M, u8), c[x..][0..M].*);
             tv[x..][0..M].* = (va + vc) * @as(V, @splat(3)) + vb * @as(V, @splat(10));
             tv[mc + x ..][0..M].* = vc - va;
-        }
-        while (x < mc) : (x += 1) {
-            const va: i16 = a[x];
-            const vb: i16 = b[x];
-            const vc: i16 = c[x];
-            tv[x] = (va + vc) * 3 + vb * 10;
-            tv[mc + x] = vc - va;
+            if (x + M == mc) break;
         }
         const ox = d[r * cols ..][0..cols];
         const oy = d[cols * rows + r * cols ..][0..cols];
         x = 0;
-        while (x + M <= cols) : (x += M) {
+        while (true) : (x += M) {
+            if (x + M > cols) x = cols - M;
             const l0: V = tv[x..][0..M].*;
             const r0: V = tv[x + 2 * cn ..][0..M].*;
             const l1: V = tv[mc + x ..][0..M].*;
@@ -436,10 +435,7 @@ fn scharrPatch(m: Patch(u8), cn: usize, cols: usize, rows: usize, d: []i16) void
             const r1: V = tv[mc + x + 2 * cn ..][0..M].*;
             ox[x..][0..M].* = r0 - l0;
             oy[x..][0..M].* = (l1 + r1) * @as(V, @splat(3)) + c1 * @as(V, @splat(10));
-        }
-        while (x < cols) : (x += 1) {
-            ox[x] = tv[x + 2 * cn] - tv[x];
-            oy[x] = (tv[mc + x] + tv[mc + x + 2 * cn]) * 3 + tv[mc + x + cn] * 10;
+            if (x + M == cols) break;
         }
     }
 }
