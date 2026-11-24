@@ -128,19 +128,53 @@ pub const FlowPyramid = struct {
 
     /// Fills the `pad`-pixel frame around `img` with reflect101.
     fn fillBorder(img: Image(u8), pad: usize) void {
-        const cn: usize = img.channels;
+        switch (img.channels) {
+            inline 1, 2, 3, 4 => |cn| fillBorderCn(cn, img, pad),
+            else => unreachable,
+        }
+    }
+
+    /// dst[i] = src[n - 1 - i] for i < n.
+    fn reverseCopy(dst: [*]u8, src: [*]const u8, n: usize) void {
+        const rev = comptime blk: {
+            var m: [16]i32 = undefined;
+            for (&m, 0..) |*v, i| v.* = 15 - @as(i32, @intCast(i));
+            break :blk m;
+        };
+        var i: usize = 0;
+        while (i + 16 <= n) : (i += 16) {
+            const v: @Vector(16, u8) = src[n - i - 16 ..][0..16].*;
+            dst[i..][0..16].* = @shuffle(u8, v, undefined, rev);
+        }
+        while (i < n) : (i += 1) dst[i] = src[n - 1 - i];
+    }
+
+    fn fillBorderCn(comptime cn: usize, img: Image(u8), pad: usize) void {
         const w = img.width;
         const h = img.height;
         const ip: isize = @intCast(pad);
-        for (0..pad) |i| {
-            const lx = imgproc.border.map(@as(isize, @intCast(i)) - ip, w, .reflect101).?;
-            const rx = imgproc.border.map(@intCast(w + i), w, .reflect101).?;
-            for (0..h) |y| {
-                const r = img.data + y * img.stride;
-                for (0..cn) |c| {
-                    (r - pad * cn)[i * cn + c] = r[lx * cn + c];
-                    r[(w + i) * cn + c] = r[rx * cn + c];
-                }
+        // Source columns of the left and right frame pixels.
+        var lmap: [256]u32 = undefined;
+        var rmap: [256]u32 = undefined;
+        const mapped = pad <= lmap.len;
+        if (mapped) for (0..pad) |i| {
+            lmap[i] = @intCast(imgproc.border.map(@as(isize, @intCast(i)) - ip, w, .reflect101).?);
+            rmap[i] = @intCast(imgproc.border.map(@intCast(w + i), w, .reflect101).?);
+        };
+        for (0..h) |y| {
+            const r = img.data + y * img.stride;
+            const l = r - pad * cn;
+            if (cn == 1 and pad < w) {
+                // Mirror images of the pixels next to each edge.
+                reverseCopy(l, r + 1, pad);
+                reverseCopy(r + w, r + w - 1 - pad, pad);
+                continue;
+            }
+            for (0..pad) |i| {
+                const lx: usize = if (mapped) lmap[i] else imgproc.border.map(@as(isize, @intCast(i)) - ip, w, .reflect101).?;
+                const rx: usize = if (mapped) rmap[i] else imgproc.border.map(@intCast(w + i), w, .reflect101).?;
+                l[i * cn ..][0..cn].* = r[lx * cn ..][0..cn].*;
+                r[(w + i) * cn ..][0..cn].* = r[rx * cn ..][0..cn].*;
             }
         }
         const full = (w + 2 * pad) * cn;
@@ -151,10 +185,6 @@ pub const FlowPyramid = struct {
             @memcpy((img.data - (pad - i) * img.stride - left)[0..full], (img.data + ty * img.stride - left)[0..full]);
             @memcpy((img.data + (h + i) * img.stride - left)[0..full], (img.data + by * img.stride - left)[0..full]);
         }
-    }
-
-    pub fn levelCount(self: FlowPyramid) usize {
-        return self.levels.len;
     }
 };
 
