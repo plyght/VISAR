@@ -52,9 +52,14 @@ def main():
         t0 = time.perf_counter()
         n = 0
         while (time.perf_counter() - t0 < 2.0 or n < 10) and n < 500:
-            s = time.perf_counter(); fa(); ta = min(ta, time.perf_counter() - s)
-            s = time.perf_counter(); fb(); tb = min(tb, time.perf_counter() - s)
-            s = time.perf_counter(); fc(); tc = min(tc, time.perf_counter() - s)
+            # Rotate the order every round so no side always follows another.
+            for k in range(3):
+                which = (n + k) % 3
+                f = (fa, fb, fc)[which]
+                s = time.perf_counter(); f(); t = time.perf_counter() - s
+                if which == 0: ta = min(ta, t)
+                elif which == 1: tb = min(tb, t)
+                else: tc = min(tc, t)
             n += 1
         rows.append((name, ta, tb, tc))
         print(f"  {name:<28} A {ta * 1e3:8.3f} ms   B {tb * 1e3:8.3f} ms   B vs A {ta / tb:5.2f}x   OpenCV {tc * 1e3:8.3f} ms", flush=True)
