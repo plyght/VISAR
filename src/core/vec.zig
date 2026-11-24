@@ -15,6 +15,14 @@ const neon = struct {
     extern fn @"llvm.aarch64.neon.st2.v16i8.p0"(V16, V16, [*]u8) void;
     extern fn @"llvm.aarch64.neon.st3.v16i8.p0"(V16, V16, V16, [*]u8) void;
     extern fn @"llvm.aarch64.neon.st4.v16i8.p0"(V16, V16, V16, V16, [*]u8) void;
+    extern fn @"llvm.aarch64.neon.tbl2.v16i8"(V16, V16, V16) V16;
+    extern fn @"llvm.aarch64.neon.tbl3.v16i8"(V16, V16, V16, V16) V16;
+    inline fn tbl2(a: V16, b: V16, i: V16) V16 {
+        return @"llvm.aarch64.neon.tbl2.v16i8"(a, b, i);
+    }
+    inline fn tbl3(a: V16, b: V16, c: V16, i: V16) V16 {
+        return @"llvm.aarch64.neon.tbl3.v16i8"(a, b, c, i);
+    }
     inline fn st2(a: V16, b: V16, p: [*]u8) void {
         @"llvm.aarch64.neon.st2.v16i8.p0"(a, b, p);
     }
@@ -270,6 +278,39 @@ pub inline fn remap(comptime scn: usize, comptime dcn: usize, comptime map: [dcn
 /// step uses, so the loop stops while a full 16 bytes still fit on both
 /// sides. Returns the number of pixels done; the caller finishes the rest.
 pub inline fn reorderRow(comptime scn: usize, comptime dcn: usize, comptime map: [dcn]?u8, fill: u8, s: [*]const u8, d: [*]u8, n: usize) usize {
+    if (comptime is_arm and simd.llvm_intrinsics and scn == 3 and dcn == 3) {
+        // AArch64 3 -> 3 (BGR <-> RGB): each 16-byte output block is one
+        // multi-register tbl over the two or three input blocks it draws
+        // from, with plain loads and stores. The indices go through
+        // opaqueV, or LLVM folds the tbl back into a shuffle and
+        // scalarises it.
+        const idx = comptime blk: {
+            var m: [3]V16 = undefined;
+            for (0..3) |b| {
+                const first = if (b == 2) 1 else 0;
+                var v: [16]u8 = undefined;
+                for (0..16) |t| {
+                    const g = 16 * b + t;
+                    v[t] = @intCast(3 * (g / 3) + map[g % 3].? - 16 * first);
+                }
+                m[b] = v;
+            }
+            break :blk m;
+        };
+        const k0 = opaqueV(idx[0]);
+        const k1 = opaqueV(idx[1]);
+        const k2 = opaqueV(idx[2]);
+        var x: usize = 0;
+        while (x + 16 <= n) : (x += 16) {
+            const b0: V16 = s[x * 3 ..][0..16].*;
+            const b1: V16 = s[x * 3 + 16 ..][0..16].*;
+            const b2: V16 = s[x * 3 + 32 ..][0..16].*;
+            d[x * 3 ..][0..16].* = neon.tbl2(b0, b1, k0);
+            d[x * 3 + 16 ..][0..16].* = neon.tbl3(b0, b1, b2, k1);
+            d[x * 3 + 32 ..][0..16].* = neon.tbl2(b1, b2, k2);
+        }
+        return x;
+    }
     // AArch64: ldN + stN do the whole reorder in two instructions per 16
     // pixels (measured faster than single-register tbl groups for BGR <->
     // RGB on Apple cores), two blocks per iteration.
@@ -369,7 +410,8 @@ test "reorderRow matches scalar" {
     }
     var d3: [3 * 37]u8 = @splat(0);
     const done3 = reorderRow(3, 3, .{ 2, 1, 0 }, 0, &src, &d3, 37);
-    for (0..done3) |i| try std.testing.expectEqual(src[3 * i + 2], d3[3 * i]);
+    try std.testing.expect(done3 > 0 and done3 <= 37);
+    for (0..done3) |i| for (0..3) |c| try std.testing.expectEqual(src[3 * i + 2 - c], d3[3 * i + c]);
 }
 
 test "load/store round trip" {
