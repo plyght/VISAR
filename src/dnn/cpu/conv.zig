@@ -69,6 +69,8 @@ pub const no_res = std.math.maxInt(usize);
 
 pub const Epilogue = struct {
     act: ir.Act,
+    /// `vec.linearSlope(act)`.
+    slope: f32,
     residual_after_act: bool,
     /// Lanes of the last output block that hold real channels.
     tail_mask: @Vector(B, bool),
@@ -76,7 +78,7 @@ pub const Epilogue = struct {
 
     fn init(c: ir.Conv, cout: usize) Epilogue {
         const rem = cout % B;
-        return .{ .act = c.act, .residual_after_act = c.residual_after_act, .tail_mask = vec.laneMask(if (rem == 0) B else rem), .coutb = (cout + B - 1) / B };
+        return .{ .act = c.act, .slope = vec.linearSlope(c.act), .residual_after_act = c.residual_after_act, .tail_mask = vec.laneMask(if (rem == 0) B else rem), .coutb = (cout + B - 1) / B };
     }
 
     inline fn apply(e: *const Epilogue, comptime ak: ActKind, acc: V, res: ?[*]const f32, cob: usize) V {
@@ -84,12 +86,38 @@ pub const Epilogue = struct {
         if (res) |r| {
             if (!e.residual_after_act) v += vec.load(r);
         }
-        v = vec.act(ak, e.act, v);
+        v = vec.act(ak, e.act, e.slope, v);
         if (res) |r| {
             if (e.residual_after_act) v += vec.load(r);
         }
         if (cob + 1 == e.coutb) v = @select(f32, e.tail_mask, v, vec.splat(0));
         return v;
+    }
+
+    /// Stores an `R` pixels x `NB` blocks register tile through the
+    /// epilogue (a `deferred` activation in a second pass over the stored
+    /// sums): `o` and `res` point at block `cob`, pixel 0 of the tile;
+    /// `os`, `rs` are the distances between their blocks.
+    inline fn storeTile(e: *const Epilogue, comptime ak: ActKind, comptime R: usize, comptime NB: usize, acc: *const [R][NB]V, o: [*]f32, os: usize, res: ?[*]const f32, rs: usize, cob: usize) void {
+        if (ak != .deferred) {
+            inline for (0..NB) |nb| {
+                inline for (0..R) |r| {
+                    const rp: ?[*]const f32 = if (res) |rr| rr + nb * rs + r * B else null;
+                    vec.store(o + nb * os + r * B, e.apply(ak, acc[r][nb], rp, cob + nb));
+                }
+            }
+            return;
+        }
+        inline for (0..NB) |nb| {
+            inline for (0..R) |r| vec.store(o + nb * os + r * B, acc[r][nb]);
+        }
+        for (0..NB) |nb| {
+            for (0..R) |r| {
+                const rp: ?[*]const f32 = if (res) |rr| rr + nb * rs + r * B else null;
+                const p = o + nb * os + r * B;
+                vec.store(p, e.apply(ak, vec.load(p), rp, cob + nb));
+            }
+        }
     }
 };
 
@@ -208,13 +236,8 @@ pub const Pointwise = struct {
                 }
             }
         }
-        inline for (0..NB) |nb| {
-            const o = out + (cob + nb) * os + px * B;
-            inline for (0..R) |r| {
-                const rp: ?[*]const f32 = if (res) |rr| rr + (cob + nb) * rs + (px + r) * B else null;
-                vec.store(o + r * B, k.epi.apply(ak, acc[r][nb], rp, cob + nb));
-            }
-        }
+        const rp: ?[*]const f32 = if (res) |rr| rr + cob * rs + px * B else null;
+        k.epi.storeTile(ak, R, NB, &acc, out + cob * os + px * B, os, rp, rs, cob);
     }
 };
 
@@ -511,13 +534,8 @@ pub const Direct = struct {
                 }
             }
         }
-        inline for (0..NB) |nb| {
-            const o = out + (cob + nb) * os + ox * B;
-            inline for (0..R) |r| {
-                const rp: ?[*]const f32 = if (res) |rr| rr + (cob + nb) * rs + (ox + r) * B else null;
-                vec.store(o + r * B, k.epi.apply(ak, acc[r][nb], rp, cob + nb));
-            }
-        }
+        const rp: ?[*]const f32 = if (res) |rr| rr + cob * rs + ox * B else null;
+        k.epi.storeTile(ak, R, NB, &acc, out + cob * os + ox * B, os, rp, rs, cob);
     }
 };
 
@@ -722,13 +740,12 @@ pub const Blocked = struct {
                 }
             }
         }
-        inline for (0..NB) |nb| {
-            const o = t.out + nb * t.os + ox * B;
-            inline for (0..R) |r| {
-                if (ph.last) {
-                    const rp: ?[*]const f32 = if (t.res) |rr| rr + nb * t.rs + (ox + r) * B else null;
-                    vec.store(o + r * B, k.epi.apply(ak, acc[r][nb], rp, t.cob + nb));
-                } else vec.store(o + r * B, acc[r][nb]);
+        if (ph.last) {
+            const rp: ?[*]const f32 = if (t.res) |rr| rr + ox * B else null;
+            k.epi.storeTile(ak, R, NB, &acc, t.out + ox * B, t.os, rp, t.rs, t.cob);
+        } else {
+            inline for (0..NB) |nb| {
+                inline for (0..R) |r| vec.store(t.out + nb * t.os + (ox + r) * B, acc[r][nb]);
             }
         }
     }
