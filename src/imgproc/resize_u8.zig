@@ -58,6 +58,7 @@ const neon = struct {
     extern fn @"llvm.aarch64.neon.tbl1.v16i8"(V, V) V;
     extern fn @"llvm.aarch64.neon.uaddlp.v8i16.v16i8"(V) @Vector(8, u16);
     extern fn @"llvm.aarch64.neon.addp.v8i16"(@Vector(8, u16), @Vector(8, u16)) @Vector(8, u16);
+    extern fn @"llvm.aarch64.neon.sqdmulh.v8i16"(@Vector(8, i16), @Vector(8, i16)) @Vector(8, i16);
     inline fn tbl(comptime k: usize, t: [k]V, idx: V) V {
         return switch (k) {
             1 => @"llvm.aarch64.neon.tbl1.v16i8"(t[0], idx),
@@ -86,9 +87,10 @@ const avx512f = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(bui
 /// window does not fit.
 ///
 /// Layout: x86 (vpermb + vpmaddwd) interleaves the taps, index in the even
-/// byte of each 16-bit lane; on NEON (`planar`) the first 16 indices and
-/// weights are tap 0, the next 16 tap 1, so two tbl lookups and a
-/// widening multiply-accumulate do the whole group.
+/// byte of each 16-bit lane; on NEON (`planar`) the first 16 indices are
+/// tap 0, the next 16 tap 1, so two tbl lookups fetch the samples, and `w`
+/// holds the weights split as bytes (w >> 4 for taps 0 and 1, then w & 15)
+/// for u8 x u8 widening multiplies (see hrowGroup).
 pub const Group = struct {
     idx: [idx_len]u8 align(64),
     w: [32]i16 align(64),
@@ -142,7 +144,9 @@ pub fn groups(gpa: Allocator, xt: []const Tap(2), cn: usize, rowlen: usize) Allo
                 const off = t.o[tap] + l - base;
                 if (planar) {
                     if (off >= win) gr.ok = false else gr.idx[tap * 16 + sample] = @intCast(off);
-                    gr.w[tap * 16 + sample] = @intCast(t.w[tap]);
+                    const wb: *[64]u8 = @ptrCast(&gr.w);
+                    wb[tap * 16 + sample] = @intCast(t.w[tap] >> 4);
+                    wb[32 + tap * 16 + sample] = @intCast(t.w[tap] & 15);
                 } else if (avx2_shuf) {
                     // Byte `pair * 2` of each chunk's 32 indices, so the
                     // result is the interleaved pairs as 32 bytes.
@@ -214,13 +218,16 @@ inline fn hrowGroup(comptime W: usize, s: []const u8, out: []i16, g: Group) void
         const w = s[g.base..][0..W];
         var t: [W / 16]neon.V = undefined;
         inline for (0..W / 16) |k| t[k] = w[k * 16 ..][0..16].*;
-        const I = @Vector(16, i32);
-        const s0: @Vector(16, i16) = @intCast(neon.tbl(W / 16, t, g.idx[0..16].*));
-        const s1: @Vector(16, i16) = @intCast(neon.tbl(W / 16, t, g.idx[16..32].*));
-        const w0: @Vector(16, i16) = g.w[0..16].*;
-        const w1: @Vector(16, i16) = g.w[16..32].*;
-        const acc = @as(I, s0) * @as(I, w0) + @as(I, s1) * @as(I, w1);
-        out[0..16].* = @as(@Vector(16, i16), @truncate(acc >> @splat(4)));
+        // (s0 w0 + s1 w1) >> 4 with w = 16 hi + lo (weights are 0..2048):
+        // s0 hi0 + s1 hi1 + ((s0 lo0 + s1 lo1) >> 4), all in u16 (umull,
+        // umlal, usra). The result is below 2^15, so it is the same i16.
+        const U = @Vector(16, u16);
+        const s0: U = neon.tbl(W / 16, t, g.idx[0..16].*);
+        const s1: U = neon.tbl(W / 16, t, g.idx[16..32].*);
+        const wb: *const [64]u8 = @ptrCast(&g.w);
+        const hi = s0 * @as(U, wb[0..16].*) + s1 * @as(U, wb[16..32].*);
+        const lo = s0 * @as(U, wb[32..48].*) + s1 * @as(U, wb[48..64].*);
+        out[0..16].* = @bitCast(hi + (lo >> @splat(4)));
         return;
     }
     if (comptime avx2_shuf) {
@@ -453,6 +460,24 @@ fn vlinear(r0: []const i16, r1: []const i16, b: [2]i32, d: []u8) void {
     const b0: V = @splat(@intCast(b[0]));
     const b1: V = @splat(@intCast(b[1]));
     var x: usize = 0;
+    if (comptime arm_tbl) {
+        // mulhi(a, b) = sqdmulh(a, b) >> 1: (2ab) >> 16 never saturates
+        // for |a| < 2^15 and |b| <= 2^11, and the floors nest.
+        const H = @Vector(8, i16);
+        const c0: H = @splat(@intCast(b[0]));
+        const c1: H = @splat(@intCast(b[1]));
+        while (x + N <= d.len) : (x += N) {
+            var t: [N]i16 = undefined;
+            inline for (0..N / 8) |k| {
+                const m0 = neon.@"llvm.aarch64.neon.sqdmulh.v8i16"(r0[x + 8 * k ..][0..8].*, c0) >> @splat(1);
+                const m1 = neon.@"llvm.aarch64.neon.sqdmulh.v8i16"(r1[x + 8 * k ..][0..8].*, c1) >> @splat(1);
+                t[8 * k ..][0..8].* = (m0 + m1 + @as(H, @splat(2))) >> @splat(2);
+            }
+            const tv: V = t;
+            const cl = @max(@min(tv, @as(V, @splat(255))), @as(V, @splat(0)));
+            d[x..][0..N].* = simd.narrow(u8, cl);
+        }
+    }
     while (x + N <= d.len) : (x += N) {
         const a: V = r0[x..][0..N].*;
         const c: V = r1[x..][0..N].*;
