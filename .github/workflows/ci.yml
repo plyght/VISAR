@@ -69,6 +69,13 @@ jobs:
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg" || true
           echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
       - run: zig build difftest -Doptimize=ReleaseSafe
+      # Runners may or may not have AVX-512; pin the AVX2 and SSE4 paths so a
+      # bug in either cannot hide behind the host CPU.
+      - name: difftest at x86_64_v3 and x86_64_v2
+        if: runner.os == 'Linux'
+        run: |
+          zig build difftest -Doptimize=ReleaseSafe -Dcpu=x86_64_v3
+          zig build difftest -Doptimize=ReleaseSafe -Dcpu=x86_64_v2
       # `visar track --faces` on a still image moving over a canvas: every
       # frame must have a face that follows the known motion, with the
       # detector on a fraction of the frames (skipped without the files).
