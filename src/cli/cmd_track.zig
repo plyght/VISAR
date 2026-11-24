@@ -15,6 +15,12 @@
 //!
 //! With --headless there is no window; stats are printed every second and a
 //! summary (or --json) at the end.
+//!
+//! With --faces MODEL.onnx the worker tracks faces instead (track_lib's
+//! FaceTracker): a YuNet detector runs every few frames, or only around the
+//! tracked faces, or not at all while nothing changes, and MOSSE filters
+//! carry the faces in between. --source image:PATH moves a still image
+//! over a canvas, a source with a known motion to check this against.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,13 +44,17 @@ pub const opts = [_]args.Opt{
     .{ .long = "camera", .value = "N", .help = "Camera number from --list-cameras (default: the default camera)" },
     .{ .long = "size", .value = "WxH", .help = "Largest frame size wanted (default 1280x720)" },
     .{ .long = "fps", .value = "N", .help = "Frame rate wanted (default: the camera's fastest; synthetic: 60)" },
-    .{ .long = "source", .value = "SRC", .help = "camera (default) or synthetic (the demo scene; runs anywhere)" },
+    .{ .long = "source", .value = "SRC", .help = "camera (default), synthetic (demo scene) or image:PATH (a moving still)" },
     .{ .long = "headless", .help = "No window: print stats every second and a summary" },
     .{ .long = "frames", .short = 'n', .value = "N", .help = "Stop after N processed frames" },
     .{ .long = "detect-width", .value = "N", .help = "Width the detector works at (default 640; 0 = full size)" },
     .{ .long = "record", .value = "FILE", .help = "Also write the annotated frames to an animated GIF; same as -o" },
     .{ .long = "lock", .value = "X,Y,W,H", .help = "Lock onto the object in this box (frame pixels); repeatable" },
-    .{ .long = "mode", .value = "MODE", .help = "both (default), motion or locks (Tab cycles in the window)" },
+    .{ .long = "mode", .value = "MODE", .help = "both (default), motion, locks or faces (default with --faces); Tab cycles" },
+    .{ .long = "faces", .value = "MODEL", .help = "Track faces with this YuNet model (face_detection_yunet_2023mar.onnx)" },
+    .{ .long = "face-width", .value = "N", .help = "Width the face detector works at (default 320)" },
+    .{ .long = "detect-every", .value = "N", .help = "Run the face detector every N frames, MOSSE in between (default 4)" },
+    .{ .long = "change-level", .value = "N", .help = "0 off, 1 skip unchanged frames, 2 also detect around faces only (default)" },
     .{ .long = "list-cameras", .help = "List the cameras, their sizes and frame rates, and exit" },
 };
 
@@ -54,12 +64,15 @@ pub const Mode = enum(u8) {
     both,
     motion,
     locks,
+    faces,
 
-    fn next(m: Mode) Mode {
+    /// The next mode for Tab; faces only when a face model is loaded.
+    fn next(m: Mode, faces: bool) Mode {
         return switch (m) {
             .both => .motion,
             .motion => .locks,
-            .locks => .both,
+            .locks => if (faces) .faces else .both,
+            .faces => .both,
         };
     }
 };
@@ -70,7 +83,9 @@ const lost_after = 10;
 /// The synthetic scene starts this many frames in, so objects are on screen.
 const synthetic_preroll = 100;
 
-pub const Source = enum { camera, synthetic };
+pub const Source = enum { camera, synthetic, image };
+
+pub const yunet_url = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx";
 
 const max_record_frames = 900;
 /// Without a frame from the camera for this long, something is wrong.
@@ -84,10 +99,22 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     if (p.flag("list-cameras")) return listCameras(ctx);
 
     var cfg: Config = .{};
-    if (p.value("source")) |v| cfg.source = try args.choice(Source, ctx.diag, "source", v);
+    if (p.value("source")) |v| {
+        if (std.mem.startsWith(u8, v, "image:")) {
+            cfg.source = .image;
+            cfg.image_path = v["image:".len..];
+            if (cfg.image_path.len == 0) {
+                ctx.hint("e.g. --source image:selfie.jpg", .{});
+                return ctx.usage("--source image: needs a file name", .{});
+            }
+        } else if (std.mem.eql(u8, v, "image")) {
+            ctx.hint("e.g. --source image:selfie.jpg", .{});
+            return ctx.usage("--source image needs a file name after a colon", .{});
+        } else cfg.source = try args.choice(Source, ctx.diag, "source", v);
+    }
     if (p.value("camera")) |v| {
         cfg.camera_index = try args.int(usize, ctx.diag, "--camera", v, 0, 63);
-        if (cfg.source == .synthetic) ctx.warn("--camera does not apply to --source synthetic; ignored", .{});
+        if (cfg.source != .camera) ctx.warn("--camera does not apply to --source {s}; ignored", .{@tagName(cfg.source)});
     }
     if (p.value("size")) |v| {
         const s = try args.size(ctx.diag, v, false);
@@ -104,7 +131,19 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     if (p.value("frames")) |v| cfg.frame_limit = try args.int(usize, ctx.diag, "--frames", v, 1, std.math.maxInt(u32));
     if (p.value("detect-width")) |v| cfg.detect_width = try args.int(u32, ctx.diag, "--detect-width", v, 0, 7680);
     cfg.headless = p.flag("headless");
+    cfg.faces_path = p.value("faces");
+    if (p.value("face-width")) |v| cfg.face.face_width = try args.int(u32, ctx.diag, "--face-width", v, 32, 4096);
+    if (p.value("detect-every")) |v| cfg.face.detect_every = try args.int(u32, ctx.diag, "--detect-every", v, 1, 1000);
+    if (p.value("change-level")) |v| cfg.face.level = try args.int(u8, ctx.diag, "--change-level", v, 0, 2);
+    if (cfg.faces_path == null) for ([_][]const u8{ "face-width", "detect-every", "change-level" }) |o| {
+        if (p.value(o) != null) ctx.warn("--{s} applies to face tracking (--faces MODEL); ignored", .{o});
+    };
+    if (cfg.faces_path != null) cfg.mode = .faces;
     if (p.value("mode")) |v| cfg.mode = try args.choice(Mode, ctx.diag, "mode", v);
+    if (cfg.mode == .faces and cfg.faces_path == null) {
+        ctx.hint("give the YuNet model with --faces face_detection_yunet_2023mar.onnx, from {s}", .{yunet_url});
+        return ctx.usage("--mode faces needs --faces MODEL", .{});
+    }
     for (p.hits.items) |h| {
         if (!std.mem.eql(u8, h.opt.long, "lock")) continue;
         if (cfg.lock_count == max_locks) return ctx.usage("at most {d} --lock boxes", .{max_locks});
@@ -153,6 +192,9 @@ const Config = struct {
     mode: Mode = .both,
     locks: [max_locks][4]f32 = undefined,
     lock_count: usize = 0,
+    image_path: []const u8 = "",
+    faces_path: ?[]const u8 = null,
+    face: track.FaceOptions = .{},
 };
 
 fn parseBox(ctx: *Ctx, v: []const u8) ![4]f32 {
@@ -221,6 +263,14 @@ const Live = struct {
     /// Ground truth per ring buffer (synthetic source).
     truth: [FrameRing.capacity][16]track.Scene.Truth = undefined,
     truth_len: [FrameRing.capacity]usize = @splat(0),
+    /// The image's offset per ring buffer (image source).
+    still_off: [FrameRing.capacity][2]i32 = undefined,
+    /// Face tracking (worker-owned), with --faces.
+    faces: ?track.FaceTracker = null,
+    still_truth: track.StillTruth = .{},
+    /// Detector runs so far, for the detection rate (main thread reads).
+    det_runs: std.atomic.Value(usize) = .init(0),
+    det_fps: std.atomic.Value(u32) = .init(0),
 
     /// Worker-owned.
     det: track.Detector,
@@ -231,8 +281,9 @@ const Live = struct {
     first_ns: i96 = 0,
     last_ns: i96 = 0,
     recorder: ?Recorder = null,
-    /// Synthetic source (the producer thread owns it).
+    /// Synthetic or image source (the producer thread owns it).
     scene: ?*track.Scene = null,
+    still: ?*track.StillScene = null,
     synthetic_fps: ?f64 = null,
     hud_label: []const u8 = "",
     hud_cache: Hud,
@@ -262,6 +313,7 @@ const StageSums = struct {
     components: f64 = 0,
     tracker: f64 = 0,
     locks: f64 = 0,
+    faces: f64 = 0,
     draw: f64 = 0,
 };
 
@@ -341,11 +393,10 @@ fn onCameraFrame(c: *anyopaque, img: Image(u8), pts: f64) void {
     ring.publishCaptured(live.io, i);
 }
 
-/// Renders the synthetic scene into the ring, paced to `synthetic_fps`
-/// (or as fast as it goes without one).
+/// Renders the synthetic scene (or the moving image) into the ring, paced
+/// to `synthetic_fps` (or as fast as it goes without one).
 fn syntheticMain(live: *Live) void {
-    const scene = live.scene.?;
-    var rgb = Image(u8).init(live.gpa, scene.width, scene.height, 3) catch |e| {
+    var rgb = Image(u8).init(live.gpa, live.ring.width, live.ring.height, 3) catch |e| {
         live.worker_error = e;
         live.stop.store(true, .release);
         return;
@@ -379,9 +430,13 @@ fn syntheticMain(live: *Live) void {
 fn produceSynthetic(live: *Live, rgb: Image(u8)) bool {
     const ring = live.ring;
     const i = ring.acquire() orelse return false;
-    live.scene.?.render(rgb, .fast);
-    live.truth_len[i] = live.scene.?.truth(&live.truth[i]).len;
-    visar.imgproc.cvtColor(.serial, rgb, ring.image(i), .rgb2bgra) catch unreachable;
+    if (live.still) |still| {
+        live.still_off[i] = still.render(ring.image(i));
+    } else {
+        live.scene.?.render(rgb, .fast);
+        live.truth_len[i] = live.scene.?.truth(&live.truth[i]).len;
+        visar.imgproc.cvtColor(.serial, rgb, ring.image(i), .rgb2bgra) catch unreachable;
+    }
     const seq = live.captured.fetchAdd(1, .monotonic);
     ring.meta[i] = .{ .seq = seq, .t_ns = live.now(), .pts = 0 };
     ring.publishCaptured(if (visar.core.pool.threads_supported) live.io else null, i);
@@ -408,7 +463,10 @@ fn workerMain(live: *Live) void {
 fn processOne(live: *Live, i: u8) !void {
     const ring = live.ring;
     const frame = ring.image(i);
-    if (live.reset.swap(false, .acq_rel)) live.det.reset();
+    if (live.reset.swap(false, .acq_rel)) {
+        live.det.reset();
+        if (live.faces) |*f| f.reset();
+    }
 
     var clock: track.Clock = .{ .io = live.io };
     _ = clock.lap();
@@ -416,17 +474,26 @@ fn processOne(live: *Live, i: u8) !void {
     const t_convert = clock.lap();
     const mode: Mode = @fromBackingInt(@intCast(live.mode.load(.monotonic)));
     var st: track.StageTimes = .{};
-    if (mode != .locks) try live.det.detect(live.exec, live.small, .{ .io = live.io, .times = &st });
+    if (mode == .both or mode == .motion) try live.det.detect(live.exec, live.small, .{ .io = live.io, .times = &st });
+    _ = clock.lap();
+    var t_faces: f64 = 0;
+    if (mode == .faces) if (live.faces) |*ft| {
+        const what = try ft.step(live.exec, live.io, frame, live.small);
+        if (what == .full or what == .crops) _ = live.det_runs.fetchAdd(1, .monotonic);
+        t_faces = clock.lap();
+        if (live.still != null) live.still_truth.score(ft.faces(), live.still_off[i]);
+    };
     _ = clock.lap();
     try updateLocks(live, i);
     const t_locks = clock.lap();
     const k: f32 = @floatFromInt(live.factor);
     const thick: i64 = @max(2, frame.width / 400);
     const ls: u32 = @max(2, frame.width / 640);
-    if (mode != .locks) drawTracks32(frame, live.det.tracker, k, thick, ls);
+    if (mode == .both or mode == .motion) drawTracks32(frame, live.det.tracker, k, thick, ls);
+    if (mode == .faces) if (live.faces) |*ft| drawFaces(frame, ft.faces(), thick, ls);
     if (mode != .motion) drawLocks(live, frame, k, thick, ls);
     if (live.windowed) drawDrag(live, frame, thick);
-    const ms_so_far = t_convert + st.blur + st.background + st.morphology + st.components + st.tracker + t_locks;
+    const ms_so_far = t_convert + st.blur + st.background + st.morphology + st.components + st.tracker + t_faces + t_locks;
     if (live.hud.load(.monotonic)) drawHud(live, frame, ms_so_far);
     const t_draw = clock.lap();
 
@@ -439,6 +506,7 @@ fn processOne(live: *Live, i: u8) !void {
     s.components += st.components;
     s.tracker += st.tracker;
     s.locks += t_locks;
+    s.faces += t_faces;
     s.draw += t_draw;
     try live.times.append(live.gpa, ms);
     live.ema_ms = if (live.ema_ms == 0) ms else 0.9 * live.ema_ms + 0.1 * ms;
@@ -446,7 +514,7 @@ fn processOne(live: *Live, i: u8) !void {
     if (live.first_ns == 0) live.first_ns = t;
     live.last_ns = t;
 
-    live.tracks_now.store(@intCast(track.countConfirmed(live.det.tracker)), .monotonic);
+    live.tracks_now.store(@intCast(if (mode == .faces) (if (live.faces) |*f| f.tracks.items.len else 0) else track.countConfirmed(live.det.tracker)), .monotonic);
     if (live.recorder) |*r| r.add(live, frame);
 
     if (live.windowed) ring.publishProcessed(i) else ring.release(i);
@@ -596,6 +664,36 @@ fn drawDrag(live: *Live, frame: Image(u8), thick: i64) void {
     outline32(frame, @intFromFloat(r[0]), @intFromFloat(r[1]), @intFromFloat(r[2]), @intFromFloat(r[3]), @max(1, @divTrunc(thick, 2)), bgra(255, 255, 255));
 }
 
+/// Face boxes labelled with their id and detection score, and the five
+/// landmarks as dots (eyes blue and red, nose green, mouth corners magenta
+/// and yellow, as in OpenCV's YuNet demo). A face whose filter is unsure
+/// is drawn in orange.
+fn drawFaces(frame: Image(u8), faces: []const track.FaceTrack, thick: i64, ls: u32) void {
+    const lsi: i64 = ls;
+    const dots = [5]u32{ bgra(0, 0, 255), bgra(255, 0, 0), bgra(0, 255, 0), bgra(255, 0, 255), bgra(255, 255, 0) };
+    for (faces) |f| {
+        const rgb = track.idColor(f.id);
+        const col = if (f.ok) bgra(rgb[0], rgb[1], rgb[2]) else bgra(255, 150, 0);
+        const bx: i64 = @intFromFloat(f.box.x);
+        const by: i64 = @intFromFloat(f.box.y);
+        const bw: i64 = @intFromFloat(f.box.w);
+        const bh: i64 = @intFromFloat(f.box.h);
+        outline32(frame, bx - thick, by - thick, bw + 2 * thick, bh + 2 * thick, thick, col);
+        const r = @max(2, thick);
+        for (0..5) |n| {
+            const p = f.landmark(n);
+            const px: i64 = @intFromFloat(p[0]);
+            const py: i64 = @intFromFloat(p[1]);
+            fill32(frame, px - r, py - r, px + r + 1, py + r + 1, dots[n]);
+        }
+        var lbuf: [32]u8 = undefined;
+        const label = std.fmt.bufPrint(&lbuf, "FACE {d} {d:.2}", .{ f.id, f.score }) catch "FACE";
+        const lw: i64 = @as(i64, @intCast(label.len)) * 6 * lsi + 3 * lsi;
+        fill32(frame, bx - thick, by - thick - 10 * lsi, bx - thick + lw, by - thick, col);
+        _ = draw.text(frame, bx - thick + 2 * lsi, by - thick - 9 * lsi, label, ls, &.{ 0, 0, 0, 255 });
+    }
+}
+
 fn outline32(img: Image(u8), x: i64, y: i64, w: i64, h: i64, t: i64, col: u32) void {
     fill32(img, x, y, x + w, y + t, col);
     fill32(img, x, y + h - t, x + w, y + h, col);
@@ -642,16 +740,22 @@ fn renderHud(live: *Live, hud: *Hud, fw: u32, fh: u32, ms_now: f64) void {
     const si: i64 = s;
     const line_h = 9 * si;
     const ms = if (live.ema_ms > 0) live.ema_ms else ms_now;
-    var b: [3][128]u8 = undefined;
+    var b: [3][160]u8 = undefined;
     const cam_fps = Live.getF32(&live.input_fps);
     const disp_fps = Live.getF32(&live.display_fps);
     const l1 = std.fmt.bufPrint(&b[0], "{s}  {d}x{d}  {d:.0} FPS", .{ live.hud_label, fw, fh, cam_fps }) catch "";
-    const l2 = std.fmt.bufPrint(&b[1], "VISAR {d:.2} MS/FRAME = {d:.0} FPS  TRACKS {d}", .{ ms, if (ms > 0) 1000 / ms else 0, track.countConfirmed(live.det.tracker) }) catch "";
     const mode: Mode = @fromBackingInt(@intCast(live.mode.load(.monotonic)));
+    const l2 = if (mode == .faces and live.faces != null) blk: {
+        const fs = live.faces.?.stats;
+        break :blk std.fmt.bufPrint(&b[1], "VISAR {d:.2} MS/FRAME = {d:.0} FPS  FACES {d}  DETECT {d:.1} MS {d:.0}/S  SKIPPED {d}  CROPS {d}", .{
+            ms, if (ms > 0) 1000 / ms else 0, live.faces.?.tracks.items.len, fs.meanDetectMs(), Live.getF32(&live.det_fps), fs.postponed, fs.crop_rounds,
+        }) catch "";
+    } else std.fmt.bufPrint(&b[1], "VISAR {d:.2} MS/FRAME = {d:.0} FPS  TRACKS {d}", .{ ms, if (ms > 0) 1000 / ms else 0, track.countConfirmed(live.det.tracker) }) catch "";
     const mode_name = switch (mode) {
         .both => "MOTION+LOCKS",
         .motion => "MOTION",
         .locks => "LOCKS",
+        .faces => "FACES+LOCKS",
     };
     const l3 = if (live.windowed)
         std.fmt.bufPrint(&b[2], "DISPLAY {d:.0} FPS  {s}  DRAG LOCK  C CLEAR  TAB MODE  Q QUIT", .{ disp_fps, mode_name }) catch ""
@@ -808,6 +912,8 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     defer if (cam) |c| c.close();
     var scene: ?track.Scene = null;
     defer if (scene) |*s| s.deinit();
+    var still: ?track.StillScene = null;
+    defer if (still) |*s| s.deinit();
     var W: u32 = cfg.width;
     var H: u32 = cfg.height;
     var input_fps: f64 = 0;
@@ -819,6 +925,12 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     // the camera is opened first and started only once everything exists.
     var live_storage: Live = undefined;
     const live = &live_storage;
+
+    // The face model is read before the camera opens, so a bad path fails
+    // fast.
+    var model: ?[]u8 = null;
+    defer if (model) |m| gpa.free(m);
+    if (cfg.faces_path) |path| model = try imageio.readAll(ctx, path);
 
     switch (cfg.source) {
         .camera => {
@@ -842,6 +954,18 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
             for (0..synthetic_preroll) |_| scene.?.advance();
             input_fps = cfg.fps orelse if (cfg.headless) 0 else 60;
         },
+        .image => {
+            var in = try imageio.load(ctx, cfg.image_path, .color);
+            defer in.deinit(gpa);
+            // Decoded as RGB; the canvas is BGRA.
+            var bgr = Image(u8).init(gpa, in.img.u8.width, in.img.u8.height, 3) catch |e| return ctx.fail("out of memory: {s}", .{cx.describe(e)});
+            defer bgr.deinit(gpa);
+            visar.imgproc.cvtColor(exec, in.img.u8, bgr, .rgb2bgr) catch |e| return ctx.fail("cannot convert the image: {s}", .{cx.describe(e)});
+            still = track.StillScene.init(gpa, exec, bgr, W, H) catch |e| return ctx.fail("cannot build the image source: {s}", .{cx.describe(e)});
+            device_name = imageio.displayName(cfg.image_path, "stdin");
+            pixel_format = "BGRA";
+            input_fps = cfg.fps orelse if (cfg.headless) 0 else 60;
+        },
     }
 
     var ring = FrameRing.init(gpa, W, H, 4) catch |e| return ctx.fail("cannot allocate frame buffers: {s}", .{cx.describe(e)});
@@ -860,6 +984,13 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     defer det.deinit();
     var small = Image(u8).init(gpa, dw, dh, 1) catch |e| return ctx.fail("cannot allocate the detector: {s}", .{cx.describe(e)});
     defer small.deinit(gpa);
+    var faces: ?track.FaceTracker = null;
+    if (model) |m| faces = track.FaceTracker.create(gpa, m, W, H, factor, cfg.face) catch |e| {
+        const name = imageio.displayName(cfg.faces_path.?, "stdin");
+        if (e == error.OutOfMemory) return ctx.fail("cannot load the face model '{s}': out of memory", .{name});
+        ctx.hint("--faces takes the YuNet model face_detection_yunet_2023mar.onnx from {s}", .{yunet_url});
+        return ctx.fail("cannot load '{s}' as a YuNet face model: {s}", .{ name, cx.describe(e) });
+    };
 
     var label_buf: [48]u8 = undefined;
     live.* = .{
@@ -873,8 +1004,14 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
         .det = det,
         .small = small,
         .scene = if (scene) |*s| s else null,
-        .synthetic_fps = if (cfg.source == .synthetic) (if (input_fps > 0) input_fps else null) else null,
-        .hud_label = upperLabel(&label_buf, if (cfg.source == .synthetic) "SYNTHETIC" else device_name),
+        .still = if (still) |*s| s else null,
+        .faces = faces,
+        .synthetic_fps = if (cfg.source != .camera) (if (input_fps > 0) input_fps else null) else null,
+        .hud_label = upperLabel(&label_buf, switch (cfg.source) {
+            .synthetic => "SYNTHETIC",
+            .image => "IMAGE",
+            .camera => device_name,
+        }),
         .hud_cache = Hud.init(gpa, W, H) catch |e| return ctx.fail("out of memory: {s}", .{cx.describe(e)}),
     };
     defer live.hud_cache.deinit(gpa);
@@ -894,6 +1031,7 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     }
     // `det` now lives in `live`; the deferred deinit must see the same state.
     defer det = live.det;
+    defer if (live.faces) |*f| f.deinit();
     defer live.times.deinit(gpa);
     if (record_out != null) live.recorder = Recorder.init(gpa, W, H, if (input_fps > 0) input_fps else 30) catch |e| return ctx.fail("cannot start the recording: {s}", .{cx.describe(e)});
     defer if (live.recorder) |*r| r.deinit(gpa);
@@ -906,7 +1044,9 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
             s.print(w, .dim, " {s} at {d:.0} fps", .{ pixel_format, input_fps }) catch {};
             if (cfg.fps) |want| if (@abs(want - input_fps) > 0.5) s.print(w, .dim, " ({d:.0} asked; this format tops out at {d:.0})", .{ want, format_max_fps }) catch {};
         } else if (input_fps > 0) s.print(w, .dim, " at {d:.0} fps", .{input_fps}) catch {} else s.print(w, .dim, " as fast as it renders", .{}) catch {};
-        s.print(w, .dim, " · detecting at {d}x{d} on {d} thread{s}\n", .{ dw, dh, exec.threads(), if (exec.threads() == 1) "" else "s" }) catch {};
+        s.print(w, .dim, " · tracking at {d}x{d}", .{ dw, dh }) catch {};
+        if (live.faces) |f| s.print(w, .dim, ", faces at {d}x{d}", .{ f.det_w, f.det_h }) catch {};
+        s.print(w, .dim, " on {d} thread{s}\n", .{ exec.threads(), if (exec.threads() == 1) "" else "s" }) catch {};
         if (live.windowed) s.print(w, .dim, "  q or Esc quits, space resets the background, h toggles the HUD\n", .{}) catch {};
         w.flush() catch {};
     }
@@ -941,7 +1081,7 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
 
         switch (cfg.source) {
             .camera => cam.?.start() catch |e| return cameraError(ctx, e, cfg),
-            .synthetic => producer = std.Thread.spawn(.{}, syntheticMain, .{live}) catch |e| return ctx.fail("cannot start the scene thread: {s}", .{cx.describe(e)}),
+            .synthetic, .image => producer = std.Thread.spawn(.{}, syntheticMain, .{live}) catch |e| return ctx.fail("cannot start the scene thread: {s}", .{cx.describe(e)}),
         }
 
         const outcome = if (live.windowed) try windowLoop(ctx, live, device_name, W, H) else headlessLoop(ctx, live);
@@ -980,6 +1120,7 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     st.pixel_format = pixel_format;
     st.mode = cfg.mode;
     st.locks = live.lock_reports.items;
+    if (live.faces) |f| st.faces = faceSummary(live, f, cfg, st);
 
     if (live.recorder) |*r| {
         if (r.failed) |e| ctx.warn("the recording failed: {s}", .{cx.describe(e)}) else if (r.frames > 0) {
@@ -1007,6 +1148,7 @@ const Meter = struct {
     captured: usize = 0,
     processed: usize = 0,
     shown: usize = 0,
+    det_runs: usize = 0,
 
     const Rates = struct { input: f64, processed: f64, shown: f64 };
 
@@ -1021,7 +1163,9 @@ const Meter = struct {
             .processed = @as(f64, @floatFromInt(p - m.processed)) / dt,
             .shown = @as(f64, @floatFromInt(shown - m.shown)) / dt,
         };
-        m.* = .{ .t = t, .captured = c, .processed = p, .shown = shown };
+        const d = live.det_runs.load(.monotonic);
+        Live.setF32(&live.det_fps, @as(f64, @floatFromInt(d - m.det_runs)) / dt);
+        m.* = .{ .t = t, .captured = c, .processed = p, .shown = shown, .det_runs = d };
         Live.setF32(&live.input_fps, r.input);
         Live.setF32(&live.display_fps, r.shown);
         return r;
@@ -1058,7 +1202,7 @@ fn windowLoop(ctx: *Ctx, live: *Live, name: []const u8, W: u32, H: u32) !Outcome
         if (in.reset) live.reset.store(true, .release);
         if (in.toggle_hud) live.hud.store(!live.hud.load(.monotonic), .monotonic);
         if (in.clear) live.clear_locks.store(true, .release);
-        if (in.cycle_mode) live.mode.store(@backingInt(@as(Mode, @fromBackingInt(@intCast(live.mode.load(.monotonic)))).next()), .monotonic);
+        if (in.cycle_mode) live.mode.store(@backingInt(@as(Mode, @fromBackingInt(@intCast(live.mode.load(.monotonic)))).next(live.faces != null)), .monotonic);
         if (in.selection) |r| {
             live.request_mutex.lockUncancelable(live.io);
             if (live.request_count < max_locks) {
@@ -1076,7 +1220,7 @@ fn windowLoop(ctx: *Ctx, live: *Live, name: []const u8, W: u32, H: u32) !Outcome
             shown += 1;
         }
         _ = meter.tick(live, shown);
-        if (live.captured.load(.monotonic) == 0 and secondsSince(live, t0) > no_frames_timeout_s and live.scene == null) return .no_frames;
+        if (live.captured.load(.monotonic) == 0 and secondsSince(live, t0) > no_frames_timeout_s and live.scene == null and live.still == null) return .no_frames;
     }
     if (live.done.load(.acquire)) {
         // Show the last frame.
@@ -1109,13 +1253,22 @@ fn headlessLoop(ctx: *Ctx, live: *Live) Outcome {
         if (meter.tick(live, 0)) |r| {
             if (!ctx.quiet) {
                 const n = live.processed.load(.monotonic);
-                ctx.se.print(ctx.err, .dim, "  {d:>5.1} s  frame {d:>6}  input {d:>6.1} fps  processed {d:>6.1} fps  visar {d:.2} ms ({d:.0} fps)  tracks {d}\n", .{
-                    secondsSince(live, t0), n, r.input, r.processed, live.ema_ms, if (live.ema_ms > 0) 1000 / live.ema_ms else 0, live.tracks_now.load(.monotonic),
+                const faces = live.mode.load(.monotonic) == @backingInt(Mode.faces);
+                ctx.se.print(ctx.err, .dim, "  {d:>5.1} s  frame {d:>6}  input {d:>6.1} fps  processed {d:>6.1} fps  visar {d:.2} ms ({d:.0} fps)  {s} {d}", .{
+                    secondsSince(live, t0), n, r.input, r.processed, live.ema_ms, if (live.ema_ms > 0) 1000 / live.ema_ms else 0, if (faces) "faces" else "tracks", live.tracks_now.load(.monotonic),
                 }) catch {};
+                if (faces) {
+                    // The worker updates these counters; a torn read only
+                    // skews one stats line.
+                    const fs = @atomicLoad(u64, &live.faces.?.stats.postponed, .monotonic);
+                    const cr = @atomicLoad(u64, &live.faces.?.stats.crop_rounds, .monotonic);
+                    ctx.se.print(ctx.err, .dim, "  detector {d:.1}/s  skipped {d}  crop-only {d}", .{ Live.getF32(&live.det_fps), fs, cr }) catch {};
+                }
+                ctx.se.print(ctx.err, .dim, "\n", .{}) catch {};
                 ctx.err.flush() catch {};
             }
         }
-        if (live.captured.load(.monotonic) == 0 and secondsSince(live, t0) > no_frames_timeout_s and live.scene == null) return .no_frames;
+        if (live.captured.load(.monotonic) == 0 and secondsSince(live, t0) > no_frames_timeout_s and live.scene == null and live.still == null) return .no_frames;
     }
     return .ok;
 }
@@ -1151,8 +1304,107 @@ const Summary = struct {
     recorded: u32 = 0,
     mode: Mode = .both,
     locks: []const LockReport = &.{},
+    faces: ?FaceSummary = null,
     pipeline: []const u8 = "gray and area downscale in one pass, Gaussian 5x5, background subtraction, open 3x3, dilate (ellipse), connected components, tracker, drawing",
 };
+
+const FaceSummary = struct {
+    model: []const u8,
+    /// The whole-frame detector input.
+    input_width: u32,
+    input_height: u32,
+    detect_every: u32,
+    change_level: u8,
+    frames: u64,
+    faces_now: usize,
+    max_faces: u32,
+    tracks_started: u64,
+    /// Frames the detector ran on, and that as a fraction of all frames.
+    detect_frames: u64,
+    detect_fraction: f64,
+    detections_per_second: f64,
+    full_frame_runs: u64,
+    /// Level 2: detections that ran only on crops around tracked faces.
+    crop_only_runs: u64,
+    crops: u64,
+    /// Level 1: frames whose scheduled detection was postponed because the
+    /// frame had not changed.
+    skipped_unchanged: u64,
+    /// Detector time per run (frame conversion included), all runs, whole
+    /// frame and crop-only.
+    detect_ms_mean: f64,
+    full_frame_ms_mean: f64,
+    crop_only_ms_mean: f64,
+    /// Frame to detector input (area downscale, BGRA to BGR) per run.
+    convert_ms_mean: f64,
+    /// MOSSE, scheduling and matching per frame.
+    track_ms_mean: f64,
+    /// Detector time over all processing time.
+    detector_share: f64,
+    /// Detector time level 2 saved (crop-only runs at the whole-frame mean,
+    /// minus what they took), and that against the detector time without it.
+    crop_saving_ms: f64,
+    crop_saving_fraction: f64,
+    /// Image source: tracked faces against the image's known motion.
+    ground_truth: ?struct {
+        frames: u64,
+        /// Faces of the first detection (the truth, moved with the image).
+        faces: usize,
+        /// Fraction of frames with a tracked face at IoU >= 0.5.
+        followed: f64,
+        mean_faces_followed: f64,
+        mean_iou: f64,
+        mean_center_error_px: f64,
+    } = null,
+};
+
+fn faceSummary(live: *Live, f: track.FaceTracker, cfg: Config, st: Summary) FaceSummary {
+    const s = f.stats;
+    const nf: f64 = @floatFromInt(@max(1, s.frames));
+    var total_ms: f64 = 0;
+    for (live.times.items) |t| total_ms += t;
+    const det_ms = s.detectMs();
+    const saving = s.cropSavingMs();
+    var out: FaceSummary = .{
+        .model = imageio.displayName(cfg.faces_path.?, "stdin"),
+        .input_width = f.det_w,
+        .input_height = f.det_h,
+        .detect_every = f.opts.detect_every,
+        .change_level = f.opts.level,
+        .frames = s.frames,
+        .faces_now = f.tracks.items.len,
+        .max_faces = s.max_faces,
+        .tracks_started = s.tracks_started,
+        .detect_frames = s.detect_frames,
+        .detect_fraction = @as(f64, @floatFromInt(s.detect_frames)) / nf,
+        .detections_per_second = if (st.seconds > 0) @as(f64, @floatFromInt(s.detect_frames)) / st.seconds else 0,
+        .full_frame_runs = s.full_runs,
+        .crop_only_runs = s.crop_rounds,
+        .crops = s.crops,
+        .skipped_unchanged = s.postponed,
+        .detect_ms_mean = s.meanDetectMs(),
+        .full_frame_ms_mean = s.meanFullMs(),
+        .crop_only_ms_mean = s.meanCropMs(),
+        .convert_ms_mean = if (s.detect_frames > 0) s.convert_ms / @as(f64, @floatFromInt(s.detect_frames)) else 0,
+        .track_ms_mean = s.track_ms / nf,
+        .detector_share = if (total_ms > 0) det_ms / total_ms else 0,
+        .crop_saving_ms = saving,
+        .crop_saving_fraction = if (det_ms + saving > 0) saving / (det_ms + saving) else 0,
+    };
+    const t = live.still_truth;
+    if (live.still != null and t.frames > 0) {
+        const n: f64 = @floatFromInt(t.frames);
+        out.ground_truth = .{
+            .frames = t.frames,
+            .faces = t.n,
+            .followed = @as(f64, @floatFromInt(t.followed)) / n,
+            .mean_faces_followed = t.faces_sum / n,
+            .mean_iou = t.iou_sum / n,
+            .mean_center_error_px = t.err_sum / n,
+        };
+    }
+    return out;
+}
 
 fn summarize(live: *Live, t_start: i96, t_end: i96) Summary {
     var s: Summary = .{};
@@ -1165,7 +1417,7 @@ fn summarize(live: *Live, t_start: i96, t_end: i96) Summary {
     const span = @as(f64, @floatFromInt(live.last_ns - live.first_ns)) / 1e9;
     s.output_fps = if (n > 1 and span > 0) @as(f64, @floatFromInt(n - 1)) / span else 0;
     s.dropped = captured -| n;
-    s.tracks = live.det.tracker.next_id - 1;
+    s.tracks = if (live.faces) |f| f.next_id - 1 else live.det.tracker.next_id - 1;
     if (live.windowed) s.display_fps = live.display_fps_mean;
     if (n == 0) return s;
     // Statistics after a short warm-up (the background is still settling).
@@ -1178,7 +1430,7 @@ fn summarize(live: *Live, t_start: i96, t_end: i96) Summary {
     s.processing = .{ .mean_ms = mean, .p50_ms = t[t.len / 2], .p95_ms = t[@min(t.len - 1, t.len * 95 / 100)], .fps = if (mean > 0) 1000 / mean else 0 };
     const nf: f64 = @floatFromInt(n);
     const a = live.stage_sum;
-    s.stages_ms = .{ .convert = a.convert / nf, .blur = a.blur / nf, .background = a.background / nf, .morphology = a.morphology / nf, .components = a.components / nf, .tracker = a.tracker / nf, .locks = a.locks / nf, .draw = a.draw / nf };
+    s.stages_ms = .{ .convert = a.convert / nf, .blur = a.blur / nf, .background = a.background / nf, .morphology = a.morphology / nf, .components = a.components / nf, .tracker = a.tracker / nf, .locks = a.locks / nf, .faces = a.faces / nf, .draw = a.draw / nf };
     return s;
 }
 
@@ -1198,17 +1450,39 @@ fn report(ctx: *Ctx, s: Summary, record_out: ?imageio.Output) !void {
     const ms = s.processing;
     const sm = s.stages_ms;
     defer writeLocks(w, st, s.locks) catch {};
+    defer if (s.faces) |f| writeFaces(w, st, f) catch {};
     try term.writeFields(w, st, 2, &.{
-        .{ "source", std.fmt.bufPrint(&b[0], "{s}, {d}x{d}{s}{s}", .{ s.device, s.width, s.height, if (s.source == .camera) " " else "", if (s.source == .camera) s.pixel_format else "" }) catch "" },
-        .{ "input", std.fmt.bufPrint(&b[1], "{d:.1} fps measured{s}", .{ s.input_fps, if (s.source == .synthetic and s.input_fps_set == 0) " (unpaced)" else "" }) catch "" },
+        .{ "source", std.fmt.bufPrint(&b[0], "{s}{s}, {d}x{d}{s}{s}", .{ if (s.source == .image) "image " else "", s.device, s.width, s.height, if (s.source == .camera) " " else "", if (s.source == .camera) s.pixel_format else "" }) catch "" },
+        .{ "input", std.fmt.bufPrint(&b[1], "{d:.1} fps measured{s}", .{ s.input_fps, if (s.source != .camera and s.input_fps_set == 0) " (unpaced)" else "" }) catch "" },
         .{ "visar", std.fmt.bufPrint(&b[2], "{d:.2} ms per frame = {d:.0} fps (p50 {d:.2}, p95 {d:.2} ms)", .{ ms.mean_ms, ms.fps, ms.p50_ms, ms.p95_ms }) catch "" },
-        .{ "stages", std.fmt.bufPrint(&b[3], "convert {d:.2} · blur {d:.2} · bg {d:.2} · morph {d:.2} · cc {d:.2} · track {d:.2} · locks {d:.2} · draw {d:.2} ms", .{ sm.convert, sm.blur, sm.background, sm.morphology, sm.components, sm.tracker, sm.locks, sm.draw }) catch "" },
+        .{ "stages", if (s.mode == .faces)
+            std.fmt.bufPrint(&b[3], "convert {d:.2} · faces {d:.2} · locks {d:.2} · draw {d:.2} ms", .{ sm.convert, sm.faces, sm.locks, sm.draw }) catch ""
+        else
+            std.fmt.bufPrint(&b[3], "convert {d:.2} · blur {d:.2} · bg {d:.2} · morph {d:.2} · cc {d:.2} · track {d:.2} · locks {d:.2} · draw {d:.2} ms", .{ sm.convert, sm.blur, sm.background, sm.morphology, sm.components, sm.tracker, sm.locks, sm.draw }) catch "" },
         .{ "processed", std.fmt.bufPrint(&b[4], "{d:.1} fps end to end, {d} frames skipped (newest frame wins)", .{ s.output_fps, s.dropped }) catch "" },
         .{ "display", if (s.display_fps) |d| std.fmt.bufPrint(&b[5], "{d:.1} fps", .{d}) catch "" else "none (headless)" },
-        .{ "detector", std.fmt.bufPrint(&b[6], "{d}x{d}, {d} thread{s}, {d} objects seen", .{ s.detect_width, s.detect_height, s.threads, if (s.threads == 1) "" else "s", s.tracks }) catch "" },
+        .{ "detector", std.fmt.bufPrint(&b[6], "{d}x{d}, {d} thread{s}, {d} {s} seen", .{ s.detect_width, s.detect_height, s.threads, if (s.threads == 1) "" else "s", s.tracks, if (s.mode == .faces) "faces" else "objects" }) catch "" },
         .{ "mode", @tagName(s.mode) },
         .{ "recording", if (record_out) |o| std.fmt.bufPrint(&b[7], "{s} ({d} frames)", .{ o.name(), s.recorded }) catch "" else "none" },
     });
+}
+
+fn writeFaces(w: *Io.Writer, st: term.Style, f: FaceSummary) !void {
+    try w.writeAll("\n  ");
+    try st.paint(w, .bold, "faces");
+    try st.print(w, .dim, " {s} at {d}x{d}, every {d} frames, change level {d}\n", .{ f.model, f.input_width, f.input_height, f.detect_every, f.change_level });
+    try w.print("  detector ran on {d} of {d} frames ({d:.1}%, {d:.1}/s): {d} whole-frame ({d:.2} ms), {d} crop-only ({d} crops, {d:.2} ms); {d} skipped as unchanged\n", .{
+        f.detect_frames, f.frames, 100 * f.detect_fraction, f.detections_per_second, f.full_frame_runs, f.full_frame_ms_mean, f.crop_only_runs, f.crops, f.crop_only_ms_mean, f.skipped_unchanged,
+    });
+    try w.print("  detector {d:.2} ms per run, {d:.1}% of processing time; crop-only runs saved {d:.0} ms ({d:.0}% of detector time); MOSSE and matching {d:.3} ms per frame\n", .{
+        f.detect_ms_mean, 100 * f.detector_share, f.crop_saving_ms, 100 * f.crop_saving_fraction, f.track_ms_mean,
+    });
+    try w.print("  {d} faces now, at most {d} at once, {d} tracks started\n", .{ f.faces_now, f.max_faces, f.tracks_started });
+    if (f.ground_truth) |g| {
+        try w.print("  vs the image's motion: a face followed in {d:.1}% of {d} frames (IoU >= 0.5), {d:.2} of {d} faces on average, best IoU {d:.2}, centre error {d:.1} px\n", .{
+            100 * g.followed, g.frames, g.mean_faces_followed, g.faces, g.mean_iou, g.mean_center_error_px,
+        });
+    }
 }
 
 fn writeLocks(w: *Io.Writer, st: term.Style, locks: []const LockReport) !void {

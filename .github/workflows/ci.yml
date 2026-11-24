@@ -69,6 +69,19 @@ jobs:
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg" || true
           echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
       - run: zig build difftest -Doptimize=ReleaseSafe
+      # `visar track --faces` on a still image moving over a canvas: every
+      # frame must have a face that follows the known motion, with the
+      # detector on a fraction of the frames (skipped without the files).
+      - name: Face tracking on a moving image
+        shell: bash
+        run: |
+          if [ ! -s "$VISAR_MODELS/face_detection_yunet_2023mar.onnx" ] || [ ! -s "$VISAR_MODELS/largest_selfie.jpg" ]; then
+            echo "SKIP: model or test image not downloaded"; exit 0
+          fi
+          zig build test -Doptimize=ReleaseSafe -Dtest-filter="face tracking" --summary all
+          zig build -Doptimize=ReleaseFast
+          ./zig-out/bin/visar track --faces "$VISAR_MODELS/face_detection_yunet_2023mar.onnx" --source "image:$VISAR_MODELS/largest_selfie.jpg" --face-width 640 --headless --frames 600 --json > faces.json
+          python3 -c "import json,sys; f=json.load(open(sys.argv[1]))['faces']; g=f['ground_truth']; print(f); assert g['followed'] >= 0.99 and f['detect_fraction'] < 0.34 and f['crop_only_runs'] > 0, 'face tracking check failed'" faces.json
 
   cross:
     runs-on: ubuntu-latest
@@ -140,6 +153,17 @@ jobs:
           cat window.err window.json
           test -s shot.png
           exit "$code"
+      - name: Face tracking on a moving image (skipped if the model download fails)
+        run: |
+          mkdir -p models
+          zoo=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet
+          if ! curl -fsSL --retry 3 -o models/face_detection_yunet_2023mar.onnx "$zoo/face_detection_yunet_2023mar.onnx" ||
+             ! curl -fsSL --retry 3 -o models/largest_selfie.jpg "$zoo/example_outputs/largest_selfie.jpg"; then
+            echo "SKIP: cannot download the model"; exit 0
+          fi
+          ./zig-out/bin/visar track --faces models/face_detection_yunet_2023mar.onnx --source image:models/largest_selfie.jpg --face-width 640 --headless --frames 600 --json > faces.json
+          python3 -c "import json,sys; f=json.load(open(sys.argv[1]))['faces']; g=f['ground_truth']; print(f); assert g['followed'] >= 0.99 and f['detect_fraction'] < 0.34 and f['crop_only_runs'] > 0, 'face tracking check failed'" faces.json
+          ./zig-out/bin/visar track --faces models/face_detection_yunet_2023mar.onnx --source image:models/largest_selfie.jpg --face-width 640 --change-level 0 --headless --frames 600 --json > faces-level0.json
       - name: x86_64 build under Rosetta
         continue-on-error: true
         run: |
@@ -159,7 +183,7 @@ jobs:
             echo '```'
             cat cameras.txt 2>/dev/null
             echo '```'
-            for f in headless locks window x86; do
+            for f in headless locks faces faces-level0 window x86; do
               if [ -s "$f.json" ]; then
                 echo "#### $f"
                 echo '```json'

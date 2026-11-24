@@ -84,6 +84,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(capi_tests).step);
     const cli_tests = b.addTest(.{ .root_module = cli, .filters = test_filters, .use_llvm = use_llvm });
     test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+    // The demos' library (face tracking runs when VISAR_MODELS is set).
+    const track_tests = b.addTest(.{ .root_module = track_lib, .filters = test_filters, .use_llvm = use_llvm });
+    test_step.dependOn(&b.addRunArtifact(track_tests).step);
 
     // Differential tests against OpenCV (needs python3 with numpy and cv2).
     const difftest = b.addSystemCommand(&.{ "python3", "tests/py/run_all.py", "--lib" });

@@ -608,3 +608,762 @@ pub fn drawTracks(frame: Image(u8), tracker: visar.video.Tracker, o: DrawOptions
         _ = draw.text(frame, bx, by - 12 * ls + @divTrunc(3 * ls, 2), label, o.label_scale, &.{ 0, 0, 0, 255 });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Face tracking (`visar track --faces`): detect, then track.
+//
+// A YuNet detector (visar.dnn.FaceDetector) runs on a schedule; between its
+// runs every face is carried by a MOSSE correlation filter on the small
+// grayscale tracking image, so faces are followed at camera rate while the
+// network runs on a fraction of the frames. Change-driven inference cuts
+// the network's work further, without changing what it would find:
+//
+//   level 1  a scheduled detection is postponed while the frame has not
+//            changed since the last one and every track is healthy
+//   level 2  with healthy tracks, a scheduled detection runs only on crops
+//            around the tracked faces (at the whole-frame detector's scale,
+//            so a face looks to the network exactly as in a whole-frame
+//            run); every `full_every`-th detection, and any detection forced
+//            by a weak or missing track, still covers the whole frame to
+//            find new faces
+// ---------------------------------------------------------------------------
+
+pub const Face = visar.dnn.Face;
+const Box = visar.video.Box;
+
+pub const FaceOptions = struct {
+    /// Width of the whole-frame detector input; the height follows the
+    /// frame's aspect ratio.
+    face_width: u32 = 320,
+    /// A detection is scheduled every this many frames.
+    detect_every: u32 = 4,
+    /// At most this many faces are tracked.
+    max_faces: u32 = 16,
+    /// Change-driven inference: 0 = every scheduled detection covers the
+    /// whole frame; 1 = also postpone it while the frame is unchanged;
+    /// 2 = also run it only around the tracked faces (the default).
+    level: u8 = 2,
+    /// Level 1: the mean absolute gray-level difference (0-255) between the
+    /// tracking image now and at the last detection, over every 4th row,
+    /// below which the frame counts as unchanged. Webcam noise at the
+    /// tracking resolution (already box-averaged) gives about 1; a face
+    /// that moved by a few pixels gives several.
+    still_threshold: f32 = 2.0,
+    /// Level 1: a detection is never postponed beyond this many frames.
+    max_postpone: u32 = 30,
+    /// Level 2: every this many detections covers the whole frame.
+    full_every: u32 = 4,
+    /// Level 2: crop side relative to the larger side of the face box.
+    crop_scale: f32 = 2.0,
+    score_threshold: f32 = 0.9,
+    /// A detection and a track overlapping by at least this IoU are the
+    /// same face.
+    match_iou: f32 = 0.3,
+    /// A track missed by this many detections in a row is dropped.
+    drop_after: u32 = 2,
+};
+
+/// One tracked face. Boxes and landmarks are in frame pixels.
+pub const FaceTrack = struct {
+    id: u32,
+    mosse: visar.video.Mosse,
+    box: Box,
+    /// Landmarks relative to the box ((x - box.x) / box.w, ...), so they
+    /// move and scale with it between detections.
+    rel: [5][2]f32,
+    /// The score of the last detection.
+    score: f32,
+    psr: f32 = 0,
+    /// The last MOSSE update was confident.
+    ok: bool = true,
+    /// Detections in a row that did not find this face.
+    det_missed: u32 = 0,
+    frames: u32 = 0,
+
+    pub fn landmark(t: FaceTrack, i: usize) [2]f32 {
+        return .{ t.box.x + t.rel[i][0] * t.box.w, t.box.y + t.rel[i][1] * t.box.h };
+    }
+
+    fn healthy(t: FaceTrack) bool {
+        return t.ok and t.det_missed == 0;
+    }
+};
+
+/// Counters of a face-tracking run. Times are sums in milliseconds.
+pub const FaceStats = struct {
+    frames: u64 = 0,
+    /// Frames on which the detector ran (on the whole frame or on crops).
+    detect_frames: u64 = 0,
+    full_runs: u64 = 0,
+    /// Detections that ran only on crops (level 2), and the crops.
+    crop_rounds: u64 = 0,
+    crops: u64 = 0,
+    /// Frames whose scheduled detection was postponed (level 1).
+    postponed: u64 = 0,
+    /// Detector time of whole-frame and crop rounds, conversion included.
+    full_ms: f64 = 0,
+    crop_ms: f64 = 0,
+    /// The frame to detector input conversion (part of the above).
+    convert_ms: f64 = 0,
+    /// MOSSE updates, scheduling, matching and re-initialisation.
+    track_ms: f64 = 0,
+    tracks_started: u64 = 0,
+    tracks_dropped: u64 = 0,
+    max_faces: u32 = 0,
+
+    pub fn detectMs(s: FaceStats) f64 {
+        return s.full_ms + s.crop_ms;
+    }
+
+    pub fn meanDetectMs(s: FaceStats) f64 {
+        const n = s.full_runs + s.crop_rounds;
+        return if (n > 0) s.detectMs() / @as(f64, @floatFromInt(n)) else 0;
+    }
+
+    pub fn meanFullMs(s: FaceStats) f64 {
+        return if (s.full_runs > 0) s.full_ms / @as(f64, @floatFromInt(s.full_runs)) else 0;
+    }
+
+    pub fn meanCropMs(s: FaceStats) f64 {
+        return if (s.crop_rounds > 0) s.crop_ms / @as(f64, @floatFromInt(s.crop_rounds)) else 0;
+    }
+
+    /// Detector time level 2 saved: what its crop rounds would have cost as
+    /// whole-frame runs (at the measured mean), minus what they cost.
+    pub fn cropSavingMs(s: FaceStats) f64 {
+        if (s.crop_rounds == 0 or s.full_runs == 0) return 0;
+        return @as(f64, @floatFromInt(s.crop_rounds)) * s.meanFullMs() - s.crop_ms;
+    }
+};
+
+/// What a `FaceTracker.step` did.
+pub const FaceStep = enum { tracked, postponed, full, crops };
+
+pub const FaceTracker = struct {
+    gpa: std.mem.Allocator,
+    opts: FaceOptions,
+    /// The ONNX model (owned; the detectors point into it).
+    model: []u8,
+    frame_w: u32,
+    frame_h: u32,
+    /// Frame pixels per tracking-image pixel.
+    k: u32,
+    /// The whole-frame detector input size.
+    det_w: u32,
+    det_h: u32,
+    det_bgra: Image(u8),
+    det_bgr: Image(u8),
+    /// Detectors planned per input size (the whole frame first, then crop
+    /// sizes, which are multiples of 32).
+    plans: std.ArrayList(Plan) = .empty,
+    tracks: std.ArrayList(FaceTrack) = .empty,
+    found: std.ArrayList(Face) = .empty,
+    next_id: u32 = 1,
+    /// Frames since the last detection.
+    since: u32 = 0,
+    /// Crop-only detections since the last whole-frame one.
+    crops_in_row: u32 = 0,
+    /// Every 4th row of the tracking image at the last detection (level 1).
+    ref: []u8,
+    ref_valid: bool = false,
+    stats: FaceStats = .{},
+    last: FaceStep = .tracked,
+    last_detect_ms: f64 = 0,
+    use_clock: u64 = 0,
+
+    const Plan = struct { w: u32, h: u32, det: visar.dnn.FaceDetector, used: u64 };
+    const max_plans = 8;
+    const min_crop = 64;
+
+    /// `model`: YuNet ONNX bytes (copied). Frames are `frame_w` x
+    /// `frame_h`; the tracking image is `k` times smaller.
+    pub fn create(gpa: std.mem.Allocator, model: []const u8, frame_w: u32, frame_h: u32, k: u32, opts: FaceOptions) !FaceTracker {
+        if (frame_w < 32 or frame_h < 32 or k == 0) return error.InvalidSize;
+        const owned = try gpa.dupe(u8, model);
+        errdefer gpa.free(owned);
+        const dw = std.math.clamp(opts.face_width, 32, frame_w);
+        const dh_f = @round(@as(f64, @floatFromInt(dw)) * @as(f64, @floatFromInt(frame_h)) / @as(f64, @floatFromInt(frame_w)));
+        const dh: u32 = std.math.clamp(@as(u32, @intFromFloat(dh_f)), 16, frame_h);
+        var det_bgra = try Image(u8).init(gpa, dw, dh, 4);
+        errdefer det_bgra.deinit(gpa);
+        var det_bgr = try Image(u8).init(gpa, dw, dh, 3);
+        errdefer det_bgr.deinit(gpa);
+        const ref = try gpa.alloc(u8, @as(usize, (frame_h / k + 3) / 4) * (frame_w / k));
+        errdefer gpa.free(ref);
+        var self: FaceTracker = .{
+            .gpa = gpa,
+            .opts = opts,
+            .model = owned,
+            .frame_w = frame_w,
+            .frame_h = frame_h,
+            .k = k,
+            .det_w = dw,
+            .det_h = dh,
+            .det_bgra = det_bgra,
+            .det_bgr = det_bgr,
+            .ref = ref,
+        };
+        // Plan the whole-frame detector now (this also checks the model).
+        errdefer {
+            for (self.plans.items) |*p| p.det.deinit();
+            self.plans.deinit(gpa);
+        }
+        _ = try self.plan(dw, dh);
+        return self;
+    }
+
+    pub fn deinit(self: *FaceTracker) void {
+        const gpa = self.gpa;
+        for (self.plans.items) |*p| p.det.deinit();
+        self.plans.deinit(gpa);
+        for (self.tracks.items) |*t| t.mosse.deinit();
+        self.tracks.deinit(gpa);
+        self.found.deinit(gpa);
+        self.det_bgra.deinit(gpa);
+        self.det_bgr.deinit(gpa);
+        gpa.free(self.ref);
+        gpa.free(self.model);
+        self.* = undefined;
+    }
+
+    /// Forgets every face.
+    pub fn reset(self: *FaceTracker) void {
+        for (self.tracks.items) |*t| t.mosse.deinit();
+        self.tracks.clearRetainingCapacity();
+        self.ref_valid = false;
+    }
+
+    /// The detector planned for `w` x `h` inputs (planned on first use; the
+    /// least recently used crop plan makes room when the cache is full).
+    fn plan(self: *FaceTracker, w: u32, h: u32) !*visar.dnn.FaceDetector {
+        self.use_clock += 1;
+        for (self.plans.items) |*p| if (p.w == w and p.h == h) {
+            p.used = self.use_clock;
+            return &p.det;
+        };
+        if (self.plans.items.len == max_plans) {
+            var lru: usize = 1; // never the whole-frame plan (index 0)
+            for (self.plans.items[1..], 1..) |p, i| {
+                if (p.used < self.plans.items[lru].used) lru = i;
+            }
+            self.plans.items[lru].det.deinit();
+            _ = self.plans.swapRemove(lru);
+        }
+        var det = try visar.dnn.FaceDetector.create(self.gpa, self.model, .{ .width = w, .height = h, .score_threshold = self.opts.score_threshold });
+        errdefer det.deinit();
+        try self.plans.append(self.gpa, .{ .w = w, .h = h, .det = det, .used = self.use_clock });
+        return &self.plans.items[self.plans.items.len - 1].det;
+    }
+
+    /// The tracked faces (frame pixels).
+    pub fn faces(self: *const FaceTracker) []const FaceTrack {
+        return self.tracks.items;
+    }
+
+    /// Processes one frame: `frame` (BGRA, the frame size) and `small`, its
+    /// grayscale tracking image (1 channel, the frame size / k). With an
+    /// `io`, the stages are timed.
+    pub fn step(self: *FaceTracker, exec: visar.Exec, io: ?Io, frame: Image(u8), small: Image(u8)) !FaceStep {
+        if (frame.channels != 4 or frame.width != self.frame_w or frame.height != self.frame_h) return error.SizeMismatch;
+        if (small.channels != 1 or small.width != self.frame_w / self.k or small.height != self.frame_h / self.k) return error.SizeMismatch;
+        const s = &self.stats;
+        var clock: Clock = .{ .io = io };
+        _ = clock.lap();
+        s.frames += 1;
+        self.since += 1;
+
+        // ---- every face follows its MOSSE filter
+        self.updateFilters(exec, small);
+
+        // ---- is a detection due, and of what kind?
+        var weak = false;
+        var healthy = true;
+        for (self.tracks.items) |t| {
+            weak = weak or !t.ok;
+            healthy = healthy and t.healthy();
+        }
+        var what: FaceStep = .tracked;
+        if (self.tracks.items.len == 0 or weak) {
+            what = .full;
+        } else if (self.since >= @max(1, self.opts.detect_every)) {
+            const crops_ok = self.opts.level >= 2 and healthy and self.crops_in_row + 1 < @max(1, self.opts.full_every);
+            what = if (crops_ok) .crops else .full;
+            if (self.opts.level >= 1 and healthy and self.ref_valid and self.since < self.opts.max_postpone and
+                self.changeSinceRef(small) < self.opts.still_threshold) what = .postponed;
+        }
+        s.track_ms += clock.lap();
+        self.last = what;
+        if (what == .postponed) s.postponed += 1;
+        if (what != .full and what != .crops) return what;
+
+        // ---- detect
+        try self.convert(exec, frame);
+        const t_convert = clock.lap();
+        self.found.clearRetainingCapacity();
+        if (what == .crops and !try self.detectCrops(exec)) what = .full;
+        if (what == .full) try self.detectIn(exec, 0, 0, self.det_w, self.det_h);
+        const t_det = t_convert + clock.lap();
+        s.convert_ms += t_convert;
+        s.detect_frames += 1;
+        if (what == .full) {
+            s.full_runs += 1;
+            s.full_ms += t_det;
+            self.crops_in_row = 0;
+        } else {
+            s.crop_rounds += 1;
+            s.crop_ms += t_det;
+            self.crops_in_row += 1;
+        }
+        self.last = what;
+        self.last_detect_ms = t_det;
+
+        // ---- correct the tracks, start new ones, drop lost ones
+        try self.match(small, what == .full);
+        self.since = 0;
+        self.snapshot(small);
+        s.track_ms += clock.lap();
+        s.max_faces = @max(s.max_faces, @as(u32, @intCast(self.tracks.items.len)));
+        return what;
+    }
+
+    /// The frame, area-downscaled to the detector input, as BGR.
+    fn convert(self: *FaceTracker, exec: visar.Exec, frame: Image(u8)) !void {
+        try ip.resize(exec, self.gpa, frame, self.det_bgra, .area);
+        try ip.cvtColor(exec, self.det_bgra, self.det_bgr, .bgra2bgr);
+    }
+
+    fn updateFilters(self: *FaceTracker, exec: visar.Exec, small: Image(u8)) void {
+        const Job = struct { tracks: []FaceTrack, gray: Image(u8), k: f32 };
+        exec.parallelFor(self.tracks.items.len, 1, Job{ .tracks = self.tracks.items, .gray = small, .k = @floatFromInt(self.k) }, struct {
+            fn run(j: Job, a: usize, b: usize) void {
+                for (j.tracks[a..b]) |*t| {
+                    const r = t.mosse.update(j.gray) catch visar.video.mosse.Result{ .box = t.mosse.box(), .psr = 0, .ok = false };
+                    t.box = .{ .x = r.box.x * j.k, .y = r.box.y * j.k, .w = r.box.w * j.k, .h = r.box.h * j.k };
+                    t.psr = r.psr;
+                    t.ok = r.ok;
+                    t.frames += 1;
+                }
+            }
+        }.run);
+    }
+
+    /// Runs the detector on the (x, y, w, h) window of the detector input
+    /// and appends what it finds, in frame pixels.
+    fn detectIn(self: *FaceTracker, exec: visar.Exec, x: u32, y: u32, w: u32, h: u32) !void {
+        const det = try self.plan(w, h);
+        const view = try self.det_bgr.roi(x, y, w, h);
+        const res = try det.detect(exec, view);
+        const sx = @as(f32, @floatFromInt(self.frame_w)) / @as(f32, @floatFromInt(self.det_w));
+        const sy = @as(f32, @floatFromInt(self.frame_h)) / @as(f32, @floatFromInt(self.det_h));
+        const ox: f32 = @floatFromInt(x);
+        const oy: f32 = @floatFromInt(y);
+        for (res) |f| {
+            var g = f;
+            g.box = .{ (f.box[0] + ox) * sx, (f.box[1] + oy) * sy, f.box[2] * sx, f.box[3] * sy };
+            for (&g.landmarks, f.landmarks) |*l, m| l.* = .{ (m[0] + ox) * sx, (m[1] + oy) * sy };
+            try self.found.append(self.gpa, g);
+        }
+    }
+
+    /// Level 2: detects in a square window around each tracked face, at the
+    /// whole-frame detector's scale. Returns false (nothing done) when the
+    /// windows would not be clearly cheaper than the whole frame.
+    fn detectCrops(self: *FaceTracker, exec: visar.Exec) !bool {
+        const sx = @as(f32, @floatFromInt(self.det_w)) / @as(f32, @floatFromInt(self.frame_w));
+        const sy = @as(f32, @floatFromInt(self.det_h)) / @as(f32, @floatFromInt(self.frame_h));
+        var wins: [64][3]u32 = undefined;
+        var n: usize = 0;
+        var area: u64 = 0;
+        for (self.tracks.items) |t| {
+            if (n == wins.len) return false;
+            const side = self.opts.crop_scale * @max(t.box.w * sx, t.box.h * sy);
+            const s32: u32 = @intFromFloat(@ceil(@max(side, min_crop) / 32) * 32);
+            if (s32 > self.det_w or s32 > self.det_h) return false;
+            const half = @as(f32, @floatFromInt(s32)) / 2;
+            const x = std.math.clamp(@round((t.box.x + t.box.w / 2) * sx - half), 0, @as(f32, @floatFromInt(self.det_w - s32)));
+            const y = std.math.clamp(@round((t.box.y + t.box.h / 2) * sy - half), 0, @as(f32, @floatFromInt(self.det_h - s32)));
+            wins[n] = .{ @intFromFloat(x), @intFromFloat(y), s32 };
+            n += 1;
+            area += @as(u64, s32) * s32;
+        }
+        // Runs on crops covering most of the frame cost more than one run
+        // on all of it.
+        if (n == 0 or 10 * area > 6 * @as(u64, self.det_w) * self.det_h) return false;
+        for (wins[0..n]) |r| try self.detectIn(exec, r[0], r[1], r[2], r[2]);
+        self.stats.crops += n;
+        // Overlapping crops can find a face twice: keep the best of each.
+        const f = &self.found;
+        var i: usize = 0;
+        while (i < f.items.len) : (i += 1) {
+            var j: usize = i + 1;
+            while (j < f.items.len) {
+                if (iou(faceBox(f.items[i]), faceBox(f.items[j])) > 0.3) {
+                    if (f.items[j].score > f.items[i].score) f.items[i] = f.items[j];
+                    _ = f.swapRemove(j);
+                } else j += 1;
+            }
+        }
+        return true;
+    }
+
+    /// Matches `found` to the tracks (greedy by IoU): matched tracks restart
+    /// their filter on the detected box (drift correction) and take its
+    /// landmarks and score; with `full`, unmatched detections start tracks;
+    /// tracks missed too often are dropped.
+    fn match(self: *FaceTracker, small: Image(u8), full: bool) !void {
+        const gpa = self.gpa;
+        const Pair = struct { v: f32, t: u32, d: u32 };
+        var pairs: std.ArrayList(Pair) = .empty;
+        defer pairs.deinit(gpa);
+        for (self.tracks.items, 0..) |t, ti| for (self.found.items, 0..) |f, di| {
+            const v = iou(t.box, faceBox(f));
+            if (v >= self.opts.match_iou) try pairs.append(gpa, .{ .v = v, .t = @intCast(ti), .d = @intCast(di) });
+        };
+        std.mem.sort(Pair, pairs.items, {}, struct {
+            fn gt(_: void, a: Pair, b: Pair) bool {
+                return a.v > b.v;
+            }
+        }.gt);
+        const t_used = try gpa.alloc(bool, self.tracks.items.len);
+        defer gpa.free(t_used);
+        const d_used = try gpa.alloc(bool, self.found.items.len);
+        defer gpa.free(d_used);
+        @memset(t_used, false);
+        @memset(d_used, false);
+        for (pairs.items) |p| {
+            if (t_used[p.t] or d_used[p.d]) continue;
+            t_used[p.t] = true;
+            d_used[p.d] = true;
+            const t = &self.tracks.items[p.t];
+            const f = self.found.items[p.d];
+            const box = self.clampBox(faceBox(f));
+            const m = try visar.video.Mosse.init(gpa, small, self.toSmall(box), .{});
+            t.mosse.deinit();
+            t.mosse = m;
+            t.box = box;
+            t.rel = relLandmarks(f, box);
+            t.score = f.score;
+            t.ok = true;
+            t.det_missed = 0;
+        }
+        for (self.tracks.items, t_used) |*t, u| {
+            if (!u) t.det_missed += 1;
+        }
+        var i: usize = 0;
+        while (i < self.tracks.items.len) {
+            if (self.tracks.items[i].det_missed >= self.opts.drop_after) {
+                self.tracks.items[i].mosse.deinit();
+                _ = self.tracks.orderedRemove(i);
+                self.stats.tracks_dropped += 1;
+            } else i += 1;
+        }
+        if (!full) return;
+        for (self.found.items, d_used) |f, u| {
+            if (u or self.tracks.items.len >= self.opts.max_faces) continue;
+            const box = self.clampBox(faceBox(f));
+            if (box.w < 4 or box.h < 4) continue;
+            var m = try visar.video.Mosse.init(gpa, small, self.toSmall(box), .{});
+            errdefer m.deinit();
+            try self.tracks.append(gpa, .{ .id = self.next_id, .mosse = m, .box = box, .rel = relLandmarks(f, box), .score = f.score });
+            self.next_id += 1;
+            self.stats.tracks_started += 1;
+        }
+    }
+
+    fn clampBox(self: *const FaceTracker, b: Box) Box {
+        const W: f32 = @floatFromInt(self.frame_w);
+        const H: f32 = @floatFromInt(self.frame_h);
+        const x0 = std.math.clamp(b.x, 0, W);
+        const y0 = std.math.clamp(b.y, 0, H);
+        const x1 = std.math.clamp(b.x + b.w, 0, W);
+        const y1 = std.math.clamp(b.y + b.h, 0, H);
+        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+    }
+
+    fn toSmall(self: *const FaceTracker, b: Box) Box {
+        const k: f32 = @floatFromInt(self.k);
+        return .{ .x = b.x / k, .y = b.y / k, .w = @max(4, b.w / k), .h = @max(4, b.h / k) };
+    }
+
+    /// Mean absolute difference between every 4th row of `small` and the
+    /// same rows at the last detection.
+    fn changeSinceRef(self: *const FaceTracker, small: Image(u8)) f32 {
+        const w = small.width;
+        var sum: u64 = 0;
+        var n: u64 = 0;
+        var y: usize = 0;
+        var off: usize = 0;
+        while (y < small.height) : (y += 4) {
+            sum += sad(small.row(y)[0..w], self.ref[off..][0..w]);
+            off += w;
+            n += w;
+        }
+        return if (n > 0) @as(f32, @floatFromInt(sum)) / @as(f32, @floatFromInt(n)) else 0;
+    }
+
+    fn snapshot(self: *FaceTracker, small: Image(u8)) void {
+        const w = small.width;
+        var y: usize = 0;
+        var off: usize = 0;
+        while (y < small.height) : (y += 4) {
+            @memcpy(self.ref[off..][0..w], small.row(y)[0..w]);
+            off += w;
+        }
+        self.ref_valid = true;
+    }
+};
+
+/// Sum of absolute differences.
+fn sad(a: []const u8, b: []const u8) u64 {
+    const N = 32;
+    const V = @Vector(N, u8);
+    var sum: u64 = 0;
+    var x: usize = 0;
+    while (x + N <= a.len) : (x += N) {
+        const va: V = a[x..][0..N].*;
+        const vb: V = b[x..][0..N].*;
+        const d: @Vector(N, u16) = (va -| vb) | (vb -| va);
+        sum += @reduce(.Add, d);
+    }
+    while (x < a.len) : (x += 1) sum += @max(a[x], b[x]) - @min(a[x], b[x]);
+    return sum;
+}
+
+fn faceBox(f: Face) Box {
+    return .{ .x = f.box[0], .y = f.box[1], .w = f.box[2], .h = f.box[3] };
+}
+
+fn relLandmarks(f: Face, b: Box) [5][2]f32 {
+    var r: [5][2]f32 = undefined;
+    for (&r, f.landmarks) |*o, l| o.* = .{ (l[0] - b.x) / @max(b.w, 1), (l[1] - b.y) / @max(b.h, 1) };
+    return r;
+}
+
+pub fn iou(a: Box, b: Box) f32 {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(a.x + a.w, b.x + b.w);
+    const y1 = @min(a.y + a.h, b.y + b.h);
+    const inter = @max(0, x1 - x0) * @max(0, y1 - y0);
+    const uni = a.w * a.h + b.w * b.h - inter;
+    return if (uni > 0) inter / uni else 0;
+}
+
+// ---------------------------------------------------------------------------
+// A still image moving across a plain canvas (`--source image:PATH`): a test
+// source with a known motion, to exercise the face tracker anywhere.
+// ---------------------------------------------------------------------------
+
+pub const StillScene = struct {
+    gpa: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    /// The image, scaled to fit, BGRA.
+    img: Image(u8),
+    /// The next frame to render.
+    frame: u32 = 0,
+
+    /// Fraction of the frame's width and height the image may cover.
+    pub const fill = 0.75;
+    /// The motion repeats every `period` frames: `moving` frames along a
+    /// figure of eight (easing in and out), then still.
+    pub const period = 300;
+    pub const moving = 240;
+    const canvas: u32 = 0xff_3c_40_48; // BGRA (72, 64, 60)
+
+    /// `src`: the image, BGR (3 channels) or BGRA.
+    pub fn init(gpa: std.mem.Allocator, exec: visar.Exec, src: Image(u8), width: u32, height: u32) !StillScene {
+        if (src.channels != 3 and src.channels != 4) return error.UnsupportedChannels;
+        const fw: f64 = @floatFromInt(width);
+        const fh: f64 = @floatFromInt(height);
+        const s = @min(fill * fw / @as(f64, @floatFromInt(src.width)), fill * fh / @as(f64, @floatFromInt(src.height)));
+        const iw: u32 = std.math.clamp(@as(u32, @intFromFloat(@round(s * @as(f64, @floatFromInt(src.width))))), 1, width);
+        const ih: u32 = std.math.clamp(@as(u32, @intFromFloat(@round(s * @as(f64, @floatFromInt(src.height))))), 1, height);
+        var scaled = try Image(u8).init(gpa, iw, ih, src.channels);
+        defer scaled.deinit(gpa);
+        try ip.resize(exec, gpa, src, scaled, .area);
+        var img = try Image(u8).init(gpa, iw, ih, 4);
+        errdefer img.deinit(gpa);
+        if (src.channels == 3) try ip.cvtColor(exec, scaled, img, .bgr2bgra) else img.copyFrom(scaled);
+        return .{ .gpa = gpa, .width = width, .height = height, .img = img };
+    }
+
+    pub fn deinit(self: *StillScene) void {
+        self.img.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// Where the image's top-left corner is in frame `f`.
+    pub fn offset(self: *const StillScene, f: u32) [2]i32 {
+        const mx = @as(f64, @floatFromInt(self.width - self.img.width)) / 2;
+        const my = @as(f64, @floatFromInt(self.height - self.img.height)) / 2;
+        const ph = f % period;
+        var theta: f64 = 0;
+        if (ph < moving) {
+            const p = @as(f64, @floatFromInt(ph)) / moving;
+            theta = 2 * std.math.pi * p - @sin(2 * std.math.pi * p);
+        }
+        return .{ @intFromFloat(@round(mx + mx * @sin(theta))), @intFromFloat(@round(my + my * @sin(2 * theta))) };
+    }
+
+    /// Renders the next frame into `dst` (BGRA, the scene size) and returns
+    /// the image's offset in it.
+    pub fn render(self: *StillScene, dst: Image(u8)) [2]i32 {
+        std.debug.assert(dst.channels == 4 and dst.width == self.width and dst.height == self.height);
+        const off = self.offset(self.frame);
+        self.frame += 1;
+        const bg = std.mem.nativeToLittle(u32, canvas);
+        const ox: usize = @intCast(off[0]);
+        const oy: usize = @intCast(off[1]);
+        const iw: usize = self.img.width;
+        for (0..dst.height) |y| {
+            const r = dst.row(y)[0 .. @as(usize, dst.width) * 4];
+            const px: []align(1) u32 = std.mem.bytesAsSlice(u32, r);
+            if (y < oy or y >= oy + self.img.height) {
+                @memset(px, bg);
+                continue;
+            }
+            @memset(px[0..ox], bg);
+            @memcpy(r[ox * 4 ..][0 .. iw * 4], self.img.row(y - oy)[0 .. iw * 4]);
+            @memset(px[ox + iw ..], bg);
+        }
+        return off;
+    }
+};
+
+/// Scores face tracks against a `StillScene`'s known motion: the faces
+/// tracked after the first detection, moved with the image, are the ground
+/// truth.
+pub const StillTruth = struct {
+    /// The true faces, relative to the image's top-left corner.
+    refs: [16]Box = undefined,
+    n: usize = 0,
+    frames: u64 = 0,
+    /// Frames where some tracked face overlaps a true one by IoU >= 0.5.
+    followed: u64 = 0,
+    /// Sums over frames of the best track-to-truth IoU, its centre error,
+    /// and the number of true faces with a track at IoU >= 0.5.
+    iou_sum: f64 = 0,
+    err_sum: f64 = 0,
+    faces_sum: f64 = 0,
+
+    pub fn score(self: *StillTruth, tracks: []const FaceTrack, off: [2]i32) void {
+        const ox: f32 = @floatFromInt(off[0]);
+        const oy: f32 = @floatFromInt(off[1]);
+        if (self.n == 0) {
+            for (tracks) |t| {
+                if (self.n == self.refs.len) break;
+                self.refs[self.n] = .{ .x = t.box.x - ox, .y = t.box.y - oy, .w = t.box.w, .h = t.box.h };
+                self.n += 1;
+            }
+            if (self.n == 0) return;
+        }
+        self.frames += 1;
+        var best: f32 = 0;
+        var best_err: f32 = 0;
+        var hits: u32 = 0;
+        for (self.refs[0..self.n]) |r0| {
+            const r: Box = .{ .x = r0.x + ox, .y = r0.y + oy, .w = r0.w, .h = r0.h };
+            var b: f32 = 0;
+            for (tracks) |t| {
+                const v = iou(r, t.box);
+                b = @max(b, v);
+                if (v > best) {
+                    best = v;
+                    best_err = std.math.hypot(r.cx() - t.box.cx(), r.cy() - t.box.cy());
+                }
+            }
+            if (b >= 0.5) hits += 1;
+        }
+        if (best >= 0.5) self.followed += 1;
+        self.iou_sum += best;
+        self.err_sum += best_err;
+        self.faces_sum += @floatFromInt(hits);
+    }
+};
+
+test "a still image moving over the canvas" {
+    const gpa = std.testing.allocator;
+    var src = try Image(u8).init(gpa, 40, 20, 3);
+    defer src.deinit(gpa);
+    src.fill(200);
+    var scene = try StillScene.init(gpa, .serial, src, 160, 90);
+    defer scene.deinit();
+    try std.testing.expectEqual(@as(u32, 120), scene.img.width);
+    var frame = try Image(u8).init(gpa, 160, 90, 4);
+    defer frame.deinit(gpa);
+    var prev = scene.offset(0);
+    for (0..StillScene.period + 1) |f| {
+        const off = scene.render(frame);
+        // Smooth: never more than a few pixels per frame.
+        try std.testing.expect(@abs(off[0] - prev[0]) <= 3 and @abs(off[1] - prev[1]) <= 3);
+        prev = off;
+        try std.testing.expectEqual(@as(u8, 200), frame.at(@intCast(off[0]), @intCast(off[1]), 0));
+        if (off[0] > 0) try std.testing.expectEqual(@as(u8, 72), frame.at(@intCast(off[0] - 1), @intCast(off[1]), 0));
+        if (f >= StillScene.moving and f < StillScene.period) try std.testing.expectEqual(scene.offset(StillScene.moving), off);
+    }
+}
+
+test "change measure ignores identical frames" {
+    var a: [100]u8 = undefined;
+    for (&a, 0..) |*v, i| v.* = @intCast(i);
+    var b = a;
+    try std.testing.expectEqual(@as(u64, 0), sad(&a, &b));
+    b[3] +%= 5;
+    b[70] -%= 7;
+    try std.testing.expectEqual(@as(u64, 12), sad(&a, &b));
+}
+
+/// Reads a file from `VISAR_MODELS` (null if unset or missing).
+fn readModelFile(gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
+    const dir = std.testing.environ.getAlloc(gpa, "VISAR_MODELS") catch return null;
+    defer gpa.free(dir);
+    const path = try std.fs.path.join(gpa, &.{ dir, name });
+    defer gpa.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 28)) catch null;
+}
+
+test "face tracking follows a moving selfie with few detector runs" {
+    // Needs VISAR_MODELS with face_detection_yunet_2023mar.onnx and
+    // largest_selfie.jpg (the OpenCV Model Zoo files); skipped otherwise.
+    const gpa = std.testing.allocator;
+    const model = try readModelFile(gpa, "face_detection_yunet_2023mar.onnx") orelse return error.SkipZigTest;
+    defer gpa.free(model);
+    const jpg = try readModelFile(gpa, "largest_selfie.jpg") orelse return error.SkipZigTest;
+    defer gpa.free(jpg);
+    var decoded = try visar.codecs.decode(gpa, jpg, .{ .mode = .color, .order = .bgr });
+    defer decoded.deinit(gpa);
+
+    var pool = visar.Pool.init(gpa, std.testing.io, 4);
+    defer pool.deinit();
+    const exec = visar.Exec.on(&pool);
+    const W = 1280;
+    const H = 720;
+    const k = 2;
+    var scene = try StillScene.init(gpa, exec, decoded.u8, W, H);
+    defer scene.deinit();
+    var ft = try FaceTracker.create(gpa, model, W, H, k, .{ .face_width = 640 });
+    defer ft.deinit();
+    var frame = try Image(u8).init(gpa, W, H, 4);
+    defer frame.deinit(gpa);
+    var small = try Image(u8).init(gpa, W / k, H / k, 1);
+    defer small.deinit(gpa);
+    var truth: StillTruth = .{};
+    const n = StillScene.period + 60;
+    for (0..n) |_| {
+        const off = scene.render(frame);
+        try visar.videoio.frame.grayDownsample(exec, frame, small, k);
+        _ = try ft.step(exec, std.testing.io, frame, small);
+        truth.score(ft.faces(), off);
+    }
+    const s = ft.stats;
+    try std.testing.expect(truth.n >= 1);
+    // Every frame has a face that moved with the image.
+    try std.testing.expectEqual(@as(u64, n), truth.frames);
+    try std.testing.expectEqual(truth.frames, truth.followed);
+    try std.testing.expect(truth.err_sum / @as(f64, @floatFromInt(truth.frames)) < 6);
+    // The detector ran on far fewer frames than there were.
+    try std.testing.expect(s.detect_frames * 3 < n);
+    try std.testing.expect(s.crop_rounds > 0);
+    try std.testing.expect(s.postponed > 0);
+}
