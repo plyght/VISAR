@@ -69,6 +69,8 @@ pub const no_res = std.math.maxInt(usize);
 
 pub const Epilogue = struct {
     act: ir.Act,
+    /// `vec.linearSlope(act)`.
+    slope: f32,
     residual_after_act: bool,
     /// Lanes of the last output block that hold real channels.
     tail_mask: @Vector(B, bool),
@@ -76,7 +78,7 @@ pub const Epilogue = struct {
 
     fn init(c: ir.Conv, cout: usize) Epilogue {
         const rem = cout % B;
-        return .{ .act = c.act, .residual_after_act = c.residual_after_act, .tail_mask = vec.laneMask(if (rem == 0) B else rem), .coutb = (cout + B - 1) / B };
+        return .{ .act = c.act, .slope = vec.linearSlope(c.act), .residual_after_act = c.residual_after_act, .tail_mask = vec.laneMask(if (rem == 0) B else rem), .coutb = (cout + B - 1) / B };
     }
 
     inline fn apply(e: *const Epilogue, comptime ak: ActKind, acc: V, res: ?[*]const f32, cob: usize) V {
@@ -84,12 +86,38 @@ pub const Epilogue = struct {
         if (res) |r| {
             if (!e.residual_after_act) v += vec.load(r);
         }
-        v = vec.act(ak, e.act, v);
+        v = vec.act(ak, e.act, e.slope, v);
         if (res) |r| {
             if (e.residual_after_act) v += vec.load(r);
         }
         if (cob + 1 == e.coutb) v = @select(f32, e.tail_mask, v, vec.splat(0));
         return v;
+    }
+
+    /// Stores an `R` pixels x `NB` blocks register tile through the
+    /// epilogue (a `deferred` activation in a second pass over the stored
+    /// sums): `o` and `res` point at block `cob`, pixel 0 of the tile;
+    /// `os`, `rs` are the distances between their blocks.
+    inline fn storeTile(e: *const Epilogue, comptime ak: ActKind, comptime R: usize, comptime NB: usize, acc: *const [R][NB]V, o: [*]f32, os: usize, res: ?[*]const f32, rs: usize, cob: usize) void {
+        if (ak != .deferred) {
+            inline for (0..NB) |nb| {
+                inline for (0..R) |r| {
+                    const rp: ?[*]const f32 = if (res) |rr| rr + nb * rs + r * B else null;
+                    vec.store(o + nb * os + r * B, e.apply(ak, acc[r][nb], rp, cob + nb));
+                }
+            }
+            return;
+        }
+        inline for (0..NB) |nb| {
+            inline for (0..R) |r| vec.store(o + nb * os + r * B, acc[r][nb]);
+        }
+        for (0..NB) |nb| {
+            for (0..R) |r| {
+                const rp: ?[*]const f32 = if (res) |rr| rr + nb * rs + r * B else null;
+                const p = o + nb * os + r * B;
+                vec.store(p, e.apply(ak, vec.load(p), rp, cob + nb));
+            }
+        }
     }
 };
 
@@ -164,17 +192,32 @@ pub const Pointwise = struct {
             switch (nb) {
                 inline 1...vec.max_nb => |NB| {
                     const R = comptime vec.tileR(NB);
+                    // As few tiles as R allows, of near-equal widths: a
+                    // narrow tile (a streamed 13- or 26-pixel row's last
+                    // one or two pixels) is bound by FMA latency, not
+                    // throughput. (Widths from `lo` get a tile of their
+                    // own; narrower ones, from short rows, halving tiles.)
+                    const lo = comptime @max((R + 1) / 2, R -| 3);
+                    const n = p1 - p0;
+                    const nt = (n + R - 1) / R;
                     var px = p0;
-                    while (px + R <= p1) : (px += R) k.tile(R, NB, ak, x, xs, out, os, res, rs, cob, px);
-                    // Remainder in halving tiles (a one-pixel tile is bound by
-                    // FMA latency, not throughput).
-                    inline for (.{ 8, 4, 2, 1 }) |T| {
-                        if (T < R and px + T <= p1) {
-                            k.tile(T, NB, ak, x, xs, out, os, res, rs, cob, px);
-                            px += T;
+                    for (0..nt) |i| {
+                        const sz = n / nt + @intFromBool(i < n % nt);
+                        switch (sz) {
+                            inline lo...R => |T| k.tile(T, NB, ak, x, xs, out, os, res, rs, cob, px),
+                            else => {
+                                var q = px;
+                                inline for (.{ 8, 4, 2, 1 }) |T| {
+                                    if (T < lo and q + T <= px + sz) {
+                                        k.tile(T, NB, ak, x, xs, out, os, res, rs, cob, q);
+                                        q += T;
+                                    }
+                                }
+                                while (q < px + sz) : (q += 1) k.tile(1, NB, ak, x, xs, out, os, res, rs, cob, q);
+                            },
                         }
+                        px += sz;
                     }
-                    while (px < p1) : (px += 1) k.tile(1, NB, ak, x, xs, out, os, res, rs, cob, px);
                 },
                 else => unreachable,
             }
@@ -208,13 +251,8 @@ pub const Pointwise = struct {
                 }
             }
         }
-        inline for (0..NB) |nb| {
-            const o = out + (cob + nb) * os + px * B;
-            inline for (0..R) |r| {
-                const rp: ?[*]const f32 = if (res) |rr| rr + (cob + nb) * rs + (px + r) * B else null;
-                vec.store(o + r * B, k.epi.apply(ak, acc[r][nb], rp, cob + nb));
-            }
-        }
+        const rp: ?[*]const f32 = if (res) |rr| rr + cob * rs + px * B else null;
+        k.epi.storeTile(ak, R, NB, &acc, out + cob * os + px * B, os, rp, rs, cob);
     }
 };
 
@@ -229,6 +267,12 @@ pub const Depthwise = struct {
     epi: Epilogue,
     /// 3x3, stride 1, pad 1, dilation 1.
     fast3: bool,
+    /// 3x3, stride 2, pad 1, dilation 1.
+    fast3s2: bool,
+    /// One input row of zeros: the fast paths read it for a kernel row
+    /// outside the input (adding exact zeros), so the first and last rows
+    /// need no checked path.
+    zero: []align(64) f32,
 
     pub fn init(arena: Allocator, g: Geom, io: Io, c: ir.Conv, w: []const f32, bias: ?[]const f32) Allocator.Error!Depthwise {
         const kk = g.kh * g.kw;
@@ -239,7 +283,10 @@ pub const Depthwise = struct {
             for (0..kk) |t| wp[((ch / B) * kk + t) * B + ch % B] = w[ch * kk + t];
         }
         const fast3 = g.kh == 3 and g.kw == 3 and g.sh == 1 and g.sw == 1 and g.pt == 1 and g.pl == 1 and g.dh == 1 and g.dw == 1 and g.oh == g.h and g.ow == g.w;
-        return .{ .g = g, .io = io, .w = wp, .bias = try packBias(arena, bias, g.cout), .epi = .init(c, g.cout), .fast3 = fast3 };
+        const fast3s2 = g.kh == 3 and g.kw == 3 and g.sh == 2 and g.sw == 2 and g.pt == 1 and g.pl == 1 and g.dh == 1 and g.dw == 1;
+        const zero = try arena.alignedAlloc(f32, .@"64", if (fast3 or fast3s2) g.w * B else 0);
+        @memset(zero, 0);
+        return .{ .g = g, .io = io, .w = wp, .bias = try packBias(arena, bias, g.cout), .epi = .init(c, g.cout), .fast3 = fast3, .fast3s2 = fast3s2, .zero = zero };
     }
 
     const Ctx = struct { k: *const Depthwise, base: [*]f32 };
@@ -270,17 +317,22 @@ pub const Depthwise = struct {
     }
 
     fn row(k: *const Depthwise, comptime ak: ActKind, src: Rows, dst: Rows, res_rows: ?Rows, cb: usize, oy: usize) void {
+        @setEvalBranchQuota(10000);
         const g = k.g;
         const out = dst.at(cb, oy);
         const res: ?[*]const f32 = if (res_rows) |r| r.at(cb, oy) else null;
         const kk = g.kh * g.kw;
         const w = k.w.ptr + cb * kk * B;
         const bias = vec.load(k.bias.ptr + cb * B);
-        if (k.fast3 and oy > 0 and oy + 1 < g.oh and g.ow >= 3) {
+        if (k.fast3 and g.ow >= 3) {
             var wv: [9]V = undefined;
             inline for (0..9) |t| wv[t] = vec.load(w + t * B);
-            const rows = [3][*]const f32{ src.at(cb, oy - 1), src.at(cb, oy), src.at(cb, oy + 1) };
-            k.pixel(ak, src, out, res, w, bias, cb, oy, 0);
+            const rows = [3][*]const f32{
+                if (oy > 0) src.at(cb, oy - 1) else k.zero.ptr,
+                src.at(cb, oy),
+                if (oy + 1 < g.h) src.at(cb, oy + 1) else k.zero.ptr,
+            };
+            k.edge3(ak, rows, &wv, bias, 1, 3, 0, out, res, cb, 0);
             var ox: usize = 1;
             while (ox + 4 < g.ow) : (ox += 4) {
                 var acc: [4]V = @splat(bias);
@@ -306,10 +358,64 @@ pub const Depthwise = struct {
                 const rp: ?[*]const f32 = if (res) |rr| rr + ox * B else null;
                 vec.store(out + ox * B, k.epi.apply(ak, acc, rp, cb));
             }
-            k.pixel(ak, src, out, res, w, bias, cb, oy, g.ow - 1);
+            k.edge3(ak, rows, &wv, bias, 0, 2, g.w - 2, out, res, cb, g.ow - 1);
+            return;
+        }
+        if (k.fast3s2 and 2 * oy < g.h and g.w >= 2) {
+            // Columns 1 .. while 2*ox+1 < w have all three inside.
+            var wv: [9]V = undefined;
+            inline for (0..9) |t| wv[t] = vec.load(w + t * B);
+            const rows = [3][*]const f32{
+                if (oy > 0) src.at(cb, 2 * oy - 1) else k.zero.ptr,
+                src.at(cb, 2 * oy),
+                if (2 * oy + 1 < g.h) src.at(cb, 2 * oy + 1) else k.zero.ptr,
+            };
+            const ox_hi = @min(g.ow, g.w / 2);
+            k.edge3(ak, rows, &wv, bias, 1, 3, 0, out, res, cb, 0);
+            var ox: usize = 1;
+            while (ox + 4 <= ox_hi) : (ox += 4) {
+                var acc: [4]V = @splat(bias);
+                inline for (0..3) |ky| {
+                    const rp = rows[ky] + (2 * ox - 1) * B;
+                    var v: [9]V = undefined;
+                    inline for (0..9) |i| v[i] = vec.load(rp + i * B);
+                    inline for (0..4) |i| {
+                        inline for (0..3) |kx| acc[i] = fma(v[2 * i + kx], wv[ky * 3 + kx], acc[i]);
+                    }
+                }
+                inline for (0..4) |i| {
+                    const rp: ?[*]const f32 = if (res) |rr| rr + (ox + i) * B else null;
+                    vec.store(out + (ox + i) * B, k.epi.apply(ak, acc[i], rp, cb));
+                }
+            }
+            while (ox < ox_hi) : (ox += 1) {
+                var acc = bias;
+                inline for (0..3) |ky| {
+                    const rp = rows[ky] + (2 * ox - 1) * B;
+                    inline for (0..3) |kx| acc = fma(vec.load(rp + kx * B), wv[ky * 3 + kx], acc);
+                }
+                const rp: ?[*]const f32 = if (res) |rr| rr + ox * B else null;
+                vec.store(out + ox * B, k.epi.apply(ak, acc, rp, cb));
+            }
+            while (ox < g.ow) : (ox += 1) {
+                if (2 * ox < g.w) k.edge3(ak, rows, &wv, bias, 0, 2, 2 * ox - 1, out, res, cb, ox) else k.pixel(ak, src, out, res, w, bias, cb, oy, ox);
+            }
             return;
         }
         for (0..g.ow) |ox| k.pixel(ak, src, out, res, w, bias, cb, oy, ox);
+    }
+
+    /// Output pixel `ox` of a 3x3 fast path whose kernel columns
+    /// [kx_lo, kx_hi) lie inside the input, the first at input column `c`
+    /// (the same sums in the same order as `pixel`, plus exact zeros for a
+    /// zero row).
+    inline fn edge3(k: *const Depthwise, comptime ak: ActKind, rows: [3][*]const f32, wv: *const [9]V, bias: V, comptime kx_lo: usize, comptime kx_hi: usize, c: usize, out: [*]f32, res: ?[*]const f32, cb: usize, ox: usize) void {
+        var acc = bias;
+        inline for (0..3) |ky| {
+            inline for (kx_lo..kx_hi) |kx| acc = fma(vec.load(rows[ky] + (c + kx - kx_lo) * B), wv[ky * 3 + kx], acc);
+        }
+        const rp: ?[*]const f32 = if (res) |rr| rr + ox * B else null;
+        vec.store(out + ox * B, k.epi.apply(ak, acc, rp, cb));
     }
 
     /// One output pixel with bounds checks (any kernel, stride, dilation).
@@ -511,13 +617,8 @@ pub const Direct = struct {
                 }
             }
         }
-        inline for (0..NB) |nb| {
-            const o = out + (cob + nb) * os + ox * B;
-            inline for (0..R) |r| {
-                const rp: ?[*]const f32 = if (res) |rr| rr + (cob + nb) * rs + (ox + r) * B else null;
-                vec.store(o + r * B, k.epi.apply(ak, acc[r][nb], rp, cob + nb));
-            }
-        }
+        const rp: ?[*]const f32 = if (res) |rr| rr + cob * rs + ox * B else null;
+        k.epi.storeTile(ak, R, NB, &acc, out + cob * os + ox * B, os, rp, rs, cob);
     }
 };
 
@@ -722,13 +823,12 @@ pub const Blocked = struct {
                 }
             }
         }
-        inline for (0..NB) |nb| {
-            const o = t.out + nb * t.os + ox * B;
-            inline for (0..R) |r| {
-                if (ph.last) {
-                    const rp: ?[*]const f32 = if (t.res) |rr| rr + nb * t.rs + (ox + r) * B else null;
-                    vec.store(o + r * B, k.epi.apply(ak, acc[r][nb], rp, t.cob + nb));
-                } else vec.store(o + r * B, acc[r][nb]);
+        if (ph.last) {
+            const rp: ?[*]const f32 = if (t.res) |rr| rr + ox * B else null;
+            k.epi.storeTile(ak, R, NB, &acc, t.out + ox * B, t.os, rp, t.rs, t.cob);
+        } else {
+            inline for (0..NB) |nb| {
+                inline for (0..R) |r| vec.store(t.out + nb * t.os + (ox + r) * B, acc[r][nb]);
             }
         }
     }

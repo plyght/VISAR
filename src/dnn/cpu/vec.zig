@@ -40,7 +40,13 @@ const acc_budget: usize = if (avx512) 24 else if (avx) 12 else if (neon) 20 else
 pub const max_nb: usize = if (avx and !avx512) 3 else 4;
 
 /// Pixels per register tile for a tile `nb` blocks wide.
+///
+/// NEON keeps the tile's `R` pixel vectors live next to the `R x NB`
+/// accumulators and `NB` weights (lanes are splatted from registers), so
+/// all three share the 32 registers: `R` is the largest with
+/// `R*NB + R + NB <= 30` (a 2x10 tile would need 32 and spills).
 pub fn tileR(comptime nb: usize) usize {
+    if (neon) return @max(1, @min(14, (30 - nb) / (nb + 1)));
     return @max(1, @min(12, acc_budget / nb));
 }
 
@@ -62,21 +68,40 @@ pub fn laneMask(n: usize) @Vector(B, bool) {
     return idx < @as(@Vector(B, u32), @splat(@intCast(n)));
 }
 
-pub const ActKind = enum { none, relu, generic };
+/// How the conv kernels apply an activation. `linear`: the piecewise
+/// linear ones (none, ReLU, LeakyRelu: all of NanoDet and YuNet), one
+/// kernel for all three through their slope below zero, inlined into the
+/// register tile's epilogue. `deferred`: the rest; the tile stores its
+/// sums and a second pass over them applies the activation (SiLU, all of
+/// YOLOX, inlined there; others through `actGeneric`), so neither the
+/// exponential's code nor an out-of-line call sits in the tile, where it
+/// would cost the live accumulators (AArch64 keeps no full vector
+/// register across a call).
+pub const ActKind = enum { linear, deferred };
 
 pub fn actKind(a: ir.Act) ActKind {
     return switch (a) {
-        .none => .none,
-        .relu => .relu,
-        else => .generic,
+        .none, .relu, .leaky_relu => .linear,
+        else => .deferred,
     };
 }
 
-pub inline fn act(comptime kind: ActKind, a: ir.Act, v: V) V {
+/// Slope below zero of a `linear` activation.
+pub fn linearSlope(a: ir.Act) f32 {
+    return switch (a) {
+        .none => 1,
+        .leaky_relu => |al| al,
+        else => 0,
+    };
+}
+
+/// `a` (of kind `kind`; `slope` its `linearSlope`) on every lane.
+/// slope*min(v, 0) + max(v, 0) is exactly v, max(v, 0) and v*slope for
+/// v < 0 (one of the two terms is a zero).
+pub inline fn act(comptime kind: ActKind, a: ir.Act, slope: f32, v: V) V {
     return switch (kind) {
-        .none => v,
-        .relu => @max(v, splat(0)),
-        .generic => actGeneric(a, v),
+        .linear => fma(splat(slope), @min(v, splat(0)), @max(v, splat(0))),
+        .deferred => if (a == .silu) v / (splat(1) + @call(.always_inline, exp, .{-v})) else actGeneric(a, v),
     };
 }
 

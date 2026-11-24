@@ -103,6 +103,22 @@ pub const Pool = struct {
         for (0..cb(k.c)) |b| k.row(B, src, dst, b, y);
     }
 
+    /// Output column `o` of the separable path, from the row of column
+    /// maxima (window clamped to the row).
+    inline fn colWindow(k: *const Pool, comptime L: usize, colmax: []const f32, out: [*]f32, o: usize) void {
+        const p = k.p;
+        const x0 = @as(isize, @intCast(o * p.stride[1])) - @as(isize, @intCast(p.pad[1]));
+        const xlo: usize = @intCast(@max(x0, 0));
+        const xhi: usize = @intCast(@min(x0 + @as(isize, @intCast(p.kernel[1])), @as(isize, @intCast(k.w))));
+        if (xlo >= xhi) {
+            stL(L, out + o * L, spL(L, 0));
+            return;
+        }
+        var acc = ldL(L, colmax[xlo * L ..].ptr);
+        for (xlo + 1..xhi) |ix| acc = @max(acc, ldL(L, colmax[ix * L ..].ptr));
+        stL(L, out + o * L, acc);
+    }
+
     /// Output row `oy` of plane `pc` (a channel block, or a channel when
     /// L = 1).
     fn row(k: *const Pool, comptime L: usize, src: Rows, dst: Rows, pc: usize, oy: usize) void {
@@ -111,11 +127,11 @@ pub const Pool = struct {
         const fast2 = k.kind == .max and p.kernel[0] == 2 and p.kernel[1] == 2 and p.stride[0] == 2 and p.stride[1] == 2 and
             p.pad[0] == 0 and p.pad[1] == 0 and p.dilation[0] == 1 and p.dilation[1] == 1 and 2 * oy + 1 < k.h;
         var ox: usize = 0;
-        if (k.kind == .max and p.stride[0] == 1 and p.stride[1] == 1 and p.dilation[0] == 1 and p.dilation[1] == 1 and k.w <= sep_max_w) {
+        if (!fast2 and k.kind == .max and p.dilation[0] == 1 and p.dilation[1] == 1 and k.w <= sep_max_w) {
             // Separable: the column maxima over the window's rows, then
             // the maxima over each window's columns.
             var colmax: [sep_max_w * L]f32 = undefined;
-            const y0 = @as(isize, @intCast(oy)) - @as(isize, @intCast(p.pad[0]));
+            const y0 = @as(isize, @intCast(oy * p.stride[0])) - @as(isize, @intCast(p.pad[0]));
             const ylo: usize = @intCast(@max(y0, 0));
             const yhi: usize = @intCast(@min(y0 + @as(isize, @intCast(p.kernel[0])), @as(isize, @intCast(k.h))));
             if (ylo >= yhi) {
@@ -123,23 +139,28 @@ pub const Pool = struct {
                 return;
             }
             const first = src.at(pc, ylo);
-            @memcpy(colmax[0 .. k.w * L], first[0 .. k.w * L]);
-            for (ylo + 1..yhi) |iy| {
-                const rp = src.at(pc, iy);
-                for (0..k.w) |ix| stL(L, colmax[ix * L ..].ptr, @max(ldL(L, colmax[ix * L ..].ptr), ldL(L, rp + ix * L)));
-            }
-            for (0..k.ow) |o| {
-                const x0 = @as(isize, @intCast(o)) - @as(isize, @intCast(p.pad[1]));
-                const xlo: usize = @intCast(@max(x0, 0));
-                const xhi: usize = @intCast(@min(x0 + @as(isize, @intCast(p.kernel[1])), @as(isize, @intCast(k.w))));
-                if (xlo >= xhi) {
-                    stL(L, out + o * L, spL(L, 0));
-                    continue;
+            if (yhi - ylo == 3) {
+                // The common 3-row window in one pass.
+                const r1 = src.at(pc, ylo + 1);
+                const r2 = src.at(pc, ylo + 2);
+                for (0..k.w) |ix| stL(L, colmax[ix * L ..].ptr, @max(@max(ldL(L, first + ix * L), ldL(L, r1 + ix * L)), ldL(L, r2 + ix * L)));
+            } else {
+                @memcpy(colmax[0 .. k.w * L], first[0 .. k.w * L]);
+                for (ylo + 1..yhi) |iy| {
+                    const rp = src.at(pc, iy);
+                    for (0..k.w) |ix| stL(L, colmax[ix * L ..].ptr, @max(ldL(L, colmax[ix * L ..].ptr), ldL(L, rp + ix * L)));
                 }
-                var acc = ldL(L, colmax[xlo * L ..].ptr);
-                for (xlo + 1..xhi) |ix| acc = @max(acc, ldL(L, colmax[ix * L ..].ptr));
-                stL(L, out + o * L, acc);
             }
+            var o: usize = 0;
+            if (p.kernel[1] == 3) {
+                // Columns whose 3-wide window lies inside the row.
+                while (o < k.ow and o * p.stride[1] < p.pad[1]) : (o += 1) k.colWindow(L, &colmax, out, o);
+                while (o < k.ow and o * p.stride[1] - p.pad[1] + 3 <= k.w) : (o += 1) {
+                    const c = colmax[(o * p.stride[1] - p.pad[1]) * L ..].ptr;
+                    stL(L, out + o * L, @max(@max(ldL(L, c), ldL(L, c + L)), ldL(L, c + 2 * L)));
+                }
+            }
+            while (o < k.ow) : (o += 1) k.colWindow(L, &colmax, out, o);
             return;
         }
         if (fast2) {
@@ -708,11 +729,14 @@ pub const Extract = struct {
             const lo = @max(k.c0, b * B);
             const hi = @min(k.c1, b * B + B);
             const src = x + ((n * nb + b) * hw + y * w) * B;
+            const whole = lo == b * B and hi == b * B + B;
             for (0..w) |i| {
-                const v: [B]f32 = vec.actGeneric(k.act, vec.load(src + i * B));
+                const raw = vec.load(src + i * B);
+                const vv = if (k.act == .none) raw else vec.actGeneric(k.act, raw);
+                const v: [B]f32 = vv;
                 if (k.nhwc) {
                     const dst = o + (n * hw + y * w + i) * cn + (lo - k.c0);
-                    @memcpy(dst[0 .. hi - lo], v[lo - b * B .. hi - b * B]);
+                    if (whole) vec.store(dst, vv) else @memcpy(dst[0 .. hi - lo], v[lo - b * B .. hi - b * B]);
                 } else {
                     for (lo..hi) |c| o[(n * cn + c - k.c0) * hw + y * w + i] = v[c - b * B];
                 }
@@ -857,6 +881,15 @@ pub const Gather = struct {
             srcs[l] = k.ins[k.src[ch]].ptr(base) + img * k.in_img[k.src[ch]] + k.off[ch] + y * k.w * B;
         }
         const mask = vec.laneMask(lanes);
+        if (lanes == B and k.act == .none) {
+            // Whole blocks (the usual case), lanes unrolled.
+            for (0..k.w) |x| {
+                var v: [B]f32 = undefined;
+                inline for (0..B) |l| v[l] = srcs[l][x * B];
+                dst[x * B ..][0..B].* = v;
+            }
+            return;
+        }
         for (0..k.w) |x| {
             var v: [B]f32 = @splat(0);
             for (0..lanes) |l| v[l] = srcs[l][x * B];

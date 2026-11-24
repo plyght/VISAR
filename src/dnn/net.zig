@@ -58,6 +58,9 @@ pub const Options = struct {
     blocked: bool = true,
     /// Stream chains of convolutions and pools row by row.
     stream: bool = true,
+    /// Only through intermediate tensors of at least this size (smaller
+    /// ones stay in cache; whole-tensor kernels run them faster).
+    stream_min_bytes: usize = 1 << 20,
     /// Backend selection, applied at `plan`. The Metal backend always uses
     /// its own blocked layout and ignores `blocked` and `stream`.
     backend: Backend = .auto,
@@ -155,7 +158,7 @@ pub const Net = struct {
                 else => |x| x,
             };
         }
-        c.plan = try plan_mod.build(a, &g, if (net.opts.blocked) cpu.block else 0, if (net.opts.stream) &cpu.streamable else null);
+        c.plan = try plan_mod.build(a, &g, if (net.opts.blocked) cpu.block else 0, if (net.opts.stream) &cpu.streamable else null, net.opts.stream_min_bytes);
         c.program = try cpu.Program.init(a, &c.plan, .{ .stream = net.opts.stream });
         c.buf = try net.gpa.alignedAlloc(u8, .@"64", @max(c.plan.arena_bytes, 64));
         @memset(c.buf, 0);
@@ -167,7 +170,7 @@ pub const Net = struct {
     fn planMetal(c: *Compiled, g: *ir.Graph, auto: bool) (ir.Error || metal.Error || error{TooSmall})!void {
         if (!metal.available()) return error.Unavailable;
         const a = c.arena.allocator();
-        const p = try plan_mod.build(a, g, metal.block, null);
+        const p = try plan_mod.build(a, g, metal.block, null, 0);
         if (auto and metal.encode.convMacs(&p) < metal.auto_min_macs) return error.TooSmall;
         c.plan = p;
         c.gpu = try metal.Program.init(a, &c.plan);
@@ -439,7 +442,7 @@ test "net runs a small model and matches a direct evaluation" {
     try testing.expectError(error.ShapeMismatch, net.plan(&.{&.{ 1, 3, 9, 11 }}));
     var prng = std.Random.DefaultPrng.init(7);
     for ([_][2]usize{ .{ 16, 20 }, .{ 32, 44 }, .{ 4, 4 } }) |hw| {
-        for ([_]Options{ .{}, .{ .stream = false }, .{ .fuse = false }, .{ .blocked = false } }) |opts| {
+        for ([_]Options{ .{}, .{ .stream_min_bytes = 0 }, .{ .stream = false }, .{ .fuse = false }, .{ .blocked = false } }) |opts| {
             for ([_]Exec{ .serial, .on(&pool) }) |exec| {
                 net.opts = opts;
                 try net.plan(&.{&.{ 1, 3, hw[0], hw[1] }});

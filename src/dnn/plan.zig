@@ -487,8 +487,9 @@ fn normAxis(axis: i64, rank: usize) ir.Error!usize {
 }
 
 /// Lowers an optimised, shape-inferred graph to a plan with blocked layout
-/// of `block` channels (0 = plain only) and assigns arena offsets.
-pub fn build(arena: Allocator, g: *ir.Graph, block: usize, streamable: ?Streamable) ir.Error!Plan {
+/// of `block` channels (0 = plain only) and assigns arena offsets. Groups
+/// (with `streamable`) only pass on tensors of at least `stream_min_bytes`.
+pub fn build(arena: Allocator, g: *ir.Graph, block: usize, streamable: ?Streamable, stream_min_bytes: usize) ir.Error!Plan {
     const nv = g.values.items.len;
     var b: Builder = .{
         .arena = arena,
@@ -532,15 +533,18 @@ pub fn build(arena: Allocator, g: *ir.Graph, block: usize, streamable: ?Streamab
         .output_names = names,
         .arena_bytes = 0,
     };
-    if (streamable) |f| p.groups = try findGroups(&p, arena, f);
+    if (streamable) |f| p.groups = try findGroups(&p, arena, f, stream_min_bytes);
     try assignMemory(&p, arena);
     return p;
 }
 
 /// Maximal runs where each step reads only the previous step's output and
 /// nothing else reads it. A pooling step ends a run, so the rows a band of
-/// output recomputes at its top stay few.
-fn findGroups(p: *const Plan, arena: Allocator, f: Streamable) Allocator.Error![]const Group {
+/// output recomputes at its top stay few. So does a tensor smaller than
+/// `min_bytes`: one that stays in cache gains nothing from streaming, and
+/// row by row each stage loses its whole-tensor work split (a pointwise
+/// stage reloads all its weights for every row).
+fn findGroups(p: *const Plan, arena: Allocator, f: Streamable, min_bytes: usize) Allocator.Error![]const Group {
     var out: std.ArrayList(Group) = .empty;
     var i: usize = 0;
     while (i < p.steps.len) {
@@ -554,6 +558,7 @@ fn findGroups(p: *const Plan, arena: Allocator, f: Streamable) Allocator.Error![
                 // A tensor sharing its storage (a view, or viewed) is
                 // always materialised.
                 if (p.steps[j].inputs[0] != t or p.readers(t) != 1 or p.shared(t)) break;
+                if (p.tensors[t].storedCount(p.block) * @sizeOf(f32) < min_bytes) break;
                 // Other inputs (residuals) must come from outside the run.
                 var inside = false;
                 for (p.steps[j].inputs[1..]) |x| {
