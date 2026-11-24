@@ -154,7 +154,7 @@ inline fn downRowsF(comptime cn: usize, comptime R: usize, s: Image(f32), d: Ima
     const w: usize = s.width;
     const dw: usize = d.width;
     // Pixels per split step: the sums of 2P pixels are split at a time.
-    const P = if (@import("builtin").cpu.arch == .aarch64) 8 else 16;
+    const P = if (arm) 4 else 16;
     const L = 2 * P * cn;
     const VL = @Vector(L, f32);
     const NV = comptime lanes(f32);
@@ -195,18 +195,43 @@ inline fn downRowsF(comptime cn: usize, comptime R: usize, s: Image(f32), d: Ima
     var x: usize = 0;
     while (x + 2 * P <= w) : (x += 2 * P) {
         const o = x * cn;
-        var v: [3 + 2 * R]VL = undefined;
-        inline for (0..3 + 2 * R) |k| v[k] = rows[k][o..][0..L].*;
         const q = (x / 2 + 1) * cn;
-        inline for (0..R) |r| {
-            const a = v[2 * r];
-            const b = v[2 * r + 1];
-            const c = v[2 * r + 2];
-            const e = v[2 * r + 3];
-            const f = v[2 * r + 4];
-            const sum = (a + f) + (b + e) * @as(VL, @splat(4)) + c * @as(VL, @splat(6));
-            er[r][q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[0]);
-            orr[r][q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[1]);
+        if (comptime arm) {
+            // 4-lane vectors throughout, each row's loads next to its sums
+            // (no spills), and each split vector built from the two or
+            // three sum vectors it draws on (ext/ins, not a wide shuffle).
+            const V4 = @Vector(4, f32);
+            const NS = L / 4;
+            var sum: [R][NS]V4 = undefined;
+            inline for (0..NS) |k| {
+                var v: [3 + 2 * R]V4 = undefined;
+                inline for (0..3 + 2 * R) |i| v[i] = rows[i][o + 4 * k ..][0..4].*;
+                inline for (0..R) |r| {
+                    const a = v[2 * r];
+                    const b = v[2 * r + 1];
+                    const c = v[2 * r + 2];
+                    const e = v[2 * r + 3];
+                    const f = v[2 * r + 4];
+                    sum[r][k] = (a + f) + (b + e) * @as(V4, @splat(4)) + c * @as(V4, @splat(6));
+                }
+            }
+            inline for (0..R) |r| inline for (0..NS / 2) |k| {
+                er[r][q + 4 * k ..][0..4].* = pick4(NS, sum[r], pick[0][4 * k ..][0..4].*);
+                orr[r][q + 4 * k ..][0..4].* = pick4(NS, sum[r], pick[1][4 * k ..][0..4].*);
+            };
+        } else {
+            var v: [3 + 2 * R]VL = undefined;
+            inline for (0..3 + 2 * R) |k| v[k] = rows[k][o..][0..L].*;
+            inline for (0..R) |r| {
+                const a = v[2 * r];
+                const b = v[2 * r + 1];
+                const c = v[2 * r + 2];
+                const e = v[2 * r + 3];
+                const f = v[2 * r + 4];
+                const sum = (a + f) + (b + e) * @as(VL, @splat(4)) + c * @as(VL, @splat(6));
+                er[r][q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[0]);
+                orr[r][q..][0 .. P * cn].* = @shuffle(f32, sum, undefined, pick[1]);
+            }
         }
         // Padded pixels below x + 2 + 2P are summed: outputs below
         // x / 2 + P - 1 are ready.
@@ -236,6 +261,49 @@ inline fn downRowsF(comptime cn: usize, comptime R: usize, s: Image(f32), d: Ima
         while (jt < n_out) : (jt += 1) hscalar(cn, er[r], orr[r], out[r], jt);
         for (0..cn) |i| hscalar(cn, er[r], orr[r], out[r], i);
     }
+}
+
+const arm = @import("builtin").cpu.arch == .aarch64;
+
+/// Lanes `idx` of the concatenated 4-lane vectors `v`, built from only the
+/// (at most three) vectors they come from.
+inline fn pick4(comptime n: usize, v: [n]@Vector(4, f32), comptime idx: [4]i32) @Vector(4, f32) {
+    const src = comptime blk: {
+        var s: [3]usize = undefined;
+        var m: usize = 0;
+        for (idx) |i| {
+            const k: usize = @intCast(@divFloor(i, 4));
+            var seen = false;
+            for (s[0..m]) |t| seen = seen or t == k;
+            if (!seen) {
+                s[m] = k;
+                m += 1;
+            }
+        }
+        if (m == 1) s[1] = s[0];
+        if (m <= 2) s[2] = s[1];
+        break :blk s;
+    };
+    // First the lanes from src[0] and src[1], then those from src[2].
+    const m1 = comptime blk: {
+        var m: [4]i32 = undefined;
+        for (idx, 0..) |i, l| {
+            const k: usize = @intCast(@divFloor(i, 4));
+            const lane: i32 = @mod(i, 4);
+            m[l] = if (k == src[0]) lane else if (k == src[1]) ~lane else 0;
+        }
+        break :blk m;
+    };
+    const m2 = comptime blk: {
+        var m: [4]i32 = undefined;
+        for (idx, 0..) |i, l| {
+            const k: usize = @intCast(@divFloor(i, 4));
+            m[l] = if (k != src[0] and k != src[1]) ~@as(i32, @mod(i, 4)) else @intCast(l);
+        }
+        break :blk m;
+    };
+    const t = @shuffle(f32, v[src[0]], v[src[1]], m1);
+    return @shuffle(f32, t, v[src[2]], m2);
 }
 
 inline fn hstep(comptime cn: usize, comptime NV: usize, er: []const f32, orr: []const f32, out: []f32, j: usize) void {
@@ -553,6 +621,34 @@ test "pyrDown and pyrUp match a direct 5x5 sum" {
                     const want: f64 = if (@typeInfo(T) == .float) s / 64 else @floor((s + 32) / 64);
                     const got: f64 = if (@typeInfo(T) == .float) up.at(x, y, ch) else @floatFromInt(up.at(x, y, ch));
                     try std.testing.expectApproxEqAbs(want, got, if (@typeInfo(T) == .float) 1e-5 else 0);
+                };
+            }
+        }
+    }
+}
+
+test "pyrDown f32 3/4 channels: same sums in the same order as the scalar formula" {
+    const gpa = std.testing.allocator;
+    for ([_][2]u32{ .{ 131, 12 }, .{ 64, 9 }, .{ 70, 7 }, .{ 9, 5 } }) |sz| {
+        for ([_]u16{ 3, 4 }) |cn| {
+            var src = try Image(f32).init(gpa, sz[0], sz[1], cn);
+            defer src.deinit(gpa);
+            fillRandom(f32, src, sz[0] * 7 + cn);
+            const ds = downSize(sz[0], sz[1]);
+            var down = try Image(f32).init(gpa, ds[0], ds[1], cn);
+            defer down.deinit(gpa);
+            for ([_]Border{ .reflect101, .replicate }) |b| {
+                try pyrDown(.serial, gpa, src, down, b);
+                for (0..ds[1]) |y| for (0..ds[0]) |x| for (0..cn) |ch| {
+                    var p: [5]f32 = undefined;
+                    for (0..5) |i| {
+                        const sx = border_mod.map(@as(isize, @intCast(2 * x + i)) - 2, src.width, b).?;
+                        var r: [5]f32 = undefined;
+                        for (0..5) |k| r[k] = src.at(sx, border_mod.map(@as(isize, @intCast(2 * y + k)) - 2, src.height, b).?, ch);
+                        p[i] = (r[0] + r[4]) + (r[1] + r[3]) * 4 + r[2] * 6;
+                    }
+                    const want = ((p[0] + p[4]) + (p[1] + p[3]) * 4 + p[2] * 6) * (1.0 / 256.0);
+                    try std.testing.expectEqual(want, down.at(x, y, ch));
                 };
             }
         }
