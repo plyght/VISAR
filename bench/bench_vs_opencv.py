@@ -113,6 +113,24 @@ def cases(h, w):
     yield "imdecode JPEG", lambda: vs.imdecode(jpgb), lambda: cv2.imdecode(jpg, cv2.IMREAD_UNCHANGED)
     yield "imencode JPEG q90", lambda: vs.imencode(".jpg", bgr, quality=90), lambda: cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
     yield from contour_cases(h, w)
+    yield from dnn_cases()
+
+
+def dnn_cases():
+    """YuNet face detection (skipped when VISAR_MODELS has no model)."""
+    d = os.environ.get("VISAR_MODELS", "")
+    path = next((os.path.join(d, n) for n in ("face_detection_yunet_2023mar.onnx", "y.onnx")
+                 if d and os.path.isfile(os.path.join(d, n))), None)
+    if path is None:
+        return
+    model = open(path, "rb").read()
+    faces = [f for f in sorted(os.listdir(d)) if f.lower().endswith((".jpg", ".png"))]
+    src = cv2.imread(os.path.join(d, faces[0])) if faces else natural(480, 640, 3)
+    for (w, h) in [(320, 240), (640, 480)]:
+        img = cv2.resize(src, (w, h), interpolation=cv2.INTER_AREA)
+        ours = vs.FaceDetector(model, (w, h))
+        theirs = cv2.FaceDetectorYN.create(path, "", (w, h))
+        yield f"FaceDetectorYN {w}x{h}", (lambda o=ours, i=img: o.detect(i)), (lambda t=theirs, i=img: t.detect(i))
 
 
 def blob_mask(h, w, n=None, seed=7):

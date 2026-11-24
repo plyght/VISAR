@@ -59,6 +59,15 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install numpy opencv-python-headless==5.0.0.*
+      # OpenCV Model Zoo files for the dnn suite (not in the repository).
+      - name: Download models
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/models"
+          zoo=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/face_detection_yunet_2023mar.onnx" "$zoo/face_detection_yunet_2023mar.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg" || true
+          echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
       - run: zig build difftest -Doptimize=ReleaseSafe
 
   cross:

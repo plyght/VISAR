@@ -518,3 +518,81 @@ def fit_ellipse(p):
     r = RotatedRect()
     _check(lib.visar_fit_ellipse(ptr, ctypes.c_size_t(n), d, ctypes.byref(r)))
     return (r.cx, r.cy), (r.w, r.h), r.angle
+
+
+# ------------------------------------------------------------------ dnn
+
+_vp = ctypes.c_void_p
+_sz = ctypes.c_size_t
+lib.visar_dnn_net_input.restype = ctypes.POINTER(ctypes.c_float)
+lib.visar_dnn_net_output_name.restype = ctypes.c_char_p
+lib.visar_dnn_net_output_count.restype = _sz
+lib.visar_dnn_net_free.argtypes = [_vp]
+lib.visar_face_detector_free.argtypes = [_vp]
+
+
+class Net:
+    """An ONNX network planned for one input shape (plain NCHW f32)."""
+
+    def __init__(self, model_bytes):
+        self._h = _vp()
+        _check(lib.visar_dnn_net_load(model_bytes, _sz(len(model_bytes)), ctypes.byref(self._h)))
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib.visar_dnn_net_free(self._h)
+            self._h = None
+
+    def plan(self, shape):
+        arr = (_sz * len(shape))(*shape)
+        _check(lib.visar_dnn_net_plan(self._h, arr, _sz(len(shape))))
+        self._shape = tuple(shape)
+
+    def forward(self, blob):
+        """Runs on `blob` (float32, the planned shape); returns {name: array}."""
+        n = _sz()
+        p = lib.visar_dnn_net_input(self._h, ctypes.byref(n))
+        dst = np.ctypeslib.as_array(p, shape=(n.value,))
+        dst[:] = np.ascontiguousarray(blob, np.float32).ravel()
+        _check(lib.visar_dnn_net_run(self._h))
+        out = {}
+        for i in range(lib.visar_dnn_net_output_count(self._h)):
+            shape = (_sz * 6)()
+            rank = _sz()
+            data = ctypes.POINTER(ctypes.c_float)()
+            _check(lib.visar_dnn_net_output(self._h, _sz(i), shape, ctypes.byref(rank), ctypes.byref(data)))
+            dims = tuple(shape[k] for k in range(rank.value))
+            cnt = int(np.prod(dims)) if dims else 1
+            out[lib.visar_dnn_net_output_name(self._h, _sz(i)).decode()] = \
+                np.ctypeslib.as_array(data, shape=(cnt,)).copy().reshape(dims)
+        return out
+
+
+class FaceDetector:
+    """YuNet face detector with cv2.FaceDetectorYN's interface."""
+
+    def __init__(self, model_bytes, size, score_threshold=0.9, nms_threshold=0.3, top_k=5000):
+        self._h = _vp()
+        _check(lib.visar_face_detector_create(model_bytes, _sz(len(model_bytes)), int(size[0]), int(size[1]),
+                                              ctypes.c_float(score_threshold), ctypes.c_float(nms_threshold),
+                                              int(top_k), ctypes.byref(self._h)))
+        self._out = np.empty((64, 15), np.float32)
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib.visar_face_detector_free(self._h)
+            self._h = None
+
+    def set_input_size(self, size):
+        _check(lib.visar_face_detector_set_input_size(self._h, int(size[0]), int(size[1])))
+
+    def detect(self, img):
+        """BGR uint8 image -> float32 array [N, 15] (empty when no face)."""
+        d = desc(img)
+        cnt = _sz()
+        while True:
+            _check(lib.visar_face_detector_detect(self._h, ctypes.byref(d), self._out.ctypes.data_as(_vp),
+                                                  _sz(len(self._out)), ctypes.byref(cnt)))
+            if cnt.value <= len(self._out):
+                return self._out[:cnt.value].copy()
+            self._out = np.empty((cnt.value, 15), np.float32)
