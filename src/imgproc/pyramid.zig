@@ -212,7 +212,7 @@ inline fn downRowsF(comptime cn: usize, comptime R: usize, s: Image(f32), d: Ima
                     const c = v[2 * r + 2];
                     const e = v[2 * r + 3];
                     const f = v[2 * r + 4];
-                    sum[r][k] = (a + f) + (b + e) * @as(V4, @splat(4)) + c * @as(V4, @splat(6));
+                    sum[r][k] = add4(a + f, b + e) + c * @as(V4, @splat(6));
                 }
             }
             inline for (0..R) |r| inline for (0..NS / 2) |k| {
@@ -313,7 +313,16 @@ inline fn hstep(comptime cn: usize, comptime NV: usize, er: []const f32, orr: []
     const e2: V = er[j + 2 * cn ..][0..NV].*;
     const o0: V = orr[j..][0..NV].*;
     const o1: V = orr[j + cn ..][0..NV].*;
-    out[j..][0..NV].* = finishV(f32, 8, NV, (e0 + e2) + (o0 + o1) * @as(V, @splat(4)) + e1 * @as(V, @splat(6)));
+    out[j..][0..NV].* = finishV(f32, 8, NV, add4(e0 + e2, o0 + o1) + e1 * @as(V, @splat(6)));
+}
+
+/// x + u * 4. On AArch64 one fused multiply-add: u * 4 is exact, so the
+/// fused and the separate forms round the same (they differ only where
+/// u * 4 overflows to infinity, |u| > 8.5e37).
+inline fn add4(x: anytype, u: @TypeOf(x)) @TypeOf(x) {
+    const V = @TypeOf(x);
+    if (comptime arm) return @mulAdd(V, u, @splat(4), x);
+    return x + u * @as(V, @splat(4));
 }
 
 inline fn hscalar(comptime cn: usize, er: []const f32, orr: []const f32, out: []f32, j: usize) void {
