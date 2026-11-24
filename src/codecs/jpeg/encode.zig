@@ -275,9 +275,9 @@ fn rgbToYcc(comptime bgr: bool, comptime ch: usize, src: []const u8, w: usize, y
             const off: VI = @splat((128 << 16) + 32767);
             const cbv = (r * @as(VI, @splat(-11059)) + g * @as(VI, @splat(-21709)) + b * @as(VI, @splat(32768)) + off) >> s16;
             const crv = (r * @as(VI, @splat(32768)) + g * @as(VI, @splat(-27439)) + b * @as(VI, @splat(-5329)) + off) >> s16;
-            y[x..][0..16].* = @as(U16, @intCast(yy));
-            cb[x..][0..16].* = @as(U16, @intCast(cbv));
-            cr[x..][0..16].* = @as(U16, @intCast(crv));
+            y[x..][0..16].* = @as(U16, @truncate(@as(@Vector(16, u32), @bitCast(yy))));
+            cb[x..][0..16].* = @as(U16, @truncate(@as(@Vector(16, u32), @bitCast(cbv))));
+            cr[x..][0..16].* = @as(U16, @truncate(@as(@Vector(16, u32), @bitCast(crv))));
         }
     }
     while (x < w) : (x += 1) {
