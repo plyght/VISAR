@@ -342,10 +342,22 @@ int visar_corner_sub_pix(const visar_image *img, float *corners, size_t n, int w
 /* findChessboardCorners (8U gray, BGR or BGRA): pattern_w * pattern_h (x, y) floats in OpenCV's order. */
 int visar_find_chessboard_corners(const visar_image *img, int pattern_w, int pattern_h, float *corners, int flags,
                                   int *found);
+
 /* calibrateCamera over planar views: counts[i] points per view, points back to back; dist has 5 coefficients.
    Flags: USE_INTRINSIC_GUESS 1, FIX_PRINCIPAL_POINT 4, ZERO_TANGENT_DIST 8, FIX_FOCAL_LENGTH 16, FIX_K1..K3 32/64/128. */
 int visar_calibrate_camera(const double *obj, const double *img, const int *counts, size_t nviews, int width, int height,
                            double k[9], double dist[5], int flags, double *rvecs, double *tvecs, double *rms);
+
+/* photo (bit-exact with OpenCV). fastNlMeansDenoising: VISAR_8U, 1-4 channels, NORM_L2; dst may be src.
+   fastNlMeansDenoisingColored: BGR or BGRA VISAR_8U. lab_linear: cvtColor COLOR_LBGR2Lab (inverse 0) or
+   COLOR_Lab2LBGR (inverse 1), VISAR_8U 3 channels. inpaint: src VISAR_8U (1 or 3 channels), VISAR_16U or
+   VISAR_32F (1 channel), mask VISAR_8U 1 channel, flags 0 INPAINT_NS, 1 INPAINT_TELEA. */
+int visar_fast_nl_means_denoising(const visar_image *src, const visar_image *dst, float h, int template_window_size,
+                                  int search_window_size);
+int visar_fast_nl_means_denoising_colored(const visar_image *src, const visar_image *dst, float h, float h_color,
+                                          int template_window_size, int search_window_size);
+int visar_lab_linear(const visar_image *src, const visar_image *dst, int inverse);
+int visar_inpaint(const visar_image *src, const visar_image *mask, const visar_image *dst, double radius, int flags);
 
 #ifdef __cplusplus
 }

@@ -119,6 +119,27 @@ def cases(h, w):
     yield from tracking_cases()
     yield from features2d_cases()
     yield from calib3d_cases()
+    yield from photo_cases()
+
+
+def photo_cases():
+    """photo at fixed sizes (independent of --size): non-local means with
+    OpenCV's defaults for 7/21 windows, inpainting a ~5% mask."""
+    if not hasattr(vs.lib, "visar_inpaint"):
+        return
+    import photo_ctypes as ph
+    from test_photo_vs_opencv import noisy, scratches
+    for (w, h) in [(640, 480), (1280, 720)]:
+        g, c = noisy(h, w, 1, seed=1), noisy(h, w, 3, seed=2)
+        yield f"fastNlMeansDenoising h10 t7 s21 {w}x{h}", (lambda g=g: ph.fast_nl_means_denoising(g, 10, 7, 21)), \
+            (lambda g=g: cv2.fastNlMeansDenoising(g, None, 10, 7, 21))
+        yield f"fastNlMeansDenoisingColored h10 {w}x{h}", (lambda c=c: ph.fast_nl_means_denoising_colored(c, 10, 10)), \
+            (lambda c=c: cv2.fastNlMeansDenoisingColored(c, None, 10, 10))
+        m = scratches(h, w, seed=3)
+        for flags, name in ((cv2.INPAINT_TELEA, "TELEA"), (cv2.INPAINT_NS, "NS")):
+            for img, kind in ((c, "BGR"), (g, "gray")):
+                yield f"inpaint {name} r3 5% {kind} {w}x{h}", (lambda img=img, f=flags, m=m: ph.inpaint(img, m, 3, f)), \
+                    (lambda img=img, f=flags, m=m: cv2.inpaint(img, m, 3, f))
 
 
 def feature_image(h, w, seed=0):
