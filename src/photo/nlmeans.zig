@@ -122,6 +122,21 @@ inline fn lookup(tbl: [*]const i32, idx: VU) VI {
     return r;
 }
 
+/// Without hardware gathers (NEON, wasm) the table lookups of a whole row
+/// run as a scalar loop between two vector passes.
+const batch_lookup = !x86_gather;
+
+/// The patch distances of V centers from the column sums.
+inline fn hsum(colsum: []const u32, x: usize, ntap: usize) VU {
+    var ssd: VU = colsum[x..][0..V].*;
+    inline for (1..8) |tx| {
+        if (tx < ntap) ssd += colsum[x + tx ..][0..V].*;
+    }
+    var tx: usize = 8;
+    while (tx < ntap) : (tx += 1) ssd += colsum[x + tx ..][0..V].*;
+    return ssd;
+}
+
 /// Geometry shared by all strips.
 fn Plan(comptime cn: usize) type {
     return struct {
@@ -175,7 +190,8 @@ fn Plan(comptime cn: usize) type {
             const dbuf = fl[0 .. drows * dwv];
             const colsum = fl[drows * dwv ..][0..dwv];
             const arows = rows + s;
-            const accp: [*]i32 = @ptrCast(@alignCast(fl + drows * dwv + dwv));
+            const wbuf = fl[drows * dwv + dwv ..][0..dwv];
+            const accp: [*]i32 = @ptrCast(@alignCast(fl + drows * dwv + 2 * dwv));
             var acc: [cn + 1][]i32 = undefined;
             for (0..cn + 1) |c| {
                 acc[c] = accp[c * arows * aw ..][0 .. arows * aw];
@@ -251,16 +267,18 @@ fn Plan(comptime cn: usize) type {
                         // Center column x is accumulator column x + s.
                         const ap = k * aw + s;
                         const aq: usize = @intCast(@as(isize, @intCast((k + dyu) * aw + s)) + dx);
+                        if (batch_lookup) {
+                            // Indices for the row, then the table lookups as
+                            // a plain scalar loop.
+                            var x: usize = 0;
+                            while (x < self.wcv) : (x += V) {
+                                wbuf[x..][0..V].* = @min(hsum(colsum, x, ntap) >> shift, max_idx);
+                            }
+                            for (wbuf[0..self.wcv]) |*v| v.* = @bitCast(tbl[v.*]);
+                        }
                         var x: usize = 0;
                         while (x < self.wcv) : (x += V) {
-                            var ssd: VU = colsum[x..][0..V].*;
-                            inline for (1..8) |tx| {
-                                if (tx < ntap) ssd += colsum[x + tx ..][0..V].*;
-                            }
-                            var tx: usize = 8;
-                            while (tx < ntap) : (tx += 1) ssd += colsum[x + tx ..][0..V].*;
-                            const idx = @min(ssd >> shift, max_idx);
-                            const w = lookup(tbl, idx);
+                            const w: VI = if (batch_lookup) @bitCast(@as(VU, wbuf[x..][0..V].*)) else lookup(tbl, @min(hsum(colsum, x, ntap) >> shift, max_idx));
                             inline for (0..cn) |c| {
                                 const pv: @Vector(V, u8) = ep[c][x..][0..V].*;
                                 const qv: @Vector(V, u8) = eq[c][x..][0..V].*;
@@ -300,7 +318,7 @@ fn Plan(comptime cn: usize) type {
         fn scratchBytes(self: *const Self) usize {
             const drows = self.strip + 2 * self.t;
             const arows = self.strip + self.s;
-            return 4 * (drows * self.dwv + self.dwv + (cn + 1) * arows * self.aw);
+            return 4 * (drows * self.dwv + 2 * self.dwv + (cn + 1) * arows * self.aw);
         }
     };
 }
