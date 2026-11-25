@@ -8,8 +8,17 @@
 //! order is fixed by OpenCV's priority queue key (T, then insertion order),
 //! which is unique, so any priority queue pops in the same order; every
 //! float operation is replayed in OpenCV's order and precision.
+//!
+//! On aarch64 the expressions clang contracts into fused multiply-adds when
+//! it compiles OpenCV for Apple Silicon (-ffp-contract=on: a*b + c within
+//! one C expression, VectorLength and VectorScalMult included) are fused
+//! the same way here: the arrival time's 2 - d*d, the direction dot
+//! products and squared lengths, the weighted sums and Telea's gradient
+//! norm. The arrival times decide the fill order, so a single unfused
+//! rounding there changes which pixels are known when a later one is filled.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("../core/core.zig");
 const Image = core.Image;
 const Allocator = std.mem.Allocator;
@@ -22,6 +31,15 @@ pub const Method = enum(u8) {
     /// Alexandru Telea's method (cv::INPAINT_TELEA).
     telea = 1,
 };
+
+/// Whether OpenCV's build fuses a*b + c (clang on aarch64).
+const contract = builtin.cpu.arch == .aarch64;
+
+/// a*b + c as OpenCV's compiler evaluates it; F is a float or a vector.
+inline fn madd(comptime F: type, a: F, b: F, c: F) F {
+    if (contract) return @mulAdd(F, a, b, c);
+    return a * b + c;
+}
 
 const KNOWN: u8 = 0;
 const BAND: u8 = 1;
@@ -113,7 +131,7 @@ fn solve(f: []const u8, t: []const f32, a: usize, b: usize) f32 {
     const m12 = @min(a11, a22);
     const sol: f64 = if (f[a] != INSIDE)
         (if (f[b] != INSIDE)
-            (if (@abs(a11 - a22) >= 1.0) 1 + m12 else (a11 + a22 + @sqrt(2 - (a11 - a22) * (a11 - a22))) * 0.5)
+            (if (@abs(a11 - a22) >= 1.0) 1 + m12 else (a11 + a22 + @sqrt(madd(f64, -(a11 - a22), a11 - a22, 2))) * 0.5)
         else
             1 + a11)
     else if (f[b] != INSIDE)
@@ -252,8 +270,9 @@ const Disk = struct {
     }
 };
 
-fn vlen(x: f32, y: f32) f32 {
-    return x * x + y * y;
+/// OpenCV's VectorLength: x*x + y*y.
+inline fn vlen(x: f32, y: f32) f32 {
+    return madd(f32, x, x, y * y);
 }
 
 /// The pixel type's conversion of the integer or float difference to f32.
@@ -335,7 +354,7 @@ fn Inpainter(comptime T: type, comptime cn: usize) type {
                     const dl = @as(isize, @intCast(l)) - @as(isize, @intCast(j));
                     const rx: f32 = @floatFromInt(-dl);
                     const lev: f32 = @floatCast(1.0 / (1.0 + @as(f64, @abs(g.T(k, l) - tij))));
-                    var dir: f32 = rx * grad[0] + ry * grad[1];
+                    var dir: f32 = madd(f32, rx, grad[0], ry * grad[1]);
                     if (@abs(@as(f64, dir)) <= 0.01) dir = 0.000001;
                     const w: f32 = @abs(self.disk.at(dk, dl) * lev * dir);
                     const lm = l - 1 + @intFromBool(l == 1);
@@ -353,15 +372,15 @@ fn Inpainter(comptime T: type, comptime cn: usize) type {
                         if (fd) {
                             giy = if (fu) diffF(T, self.o(kp + 1, lm, c), self.o(km - 1, lm, c)) * 2.0 else diffF(T, self.o(kp + 1, lm, c), self.o(km, lm, c));
                         } else if (fu) giy = diffF(T, self.o(kp, lm, c), self.o(km - 1, lm, c));
-                        ia[c] += w * toF(T, self.o(k - 1, l - 1, c));
-                        jx[c] -= w * (gix * rx);
-                        jy[c] -= w * (giy * ry);
+                        ia[c] = madd(f32, w, toF(T, self.o(k - 1, l - 1, c)), ia[c]);
+                        jx[c] = madd(f32, -w, gix * rx, jx[c]);
+                        jy[c] = madd(f32, -w, giy * ry, jy[c]);
                         s[c] += w;
                     }
                 }
             }
             inline for (0..cn) |c| {
-                const sat: f32 = ia[c] / s[c] + (jx[c] + jy[c]) / (@sqrt(jx[c] * jx[c] + jy[c] * jy[c]) + 1.0e-20);
+                const sat: f32 = ia[c] / s[c] + (jx[c] + jy[c]) / (@sqrt(madd(f32, jx[c], jx[c], jy[c] * jy[c])) + 1.0e-20);
                 self.out.data[(i - 1) * self.out.stride + (j - 1) * cn + c] = if (T == f32) sat else satD(T, @as(f64, sat) + 0.5);
             }
         }
@@ -410,14 +429,14 @@ fn Inpainter(comptime T: type, comptime cn: usize) type {
                                 absDiffF(T, self.o(km, lp + 1, c), self.o(km, lm, c)) * 2.0;
                         } else if (fl) giy = absDiffF(T, self.o(km, lm, c), self.o(km, lm - 1, c)) * 2.0;
                         gix = -gix;
-                        var dir: f32 = rx * gix + ry * giy;
+                        var dir: f32 = madd(f32, rx, gix, ry * giy);
                         if (@abs(@as(f64, dir)) <= 0.01) {
                             dir = 0.000001;
                         } else {
                             dir = @abs(dir / @sqrt(vlen(rx, ry) * vlen(gix, giy)));
                         }
                         const w = dst * dir;
-                        ia[c] += w * toF(T, self.o(k - 1, l - 1, c));
+                        ia[c] = madd(f32, w, toF(T, self.o(k - 1, l - 1, c)), ia[c]);
                         s[c] += w;
                     }
                 }
@@ -512,7 +531,7 @@ fn Inpainter(comptime T: type, comptime cn: usize) type {
                     const okm2 = self.oVec(km, lb - 2);
                     const oc = self.oVec(k - 1, lb - 1);
                     var wa: [cn][L]f32 = undefined;
-                    var wo: [cn][L]f32 = undefined;
+                    var ov: [cn][L]f32 = undefined;
                     inline for (0..cn) |c| {
                         const a1 = @abs(okp1[c] - okp[c]);
                         const a2 = @abs(okp[c] - okmm[c]);
@@ -520,19 +539,19 @@ fn Inpainter(comptime T: type, comptime cn: usize) type {
                         const b1 = @abs(okm0[c] - okm1[c]);
                         const b2 = @abs(okm1[c] - okm2[c]);
                         const giy = @select(f32, fr, @select(f32, fl, b1 + b2, b1 * two), @select(f32, fl, b2 * two, zero));
-                        const dir = rx * gix + vry * giy;
+                        const dir = madd(VF, rx, gix, vry * giy);
                         const small = @abs(dir) <= dir_thr;
-                        const len2 = @select(f32, small, @as(VF, @splat(1)), rlen * (gix * gix + giy * giy));
+                        const len2 = @select(f32, small, @as(VF, @splat(1)), rlen * madd(VF, gix, gix, giy * giy));
                         const dn = @select(f32, small, @as(VF, @splat(0.000001)), @abs(dir / @sqrt(len2)));
                         const w = dstv * dn;
                         wa[c] = w;
-                        wo[c] = w * oc[c];
+                        ov[c] = oc[c];
                     }
                     const ka: [L]bool = kn;
                     for (0..cnt) |q| {
                         if (!ka[q]) continue;
                         inline for (0..cn) |c| {
-                            ia[c] += wo[c][q];
+                            ia[c] = madd(f32, wa[c][q], ov[c][q], ia[c]);
                             s[c] += wa[c][q];
                         }
                     }
@@ -695,7 +714,7 @@ fn inpaintCn(comptime T: type, comptime cn: usize, gpa: Allocator, src: Image(T)
                     @floatCast(1.0 / (@as(f64, L) * @sqrt(@as(f64, L))))
                 else
                     @floatCast(1.0 / @as(f64, L * @sqrt(L))),
-                .ns => 1 / (L * L + 1),
+                .ns => 1 / madd(f32, L, L, 1),
             };
         }
     }
