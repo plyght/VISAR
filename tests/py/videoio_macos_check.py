@@ -69,7 +69,8 @@ def main():
             ok, f = cap.read()
             p = psnr(f, want[k]) if ok else 0
             if p < 30:
-                failed.append(f"{name}: seek to {k}: PSNR {p:.1f}")
+                best = max(range(n), key=lambda j: psnr(f, want[j])) if ok else -1
+                failed.append(f"{name}: seek to {k}: PSNR {p:.1f} (got frame {best}?)")
         print(f"  seek checks done (frames {n // 2}, {n - 1}, 3, 0)")
         cap.release()
 
