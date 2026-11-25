@@ -290,14 +290,76 @@ pub fn remap(exec: Exec, src: Image(u8), dst: Image(u8), mapx: Image(f32), mapy:
         }
 
         fn runCn(comptime cn: usize, c: Ctx, y0: usize, y1: usize) void {
+            const L = 16;
+            const V = @Vector(L, f32);
+            const sw: f32 = @floatFromInt(c.src.width);
+            const sh: f32 = @floatFromInt(c.src.height);
+            const row_bytes = c.src.rowLen();
+            // A word read at the last row must stay inside the row.
+            const xsafe_last: f32 = if (row_bytes >= 8) @floatFromInt((row_bytes - 8) / cn) else -1;
             for (y0..y1) |y| {
                 const d = c.dst.row(y);
                 const mx = c.mx.row(y);
                 const my = c.my.row(y);
-                for (0..c.dst.width) |x| linearF32(cn, c.src, mx[x], my[x], c.bv, d[x * cn ..][0..cn]);
+                var x: usize = 0;
+                if (cn != 2) while (x + L <= c.dst.width) : (x += L) {
+                    const sx: V = mx[x..][0..L].*;
+                    const sy: V = my[x..][0..L].*;
+                    const fx = @floor(sx);
+                    const fy = @floor(sy);
+                    const zero: V = @splat(0);
+                    const ok = (fx >= zero) & (fy >= zero) & (fx <= @as(V, @splat(sw - 2))) & (fy <= @as(V, @splat(sh - 2))) &
+                        ((fy < @as(V, @splat(sh - 2))) | (fx <= @as(V, @splat(xsafe_last))));
+                    if (@reduce(.And, ok)) {
+                        linearF16(cn, c.src, fx, fy, sx - fx, sy - fy, d[x * cn ..]);
+                    } else {
+                        for (x..x + L) |i| linearF32(cn, c.src, mx[i], my[i], c.bv, d[i * cn ..][0..cn]);
+                    }
+                };
+                while (x < c.dst.width) : (x += 1) linearF32(cn, c.src, mx[x], my[x], c.bv, d[x * cn ..][0..cn]);
             }
         }
     }.run);
+}
+
+/// 16 bilinear pixels whose taps are all inside the source (f32 fma
+/// blend, as linearF32).
+inline fn linearF16(comptime cn: usize, s: Image(u8), fx: @Vector(16, f32), fy: @Vector(16, f32), ax: @Vector(16, f32), ay: @Vector(16, f32), d: []u8) void {
+    const L = 16;
+    const V = @Vector(L, f32);
+    const U = @Vector(L, u32);
+    const ixv: U = @intFromFloat(fx);
+    const iyv: U = @intFromFloat(fy);
+    const off: [L]u32 = iyv * @as(U, @splat(@intCast(s.stride))) + ixv * @as(U, @splat(cn));
+    var w0: [L]u64 = undefined;
+    var w1: [L]u64 = undefined;
+    inline for (0..L) |i| {
+        const q = s.data + off[i];
+        w0[i] = std.mem.readInt(u64, q[0..8], .little);
+        w1[i] = std.mem.readInt(u64, q[s.stride..][0..8], .little);
+    }
+    const r0: @Vector(L, u64) = w0;
+    const r1: @Vector(L, u64) = w1;
+    const words = [4]U{ @truncate(r0), @truncate(r0 >> @splat(32)), @truncate(r1), @truncate(r1 >> @splat(32)) };
+    var outs: [cn]@Vector(L, u8) = undefined;
+    inline for (0..cn) |ch| {
+        const p00: V = @floatFromInt(byteU(words[0..2], ch));
+        const p01: V = @floatFromInt(byteU(words[0..2], cn + ch));
+        const p10: V = @floatFromInt(byteU(words[2..4], ch));
+        const p11: V = @floatFromInt(byteU(words[2..4], cn + ch));
+        const v0 = @mulAdd(V, ax, p01 - p00, p00);
+        const v1 = @mulAdd(V, ax, p11 - p10, p10);
+        const v = @mulAdd(V, ay, v1 - v0, v0);
+        const bits: @Vector(L, i32) = @bitCast(v + @as(V, @splat(12582912.0)));
+        const q = bits - @as(@Vector(L, i32), @splat(0x4B400000));
+        const cl = @min(@max(q, @as(@Vector(L, i32), @splat(0))), @as(@Vector(L, i32), @splat(255)));
+        outs[ch] = core.simd.narrow(u8, cl);
+    }
+    if (cn == 1) {
+        d[0..L].* = outs[0];
+    } else {
+        core.vec.store(cn, outs, d.ptr);
+    }
 }
 
 inline fn linearF32(comptime cn: usize, src: Image(u8), sx: f32, sy: f32, bv: [4]u8, out: *[cn]u8) void {

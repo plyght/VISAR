@@ -117,6 +117,58 @@ def cases(h, w):
     yield from video_cases(h, w)
     yield from dnn_cases()
     yield from tracking_cases()
+    yield from calib3d_cases()
+
+
+def calib3d_cases():
+    """calib3d at fixed sizes (independent of --size)."""
+    import visar_calib3d as vc
+    from test_calib3d_vs_opencv import board_scene, homography_scene
+    src, dst = homography_scene(500, 0.3, 0.5, 1)
+    yield "findHomography RANSAC 500pt 30% out", lambda: vc.find_homography(src, dst, 8), lambda: cv2.findHomography(src, dst, cv2.RANSAC)
+    yield "findHomography LMEDS 500pt 30% out", lambda: vc.find_homography(src, dst, 4), lambda: cv2.findHomography(src, dst, cv2.LMEDS)
+    a_src, a_dst = homography_scene(500, 0.3, 0.5, 2)
+    a_dst = (a_src @ np.float32([[0.9, -0.2], [0.2, 0.9]]).T + [5, -7]).astype(np.float32)
+    yield "estimateAffine2D RANSAC 500pt", lambda: vc.estimate_affine_2d(a_src, a_dst), lambda: cv2.estimateAffine2D(a_src, a_dst)
+    r = np.random.default_rng(3)
+    K = np.array([[900.0, 0, 640], [0, 900, 360], [0, 0, 1]])
+    d = np.array([-0.28, 0.09, 0.001, -0.0005, -0.01])
+    obj = r.uniform(-1, 1, (100, 3))
+    img = cv2.projectPoints(obj, np.array([0.3, -0.2, 0.1]), np.array([0.1, -0.1, 5.0]), K, d)[0].reshape(-1, 2)
+    img = img + r.normal(0, 0.5, img.shape)
+    yield "solvePnP ITERATIVE 100pt", lambda: vc.solve_pnp(obj, img, K, d), lambda: cv2.solvePnP(obj, img, K, d)
+    yield "solvePnP EPNP 100pt", lambda: vc.solve_pnp(obj, img, K, d, 1), lambda: cv2.solvePnP(obj, img, K, d, flags=cv2.SOLVEPNP_EPNP)
+    img_o = img.copy()
+    out = r.random(len(img)) < 0.3
+    img_o[out] = r.uniform(0, [1280, 720], (int(out.sum()), 2))
+    yield "solvePnPRansac 100pt 30% out", lambda: vc.solve_pnp_ransac(obj, img_o, K, d), lambda: cv2.solvePnPRansac(obj, img_o, K, d)
+    yield "projectPoints 1000pt", lambda: vc.project_points(np.tile(obj, (10, 1)), [0.3, -0.2, 0.1], [0.1, -0.1, 5.0], K, d), \
+        lambda: cv2.projectPoints(np.tile(obj, (10, 1)), np.array([0.3, -0.2, 0.1]), np.array([0.1, -0.1, 5.0]), K, d)
+    board = board_scene(10, 7, 20.5, 0.3, noise=3, blur=0.8)
+    yield "findChessboardCorners 9x6 1280x720", lambda: vc.find_chessboard_corners(board, (9, 6)), lambda: cv2.findChessboardCorners(board, (9, 6))
+    ok, corners = cv2.findChessboardCorners(board, (9, 6))
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    yield "cornerSubPix 54pt 11x11", lambda: vc.corner_sub_pix(board, corners, (11, 11)), lambda: cv2.cornerSubPix(board, corners.copy(), (11, 11), (-1, -1), crit)
+    bgr = natural(720, 1280, 3)
+    und = np.empty_like(bgr)
+    yield "undistort 1280x720 BGR", lambda: vc.undistort(bgr, K, d, dst=und), lambda: cv2.undistort(bgr, K, d, dst=und)
+    gray = natural(720, 1280, 1)
+    und1 = np.empty_like(gray)
+    yield "undistort 1280x720 gray", lambda: vc.undistort(gray, K, d, dst=und1), lambda: cv2.undistort(gray, K, d, dst=und1)
+    mx, my = cv2.initUndistortRectifyMap(K, d, None, K, (1280, 720), cv2.CV_32FC1)
+    yield "initUndistortRectifyMap 1280x720", lambda: vc.init_undistort_rectify_map(K, d, None, K, (1280, 720)), \
+        lambda: cv2.initUndistortRectifyMap(K, d, None, K, (1280, 720), cv2.CV_32FC1)
+    yield "remap linear 1280x720 BGR", lambda: vc.remap(bgr, mx, my, dst=und), lambda: cv2.remap(bgr, mx, my, cv2.INTER_LINEAR, dst=und)
+    objp = np.zeros((54, 3), np.float32)
+    objp[:, :2] = np.mgrid[0:9, 0:6].T.reshape(-1, 2) * 0.025
+    objs, imgs = [], []
+    for _ in range(10):
+        rv = r.normal(0, 0.3, 3)
+        tv = np.array([r.uniform(-0.12, 0.0), r.uniform(-0.08, 0.0), r.uniform(0.35, 0.6)])
+        p = cv2.projectPoints(objp, rv, tv, K, d)[0].reshape(-1, 2)
+        objs.append(objp)
+        imgs.append((p + r.normal(0, 0.2, p.shape)).astype(np.float32))
+    yield "calibrateCamera 10 views 9x6", lambda: vc.calibrate_camera(objs, imgs, (1280, 720)), lambda: cv2.calibrateCamera(objs, imgs, (1280, 720), None, None)
 
 
 def dnn_cases():

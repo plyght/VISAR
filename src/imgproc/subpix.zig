@@ -32,12 +32,31 @@ pub fn getRectSubPix(src: anytype, ww: usize, wh: usize, cx: f32, cy: f32, dst: 
         const b1 = 1 - b;
         const b2 = b;
         const s: f64 = (1.0 - @as(f64, a)) / @as(f64, a);
+        const L = 8;
+        const VF = @Vector(L, f32);
+        const VD = @Vector(L, f64);
         for (0..wh) |i| {
             const r0 = src.data[@as(usize, @intCast(ipy)) * src.stride + i * src.stride + @as(usize, @intCast(ipx)) ..];
             const r1 = r0[src.stride..];
             const d = dst[i * ww ..][0..ww];
             var prev: f32 = (1 - a) * (b1 * @as(f32, @floatFromInt(r0[0])) + b2 * @as(f32, @floatFromInt(r1[0])));
-            for (0..ww) |j| {
+            // dst[j] = t[j-1] * s (rounded to f32; prev for j = 0) + t[j]:
+            // the same values as OpenCV's running loop, L at a time.
+            var j: usize = 0;
+            while (j + L <= ww) : (j += L) {
+                var top: VF = undefined;
+                var bot: VF = undefined;
+                inline for (0..L) |l| {
+                    top[l] = @floatFromInt(r0[j + 1 + l]);
+                    bot[l] = @floatFromInt(r1[j + 1 + l]);
+                }
+                const t = @as(VF, @splat(a12)) * top + @as(VF, @splat(a22)) * bot;
+                const ts: VF = @floatCast(@as(VD, t) * @as(VD, @splat(s)));
+                const shifted = std.simd.shiftElementsRight(ts, 1, prev);
+                d[j..][0..L].* = shifted + t;
+                prev = ts[L - 1];
+            }
+            while (j < ww) : (j += 1) {
                 const t = a12 * @as(f32, @floatFromInt(r0[j + 1])) + a22 * @as(f32, @floatFromInt(r1[j + 1]));
                 d[j] = prev + t;
                 prev = @floatCast(@as(f64, t) * s);
@@ -150,24 +169,34 @@ pub fn cornerSubPix(gpa: std.mem.Allocator, src: anytype, corners: []Point2f, o:
     eps *= eps;
     const ww: usize = o.win_w * 2 + 1;
     const wh: usize = o.win_h * 2 + 1;
-    const mask = try gpa.alloc(f32, ww * wh + (ww + 2) * (wh + 2));
+    // The mask rows are padded with zeros to whole vectors; the window
+    // buffer gets a vector of slack for the padded reads.
+    const L = 4;
+    const V = @Vector(L, f64);
+    const VF = @Vector(L, f32);
+    const wwp = (ww + L - 1) / L * L;
+    const mask = try gpa.alloc(f32, wwp * wh + (ww + 2) * (wh + 2) + L);
     defer gpa.free(mask);
-    const buf = mask[ww * wh ..];
+    @memset(mask, 0);
+    const buf = mask[wwp * wh ..];
     for (0..wh) |i| {
         const y: f32 = @as(f32, @floatFromInt(@as(i64, @intCast(i)) - o.win_h)) / @as(f32, @floatFromInt(o.win_h));
         const vy = @exp(-y * y);
         for (0..ww) |j| {
             const x: f32 = @as(f32, @floatFromInt(@as(i64, @intCast(j)) - o.win_w)) / @as(f32, @floatFromInt(o.win_w));
-            mask[i * ww + j] = vy * @exp(-x * x);
+            mask[i * wwp + j] = vy * @exp(-x * x);
         }
     }
     if (o.zero_w >= 0 and o.zero_h >= 0 and o.zero_w * 2 + 1 < ww and o.zero_h * 2 + 1 < wh) {
         const zw: usize = @intCast(o.zero_w);
         const zh: usize = @intCast(o.zero_h);
         for (o.win_h - zh..o.win_h + zh + 1) |i| for (o.win_w - zw..o.win_w + zw + 1) |j| {
-            mask[i * ww + j] = 0;
+            mask[i * wwp + j] = 0;
         };
     }
+    var pxs: [L]f64 = undefined;
+    for (&pxs, 0..) |*v, l| v.* = @floatFromInt(l);
+    const px0: V = pxs;
     const fw: f32 = @floatFromInt(src.width);
     const fh: f32 = @floatFromInt(src.height);
     for (corners) |*pt| {
@@ -178,30 +207,42 @@ pub fn cornerSubPix(gpa: std.mem.Allocator, src: anytype, corners: []Point2f, o:
         var err: f64 = 0;
         while (true) {
             getRectSubPix(src, ww + 2, wh + 2, cI.x, cI.y, buf);
-            var a: f64 = 0;
-            var b: f64 = 0;
-            var c: f64 = 0;
-            var bb1: f64 = 0;
-            var bb2: f64 = 0;
+            // OpenCV sums these in f64 one pixel at a time; VISAR keeps L
+            // partial sums (the same terms, added in a different order).
+            var va: V = @splat(0);
+            var vb: V = @splat(0);
+            var vc: V = @splat(0);
+            var vb1: V = @splat(0);
+            var vb2: V = @splat(0);
             const st = ww + 2;
             for (0..wh) |i| {
-                const py: f64 = @floatFromInt(@as(i64, @intCast(i)) - o.win_h);
-                for (0..ww) |j| {
+                const py: V = @splat(@floatFromInt(@as(i64, @intCast(i)) - o.win_h));
+                var j: usize = 0;
+                while (j < ww) : (j += L) {
                     const q = (i + 1) * st + 1 + j;
-                    const m: f64 = mask[i * ww + j];
-                    const tgx: f64 = buf[q + 1] - buf[q - 1];
-                    const tgy: f64 = buf[q + st] - buf[q - st];
+                    const m: V = @floatCast(@as(VF, mask[i * wwp + j ..][0..L].*));
+                    const r: VF = buf[q + 1 ..][0..L].*;
+                    const l: VF = buf[q - 1 ..][0..L].*;
+                    const dn: VF = buf[q + st ..][0..L].*;
+                    const up: VF = buf[q - st ..][0..L].*;
+                    const tgx: V = @floatCast(r - l);
+                    const tgy: V = @floatCast(dn - up);
                     const gxx = tgx * tgx * m;
                     const gxy = tgx * tgy * m;
                     const gyy = tgy * tgy * m;
-                    const px: f64 = @floatFromInt(@as(i64, @intCast(j)) - o.win_w);
-                    a += gxx;
-                    b += gxy;
-                    c += gyy;
-                    bb1 += gxx * px + gxy * py;
-                    bb2 += gxy * px + gyy * py;
+                    const px = px0 + @as(V, @splat(@floatFromInt(@as(i64, @intCast(j)) - o.win_w)));
+                    va += gxx;
+                    vb += gxy;
+                    vc += gyy;
+                    vb1 += gxx * px + gxy * py;
+                    vb2 += gxy * px + gyy * py;
                 }
             }
+            const a = @reduce(.Add, va);
+            const b = @reduce(.Add, vb);
+            const c = @reduce(.Add, vc);
+            const bb1 = @reduce(.Add, vb1);
+            const bb2 = @reduce(.Add, vb2);
             const det = a * c - b * b;
             if (@abs(det) <= std.math.floatEps(f64) * std.math.floatEps(f64)) break;
             const scale = 1.0 / det;
