@@ -147,6 +147,10 @@ def photo_cases():
             (lambda s=s: cv2.edgePreservingFilter(s, flags=cv2.NORMCONV_FILTER))
         yield f"stylization {w}x{h}", (lambda s=s: ph.stylization(s)), (lambda s=s: cv2.stylization(s))
         yield f"pencilSketch {w}x{h}", (lambda s=s: ph.pencil_sketch(s)), (lambda s=s: cv2.pencilSketch(s))
+        for img, kind in ((c, "BGR"), (g, "gray")):
+            out = np.empty_like(img)
+            yield f"bilateralFilter d9 s75 {kind} {w}x{h}", (lambda img=img: ph.bilateral_filter(img, 9, 75, 75)), \
+                (lambda img=img, out=out: cv2.bilateralFilter(img, 9, 75, 75, dst=out))
 
 
 def feature_image(h, w, seed=0):
