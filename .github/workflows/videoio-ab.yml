@@ -1,0 +1,48 @@
+name: videoio-ab
+
+# Throwaway: the macos-videoio job of ci.yml on push to ab/videoio-*.
+on:
+  push:
+    branches: ["ab/videoio-*"]
+
+jobs:
+  macos-videoio:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install numpy opencv-python-headless==5.0.0.*
+      - run: zig build test -Doptimize=ReleaseSafe -Dtest-filter=avi -Dtest-filter=y4m -Dtest-filter=capture --summary all
+      - run: zig build -Doptimize=ReleaseFast
+      - name: ffmpeg (for the test clips)
+        run: command -v ffmpeg || brew install ffmpeg
+      - name: Test clips and ffmpeg's own decode of them
+        run: |
+          set -eux
+          mkdir -p clips
+          # BT.601 tags, so both decoders convert to BGR the same way.
+          tags="-colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m"
+          ffmpeg -v error -f lavfi -i testsrc2=size=640x360:rate=30 -frames:v 90 -c:v libx264 -pix_fmt yuv420p -g 30 $tags clips/h264.mp4
+          ffmpeg -v error -f lavfi -i testsrc2=size=1280x720:rate=25 -frames:v 50 -c:v libx265 -tag:v hvc1 -pix_fmt yuv420p $tags clips/hevc.mov
+          for c in h264.mp4 hevc.mov; do ffmpeg -v error -i clips/$c -pix_fmt yuv420p -f yuv4mpegpipe clips/$c.y4m; done
+      - name: AVFoundation decode vs ffmpeg
+        run: python3 tests/py/videoio_macos_check.py --lib zig-out/lib/libvisar.dylib clips/h264.mp4 clips/h264.mp4.y4m clips/hevc.mov clips/hevc.mov.y4m
+      - name: CLI on an .mp4
+        run: |
+          set -eux
+          ./zig-out/bin/visar convert clips/h264.mp4 clips/h264.avi
+          python3 -c "import cv2,sys; c=cv2.VideoCapture(sys.argv[1]); n=int(c.get(cv2.CAP_PROP_FRAME_COUNT)); print(n); assert n == 90" clips/h264.avi
+          ./zig-out/bin/visar track --source video:clips/h264.mp4 --headless --json > track.json
+          python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(s['frames'] if 'frames' in s else s); " track.json || cat track.json
+      - name: AVI / Y4M against OpenCV
+        run: python3 tests/py/test_videoio_vs_opencv.py --lib zig-out/lib/libvisar.dylib
+      - name: Video read/write timings against OpenCV (information only)
+        run: |
+          python3 bench/bench_vs_opencv.py --lib zig-out/lib/libvisar.dylib --filter Video --size 1280x720 --threads 3
+          python3 bench/bench_vs_opencv.py --lib zig-out/lib/libvisar.dylib --filter Video --size 1920x1080 --threads 3
+
