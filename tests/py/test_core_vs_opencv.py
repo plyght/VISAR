@@ -161,6 +161,45 @@ def connected_components_cases():
     vs.set_num_threads(0)
 
 
+def gaussian_cases():
+    """GaussianBlur: u8 and u16 are bit-exact (OpenCV's fixed-point path with
+    error-diffused kernel taps); i16 and f32 run float kernels and may round
+    a sample differently. Every odd ksize up to 31 with sigma 0 (binomial
+    tables up to 9, then sigma = 0.15 ksize + 0.35) and explicit sigmas,
+    automatic ksize, sigmaY != sigmaX, asymmetric kernels, every border,
+    1/3/4 channels, strided views and degenerate sizes."""
+    tols = {np.uint8: 0, np.uint16: 0, np.int16: 1, np.float32: 1e-5}
+    gray = natural(480, 640, 1)
+    for dt in tols:
+        a = natural(480, 640, 1, dt) if dt != np.uint8 else gray
+        for k in range(1, 32, 2):
+            for s in (0, 0.6, 1.3, 2.5, 4.1):
+                run(f"GaussianBlur sweep k{k} s{s} {np.dtype(dt).name}",
+                    lambda: (vs.gaussian_blur(a, (k, k), s), cv2.GaussianBlur(a, (k, k), s)), tols[dt])
+        for s in (0.3, 0.8, 1.0, 1.7, 2.2, 3.3, 5.0, 7.5):
+            run(f"GaussianBlur auto s{s} {np.dtype(dt).name}",
+                lambda: (vs.gaussian_blur(a, (0, 0), s), cv2.GaussianBlur(a, (0, 0), s)), tols[dt])
+    for cn in (1, 3, 4):
+        for (h, w) in [(37, 53), (101, 67), (1, 1), (7, 1), (1, 9), (2, 40), (31, 3)]:
+            for dt in tols:
+                a = natural(h, w, cn, dt)
+                for (kw, kh), sx, sy in [((3, 15), 0, 0), ((21, 5), 0, 0), ((1, 9), 0, 0), ((13, 1), 0, 0),
+                                         ((15, 15), 0, 0), ((31, 31), 0, 0), ((11, 7), 1.4, 3.2), ((9, 9), 2.0, 0.7),
+                                         ((0, 0), 1.2, 2.9), ((0, 17), 2.1, 0), ((25, 0), 0, 1.8), ((5, 5), 0.4, 0)]:
+                    for border in (cv2.BORDER_CONSTANT, cv2.BORDER_REPLICATE, cv2.BORDER_REFLECT, cv2.BORDER_REFLECT_101):
+                        run(f"GaussianBlur ({kw},{kh}) s{sx}/{sy} b{border} c{cn} {np.dtype(dt).name} {w}x{h}",
+                            lambda: (vs.gaussian_blur(a, (kw, kh), sx, sy, border=border),
+                                     cv2.GaussianBlur(a, (kw, kh), sx, sigmaY=sy, borderType=border)), tols[dt])
+    # Strided views (rows of a larger image) at odd sizes and offsets.
+    for cn in (1, 3):
+        big = natural(120, 160, cn)
+        for y0, x0, h, w in [(3, 5, 37, 53), (1, 1, 97, 131), (10, 7, 9, 150)]:
+            v = big[y0:y0 + h, x0:x0 + w]
+            for k, s in [(3, 0), (7, 0), (13, 0), (19, 2.3), (31, 0)]:
+                run(f"GaussianBlur view k{k} s{s} c{cn} {w}x{h}+{x0}+{y0}",
+                    lambda: (vs.gaussian_blur(v, (k, k), s), cv2.GaussianBlur(v, (k, k), s)))
+
+
 def main():
     vs.set_num_threads(0)
     print(f"VISAR {vs.version()} ({vs.lib.visar_build_info().decode()}) vs OpenCV {cv2.__version__}, custom HAL: {HAL}")
@@ -210,10 +249,8 @@ def main():
 
         # --- filters
         for k, s in [(3, 0), (5, 0), (7, 0), (0, 1.5), (9, 2.0), (0, 3.0)]:
-            # Known deviation: for kernels wider than ~15 taps OpenCV's fixed-point
-            # accumulation order differs from VISAR's by up to 2 levels.
             run(f"GaussianBlur k{k} s{s} u8 {tag}",
-                lambda: (vs.gaussian_blur(bgr, (k, k), s), cv2.GaussianBlur(bgr, (k, k), s)), 0 if s < 3 else 2)
+                lambda: (vs.gaussian_blur(bgr, (k, k), s), cv2.GaussianBlur(bgr, (k, k), s)))
             run(f"GaussianBlur k{k} s{s} f32 {tag}",
                 lambda: (vs.gaussian_blur(f, (k, k), s), cv2.GaussianBlur(f, (k, k), s)), 1e-5)
         for border in [cv2.BORDER_REPLICATE, cv2.BORDER_REFLECT, cv2.BORDER_CONSTANT, cv2.BORDER_WRAP]:
@@ -289,6 +326,7 @@ def main():
         run(f"convertTo f32->u8 {tag}", lambda: (vs.convert_to(f, np.uint8, 255.0), (f * 255.0).round().clip(0, 255).astype(np.uint8)), 1)
 
     connected_components_cases()
+    gaussian_cases()
 
     # --- codecs (decode files written by OpenCV; OpenCV decodes ours)
     img = natural(97, 131, 3)
