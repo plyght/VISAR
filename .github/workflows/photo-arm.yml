@@ -1,0 +1,22 @@
+name: photo-arm
+on:
+  push:
+    branches: [ab/photo-arm-1]
+jobs:
+  difftest:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install numpy "opencv-python-headless==5.0.0.*"
+      - run: zig build -Doptimize=ReleaseSafe --prefix out
+      - name: photo
+        run: python3 tests/py/test_photo_vs_opencv.py --lib out/lib/libvisar.dylib
+      - name: core
+        if: always()
+        run: python3 tests/py/test_core_vs_opencv.py --lib out/lib/libvisar.dylib
