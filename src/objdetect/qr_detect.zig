@@ -32,9 +32,6 @@ const geom = @import("../imgproc/geometry.zig");
 
 pub const Point2f = shape.Point2f;
 
-/// Prints the pipeline's intermediate results (tests only).
-pub var debug = false;
-
 pub const Code = struct {
     corners: [4]Point2f,
     /// Decoded contents (owned; empty when not decoded).
@@ -743,7 +740,6 @@ fn readTriple(ctx: *Ctx, f: [3]Finder, want_decode: bool) Allocator.Error!?Attem
     }
     var corners: [3]?[4]P = undefined;
     for (fo, &corners) |q, *c| c.* = try finderCorners(ctx, q);
-    if (debug) std.debug.print("  triple tl=({d:.1},{d:.1}) tr=({d:.1},{d:.1}) bl=({d:.1},{d:.1}) m={d:.2} dim0={d} corners={any}\n", .{ geo.tl.x, geo.tl.y, geo.tr.x, geo.tr.y, geo.bl.x, geo.bl.y, geo.module, geo.dim0, corners });
     var best: ?Attempt = null;
     const dims = [3]i32{ 0, -4, 4 };
     for (dims) |dd| {
@@ -775,7 +771,6 @@ fn readTriple(ctx: *Ctx, f: [3]Finder, want_decode: bool) Allocator.Error!?Attem
             for (0..2) |gi| {
                 threshModules(ctx, dim, gi == 1);
                 const ts = timingScore(ctx.mods[0 .. dim * dim], dim);
-                if (debug) std.debug.print("    dim={d} al={any} timing={d:.2}\n", .{ dim, al, ts });
                 if (want_decode) {
                     if (try qr_decode.decode(ctx.gpa, ctx.mods[0 .. dim * dim], dim, &ctx.text)) |info| {
                         return .{ .h = h, .dim = dim, .decoded = true, .info = info, .timing = ts };
@@ -880,7 +875,6 @@ pub fn detect(gpa: Allocator, src: Image(u8), o: Options) Error![]Code {
         if (k >= 3) nf = k;
     }
     const fs = all[0..@min(nf, 40)];
-    if (debug) for (all) |f| std.debug.print("finder ({d:.1},{d:.1}) m={d:.2} n={d}\n", .{ f.x, f.y, f.module, f.count });
     if (fs.len < 3) return out.toOwnedSlice(gpa);
 
     const triples = try scoreTriples(gpa, fs);
