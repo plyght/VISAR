@@ -77,11 +77,17 @@ pub fn laneMask(n: usize) @Vector(B, bool) {
 /// exponential's code nor an out-of-line call sits in the tile, where it
 /// would cost the live accumulators (AArch64 keeps no full vector
 /// register across a call).
-pub const ActKind = enum { linear, deferred };
+/// `none` and `relu` are `linear` ones with their own (shorter) epilogue:
+/// nothing, one max. (YuNet's pointwise layers have no activation and its
+/// 3x3 ones ReLU; next to a depthwise tap's 9 FMAs the generic form's
+/// three extra ops are a large share.)
+pub const ActKind = enum { none, relu, linear, deferred };
 
 pub fn actKind(a: ir.Act) ActKind {
     return switch (a) {
-        .none, .relu, .leaky_relu => .linear,
+        .none => .none,
+        .relu => .relu,
+        .leaky_relu => .linear,
         else => .deferred,
     };
 }
@@ -100,6 +106,8 @@ pub fn linearSlope(a: ir.Act) f32 {
 /// v < 0 (one of the two terms is a zero).
 pub inline fn act(comptime kind: ActKind, a: ir.Act, slope: f32, v: V) V {
     return switch (kind) {
+        .none => v,
+        .relu => @max(v, splat(0)),
         .linear => fma(splat(slope), @min(v, splat(0)), @max(v, splat(0))),
         .deferred => if (a == .silu) v / (splat(1) + @call(.always_inline, exp, .{-v})) else actGeneric(a, v),
     };
