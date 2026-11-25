@@ -45,6 +45,44 @@ jobs:
             git worktree add "../src-$tag" "$ref"
             (cd "../src-$tag" && zig build -Doptimize=ReleaseFast --prefix "$GITHUB_WORKSPACE/../out-$tag")
           done
+      # The YuNet model and the selfie (face cases of the bench and face4k).
+      - name: Download models
+        run: |
+          mkdir -p "$RUNNER_TEMP/models"
+          zoo=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/face_detection_yunet_2023mar.onnx" "$zoo/face_detection_yunet_2023mar.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg"
+          echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
+      # filter contains "face": YuNet step by step and the tracker's steady
+      # state, A and B alternating (throwaway).
+      - name: Face profile A/B
+        if: contains(inputs.filter, 'face')
+        run: |
+          set -u
+          for tag in A B; do (cd "../src-$tag" && zig build face4k-steady -Doptimize=ReleaseFast --prefix "$GITHUB_WORKSPACE/../st-$tag"); done
+          n="${{ inputs.threads }}"; [ "$n" = 1 ] && n=0
+          {
+          for r in 1 2; do for tag in A B; do
+            echo "#### profile $tag (round $r)"; echo '```'
+            "$GITHUB_WORKSPACE/../st-$tag/bin/visar-face4k-steady" --profile --threads "$n" || true
+            echo '```'
+          done; done
+          echo "#### steady state (level, every, threads: JSON)"; echo '```'
+          for r in 1 2; do for m in "0 1" "2 1"; do set -- $m; for t in 1 "$n"; do for tag in A B; do
+            printf '%s L%s E%s T%s ' "$tag" "$1" "$2" "$t"
+            "$GITHUB_WORKSPACE/../st-$tag/bin/visar-face4k-steady" --level "$1" --detect-every "$2" --threads "$t" --frames 600 | tr -d '\n' || true
+            echo
+          done; done; done; done
+          echo '```'
+          } | tee prof.md
+          cat prof.md >> "$GITHUB_STEP_SUMMARY"
+      # filter contains "face4k": also the full face4k table of B.
+      - name: Face pipeline 4K
+        if: contains(inputs.filter, 'face4k')
+        run: |
+          set -eu
+          (cd ../src-B && zig build face4k -Doptimize=ReleaseFast -- --threads "${{ inputs.threads }}" --md "$GITHUB_WORKSPACE/face.md")
+          { echo "### face4k, \`${{ inputs.head }}\` on ${{ inputs.runner }}"; echo; cat face.md; } >> "$GITHUB_STEP_SUMMARY"
       - name: Time
         if: inputs.base != inputs.head
         run: |
