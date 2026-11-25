@@ -171,6 +171,22 @@ pub const FaceDetector = struct {
         try d.net.tryRun(exec);
     }
 
+    /// Stage 2 in pieces, for spreading an inference over several calls
+    /// (frames): `inferPart` on consecutive ranges of 0..`inferParts()`, in
+    /// order and with no other use of the detector in between, is exactly
+    /// `infer`; `splitInfer` balances the ranges (see `Net.splitRun`).
+    pub fn inferParts(d: *const FaceDetector) usize {
+        return d.net.partCount();
+    }
+
+    pub fn inferPart(d: *FaceDetector, exec: Exec, from: usize, to: usize) !void {
+        try d.net.runPart(exec, from, to);
+    }
+
+    pub fn splitInfer(d: *const FaceDetector, bounds: []usize, weights: ?[]const u32) void {
+        d.net.splitRun(bounds, weights);
+    }
+
     /// Stage 3: decoding, NMS, and the faces mapped to the prepared
     /// frame's pixels. Owned by the detector, valid until the next call.
     pub fn decode(d: *FaceDetector) ![]const Face {

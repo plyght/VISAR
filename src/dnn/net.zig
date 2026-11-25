@@ -216,6 +216,112 @@ pub const Net = struct {
         c.program.run(exec, c.buf);
     }
 
+    /// The pieces a run can be split into (`runPart`): the CPU program's
+    /// items (kernels and streamed chains); 1 on the GPU.
+    pub fn partCount(net: *const Net) usize {
+        const c = &net.compiled.?;
+        return if (c.gpu != null) 1 else c.program.items.len;
+    }
+
+    /// Runs pieces `from..to` of one inference. Calling it on consecutive
+    /// ranges covering 0..partCount(), in order and with nothing else
+    /// touching the net in between, is exactly one `tryRun` (the arena
+    /// keeps the intermediate tensors between calls).
+    pub fn runPart(net: *Net, exec: Exec, from: usize, to: usize) RunError!void {
+        const c = &net.compiled.?;
+        if (c.gpu) |*g| {
+            if (from == 0 and to >= 1) return g.run() catch error.GpuFailed;
+            return;
+        }
+        c.program.runRange(exec, c.buf, from, @min(to, c.program.items.len));
+    }
+
+    /// Splits a run into `bounds.len - 1` consecutive ranges of pieces
+    /// (range i is bounds[i]..bounds[i+1]) whose estimated costs (conv MACs
+    /// plus per-element terms for memory traffic, see `stepsCost`) are
+    /// about proportional to `weights` (one per range; null = equal).
+    pub fn splitRun(net: *const Net, bounds: []usize, weights: ?[]const u32) void {
+        std.debug.assert(bounds.len >= 2);
+        if (weights) |w| std.debug.assert(w.len == bounds.len - 1);
+        const c = &net.compiled.?;
+        const n = net.partCount();
+        const parts = bounds.len - 1;
+        if (c.gpu != null) {
+            // One piece: all of it in the first range.
+            bounds[0] = 0;
+            for (bounds[1..]) |*b| b.* = n;
+            return;
+        }
+        const total = prefixCost(c, n);
+        var wsum: u64 = 0;
+        for (0..parts) |r| wsum += if (weights) |w| w[r] else 1;
+        var wacc: u64 = 0;
+        bounds[0] = 0;
+        for (1..parts) |r| {
+            // The boundary closest to the weights' share of the total cost
+            // so far, leaving every range a piece while pieces last.
+            wacc += if (weights) |w| w[r - 1] else 1;
+            const goal = if (wsum > 0) total * wacc / wsum else 0;
+            const lo = @min(n, bounds[r - 1] + 1);
+            const hi = @max(lo, n -| (parts - r));
+            var best = lo;
+            var best_d: u64 = std.math.maxInt(u64);
+            for (lo..hi + 1) |j| {
+                const v = prefixCost(c, j);
+                const d = if (v > goal) v - goal else goal - v;
+                if (d < best_d) {
+                    best_d = d;
+                    best = j;
+                }
+            }
+            bounds[r] = best;
+        }
+        bounds[parts] = n;
+    }
+
+    /// The estimated cost of piece `i` (CPU; in multiply-accumulates).
+    pub fn partCost(net: *const Net, i: usize) u64 {
+        const c = &net.compiled.?;
+        if (c.gpu != null) return 1;
+        return prefixCost(c, i + 1) - prefixCost(c, i);
+    }
+
+    /// The estimated cost of the program's first `j` pieces.
+    fn prefixCost(c: *const Compiled, j: usize) u64 {
+        var cost: u64 = 0;
+        var step: usize = 0;
+        for (c.program.items[0..j]) |*it| {
+            cost += stepsCost(&c.plan, step, it.steps());
+            step += it.steps();
+        }
+        return cost;
+    }
+
+    /// The estimated cost of plan steps `first..first+len`.
+    /// In multiply-accumulate units: a conv costs its MACs plus 8 per
+    /// output element; other ops, memory-bound, 8 per output element plus
+    /// 12 per element read or written (fitted to YuNet's CPU kernels).
+    fn stepsCost(p: *const plan_mod.Plan, first: usize, len: usize) u64 {
+        var cost: u64 = 0;
+        for (p.steps[first..][0..len]) |s| {
+            const o: u64 = p.tensors[s.outputs[0]].shape.count();
+            cost += 8 * o;
+            if (s.op == .conv) {
+                const cv = s.op.conv;
+                const x = p.tensors[s.inputs[0]].shape;
+                if (x.rank == 4 and cv.group != 0) cost += o * (x.d[1] / cv.group) * cv.kernel[0] * cv.kernel[1];
+                continue;
+            }
+            var moved = o;
+            for (s.inputs) |i| {
+                if (i == plan_mod.none or p.tensors[i].data != null) continue;
+                moved += p.tensors[i].shape.count();
+            }
+            cost += 12 * moved;
+        }
+        return cost;
+    }
+
     /// The `i`th output (plain row-major), valid until the next `run`/`plan`.
     pub fn output(net: *Net, i: usize) Tensor {
         return net.tensor(net.compiled.?.plan.outputs[i]);
@@ -455,6 +561,43 @@ test "net runs a small model and matches a direct evaluation" {
                 try testing.expectEqual(want.len, y.data.len);
                 for (want, y.data) |w, v| try testing.expectApproxEqAbs(w, v, 1e-5);
             }
+        }
+    }
+}
+
+test "a run split into parts is the whole run" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const bytes = try buildTestModel(a);
+    var net = try Net.load(testing.allocator, bytes);
+    defer net.deinit();
+    var pool = core.Pool.init(testing.allocator, testing.io, 3);
+    defer pool.deinit();
+    net.opts.backend = .cpu;
+    try net.plan(&.{&.{ 1, 3, 32, 44 }});
+    var prng = std.Random.DefaultPrng.init(11);
+    for (net.input(0)) |*v| v.* = prng.random().float(f32) * 4 - 2;
+    const x = try a.dupe(f32, net.input(0));
+    net.run(.on(&pool));
+    const want = try a.dupe(f32, net.output(0).data);
+    const n = net.partCount();
+    try testing.expect(n > 1);
+    for ([_]usize{ 1, 2, 3, 5, 64 }) |parts| {
+        for ([_]Exec{ .serial, .on(&pool) }) |exec| {
+            const bounds = try a.alloc(usize, parts + 1);
+            net.splitRun(bounds, if (parts == 3) &.{ 1, 3, 2 } else null);
+            try testing.expectEqual(@as(usize, 0), bounds[0]);
+            try testing.expectEqual(n, bounds[parts]);
+            for (bounds[0..parts], bounds[1..], 0..) |lo, hi, r| {
+                try testing.expect(lo <= hi);
+                // Non-empty while pieces last.
+                if (r < n) try testing.expect(lo < hi);
+            }
+            @memcpy(net.input(0), x);
+            @memset(net.output(0).data, 0);
+            for (bounds[0..parts], bounds[1..]) |lo, hi| try net.runPart(exec, lo, hi);
+            try testing.expectEqualSlices(f32, want, net.output(0).data);
         }
     }
 }

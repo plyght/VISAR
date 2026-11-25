@@ -71,6 +71,9 @@ pub const Program = struct {
     items: []Item,
     /// One per parallelFor call of a run (team execution).
     slots: []Slot,
+    /// The first slot of each item (and the slot count last): a range of
+    /// items runs with its own slots (`runRange`).
+    first_slot: []usize,
 
     /// Prepares every step. Allocations (packed weights, maps, ring
     /// buffers) go to `arena`.
@@ -98,26 +101,38 @@ pub const Program = struct {
         // sits inside parallelFor bodies).
         var counter: Counter = .{};
         var dummy: [64]f32 align(64) = undefined;
-        for (items.items) |*it| it.run(&counter, &dummy);
+        const first_slot = try arena.alloc(usize, items.items.len + 1);
+        for (items.items, first_slot[0..items.items.len]) |*it, *f| {
+            f.* = counter.calls;
+            it.run(&counter, &dummy);
+        }
+        first_slot[items.items.len] = counter.calls;
         const slots = try arena.alloc(Slot, counter.calls);
-        return .{ .kernels = ks, .items = items.items, .slots = slots };
+        return .{ .kernels = ks, .items = items.items, .slots = slots, .first_slot = first_slot };
     }
 
     /// Runs the program; `arena_buf` holds `plan.arena_bytes` bytes with
     /// the inputs already in place.
     pub fn run(prog: *const Program, exec: Exec, arena_buf: []align(64) u8) void {
+        prog.runRange(exec, arena_buf, 0, prog.items.len);
+    }
+
+    /// Runs items `from..to` only: a run split into consecutive ranges
+    /// (in order, on the same buffer) computes exactly what `run` does.
+    pub fn runRange(prog: *const Program, exec: Exec, arena_buf: []align(64) u8, from: usize, to: usize) void {
+        if (from >= to) return;
         const base: [*]f32 = @ptrCast(arena_buf.ptr);
         if (exec.threads() <= 1) {
-            for (prog.items) |*it| it.run(Exec.serial, base);
+            for (prog.items[from..to]) |*it| it.run(Exec.serial, base);
             return;
         }
-        for (prog.slots) |*sl| sl.* = .{};
-        const Ctx = struct { prog: *const Program, base: [*]f32, threads: usize };
-        exec.parallelFor(exec.threads(), 1, Ctx{ .prog = prog, .base = base, .threads = exec.threads() }, struct {
+        for (prog.slots[prog.first_slot[from]..prog.first_slot[to]]) |*sl| sl.* = .{};
+        const Ctx = struct { prog: *const Program, base: [*]f32, threads: usize, from: usize, to: usize };
+        exec.parallelFor(exec.threads(), 1, Ctx{ .prog = prog, .base = base, .threads = exec.threads(), .from = from, .to = to }, struct {
             fn f(c: Ctx, s: usize, e: usize) void {
                 for (s..e) |_| {
-                    var team: Team = .{ .slots = c.prog.slots, .nthreads = c.threads };
-                    for (c.prog.items) |*it| it.run(&team, c.base);
+                    var team: Team = .{ .slots = c.prog.slots, .nthreads = c.threads, .call = c.prog.first_slot[c.from] };
+                    for (c.prog.items[c.from..c.to]) |*it| it.run(&team, c.base);
                 }
             }
         }.f);
