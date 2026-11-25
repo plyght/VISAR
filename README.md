@@ -29,8 +29,23 @@ See [PRD.md](PRD.md) for the full scope and roadmap. VISAR is early: the roadmap
 | Codecs | PNG (all colour types and depths, Adam7; custom inflate), JPEG (in progress), QOI, PNM/PAM, BMP (incl. RLE), animated GIF (encode) |
 | dnn | ONNX inference engine (protobuf reader, graph IR, fusion passes, liveness memory plan with in-place concatenation, blocked-layout SIMD CPU kernels with row-streamed conv chains and cache-blocked GEMM-class convolutions; a Metal GPU backend on macOS that runs the whole plan in one command buffer, loaded at run time with no SDK); `FaceDetector` runs YuNet with results matching `cv2.FaceDetectorYN` and about 3.5x faster on CPU; `ObjectDetector` runs the Model Zoo's NanoDet and YOLOX (COCO) with the zoo pipelines' detections, faster than `cv2.dnn` |
 | Video | Background subtraction, multi-object tracker, MOSSE correlation tracker (follows a selected object, ~5000 updates/s per object with its three-scale search) |
+| features2d | FAST (9/16, 7/12, 5/8, non-maximum suppression) and ORB (pyramid, Harris ranking, orientation, rBRIEF with WTA_K 2/3/4, masks) with keypoints and descriptors bit-identical to cv2 on x86-64 and Apple Silicon; `BFMatcher` `match`/`knnMatch`/cross-check under Hamming, Hamming2, L1 and L2, Lowe's ratio test; `drawKeypoints`, `drawMatches` |
 | Video I/O | `VideoCapture` / `VideoWriter`: AVI (Motion-JPEG, uncompressed, I420/YV12/Y800; idx1 and OpenDML indexes, seeking by frame) and YUV4MPEG2 in pure Zig on every platform; .mp4/.mov (H.264, HEVC) through AVFoundation on macOS; cameras (AVFoundation, V4L2) |
 | Interfaces | Zig module, C ABI, `visar` CLI (clig.dev-style: JSON output, helpful errors, pipelines, bench, demos) |
+
+### Feature detection and matching
+
+`visar.features2d` follows OpenCV's `features2d` step for step, so `cv2.FastFeatureDetector`, `cv2.ORB_create` and `cv2.BFMatcher` results carry over unchanged: FAST keypoints come out identical and in the same order, ORB keypoints (position, size, angle, Harris response, octave) and 32-byte descriptors are byte-identical for every parameter combination in the differential suite (WTA_K 2/3/4, other patch sizes and pyramid shapes, masks), and matches agree on train index and distance. The one difference is ordering inside an ORB pyramid level, where OpenCV keeps whatever order `std::nth_element` left (it differs between C++ standard libraries); VISAR keeps FAST's row-major order.
+
+At one thread against OpenCV 5.0 (`zig build bench -- --threads 1 --filter ORB` etc.; a textured image with many corners):
+
+| Case | Apple M1 (3-core VM) | x86-64 (Xeon, AVX-512) |
+| --- | ---: | ---: |
+| FAST-9, threshold 20, 640x480 / 1280x720 | 1.95x / 2.02x | 2.17x / 2.29x |
+| ORB 500 features detect+compute, 640x480 / 1280x720 | 2.05x / 1.94x | 1.79x / 1.73x |
+| ORB 1000 features, 640x480 / 1280x720 | 2.05x / 1.94x | 1.79x / 1.70x |
+| BFMatcher Hamming match / knnMatch k=2 / crossCheck, 1000x1000 | 6.4x / 4.5x / 6.7x | 3.84x / 3.56x / 3.88x |
+| BFMatcher L2, 128-d f32, knnMatch k=2, 1000x1000 | 1.43x | 2.04x |
 
 ## Build
 
