@@ -229,7 +229,8 @@ const Disk = struct {
         const side = 2 * r + 1;
         const hw = try gpa.alloc(usize, side);
         errdefer gpa.free(hw);
-        const dst = try gpa.alloc(f32, side * side);
+        const dst = try gpa.alloc(f32, side * side + 16);
+        @memset(dst, 0);
         const ri: isize = @intCast(r);
         var dk: isize = -ri;
         while (dk <= ri) : (dk += 1) {
@@ -426,6 +427,122 @@ fn Inpainter(comptime T: type, comptime cn: usize) type {
             }
         }
 
+        /// Lanes of the vectorised neighbour rows.
+        const L = 8;
+        const VF = @Vector(L, f32);
+        /// The largest float that is <= 0.01 as a double: OpenCV compares
+        /// |dir| <= 0.01 in double precision.
+        const dir_thr: VF = @splat(@as(f32, 0.01));
+        const lane: VF = blk: {
+            var m: [L]f32 = undefined;
+            for (0..L) |q| m[q] = @floatFromInt(q);
+            break :blk m;
+        };
+
+        /// out values at (row, col .. col + L) as floats, one vector per
+        /// channel.
+        inline fn oVec(self: *const Self, row: usize, col: usize) [cn]VF {
+            const p = self.out.data + row * self.out.stride + col * cn;
+            const raw: @Vector(L * cn, T) = p[0 .. L * cn].*;
+            var r: [cn]VF = undefined;
+            inline for (0..cn) |c| {
+                const idx = comptime blk: {
+                    var m: [L]i32 = undefined;
+                    for (0..L) |q| m[q] = @intCast(q * cn + c);
+                    break :blk m;
+                };
+                const v: @Vector(L, T) = @shuffle(T, raw, undefined, idx);
+                r[c] = if (T == f32) v else @floatFromInt(v);
+            }
+            return r;
+        }
+
+        inline fn known(g: *const Grid, row: usize, col: usize) @Vector(L, bool) {
+            const v: @Vector(L, u8) = g.f[row * g.cols + col ..][0..L].*;
+            return v != @as(@Vector(L, u8), @splat(INSIDE));
+        }
+
+        /// Whether the vector path can take pixel column j: every chunk of
+        /// L lanes stays away from the grid's first two and last two
+        /// columns, where OpenCV adjusts the neighbour indices.
+        inline fn vectorOk(self: *const Self, j: usize) bool {
+            const r = self.disk.range;
+            return j >= r + 2 and j + r + L + 2 <= self.g.cols;
+        }
+
+        inline fn dstRow(self: *const Self, dk: isize, dl: isize) VF {
+            const r: isize = @intCast(self.disk.range);
+            return self.disk.dst[@as(usize, @intCast(dk + r)) * self.disk.side + @as(usize, @intCast(dl + r)) ..][0..L].*;
+        }
+
+        /// Navier-Stokes weights with each disk row in vectors of L lanes.
+        fn nsVec(self: *Self, i: usize, j: usize) void {
+            const g = &self.g;
+            const range = self.disk.range;
+            const kbeg = @max(i -| range, 1);
+            const kend = @min(i + range, g.rows - 2);
+            var ia: [cn]f32 = @splat(0);
+            var s: [cn]f32 = @splat(1.0e-20);
+            const two: VF = @splat(2.0);
+            const zero: VF = @splat(0);
+            var k = kbeg;
+            while (k <= kend) : (k += 1) {
+                const km = k - 1 + @intFromBool(k == 1);
+                const kp = k - 1 - @intFromBool(k == g.rows - 2);
+                const dk = @as(isize, @intCast(k)) - @as(isize, @intCast(i));
+                const rhw = self.disk.half_width[@intCast(dk + @as(isize, @intCast(range)))];
+                const vry: VF = @splat(@floatFromInt(-dk));
+                var lb = j - rhw;
+                const lend = j + rhw;
+                while (lb <= lend) : (lb += L) {
+                    const cnt = @min(L, lend + 1 - lb);
+                    const kn = known(g, k, lb);
+                    const fr = known(g, k, lb + 1);
+                    const fl = known(g, k, lb - 1);
+                    const fd = known(g, k + 1, lb);
+                    const fu = known(g, k - 1, lb);
+                    const rx: VF = @as(VF, @splat(@floatFromInt(@as(isize, @intCast(j)) - @as(isize, @intCast(lb))))) - lane;
+                    const dstv = self.dstRow(dk, @as(isize, @intCast(lb)) - @as(isize, @intCast(j)));
+                    const rlen = rx * rx + vry * vry;
+                    const okp1 = self.oVec(kp + 1, lb - 1);
+                    const okp = self.oVec(kp, lb - 1);
+                    const okmm = self.oVec(km - 1, lb - 1);
+                    const okm0 = self.oVec(km, lb);
+                    const okm1 = self.oVec(km, lb - 1);
+                    const okm2 = self.oVec(km, lb - 2);
+                    const oc = self.oVec(k - 1, lb - 1);
+                    var wa: [cn][L]f32 = undefined;
+                    var wo: [cn][L]f32 = undefined;
+                    inline for (0..cn) |c| {
+                        const a1 = @abs(okp1[c] - okp[c]);
+                        const a2 = @abs(okp[c] - okmm[c]);
+                        const gix = -@select(f32, fd, @select(f32, fu, a1 + a2, a1 * two), @select(f32, fu, a2 * two, zero));
+                        const b1 = @abs(okm0[c] - okm1[c]);
+                        const b2 = @abs(okm1[c] - okm2[c]);
+                        const giy = @select(f32, fr, @select(f32, fl, b1 + b2, b1 * two), @select(f32, fl, b2 * two, zero));
+                        const dir = rx * gix + vry * giy;
+                        const small = @abs(dir) <= dir_thr;
+                        const len2 = @select(f32, small, @as(VF, @splat(1)), rlen * (gix * gix + giy * giy));
+                        const dn = @select(f32, small, @as(VF, @splat(0.000001)), @abs(dir / @sqrt(len2)));
+                        const w = dstv * dn;
+                        wa[c] = w;
+                        wo[c] = w * oc[c];
+                    }
+                    const ka: [L]bool = kn;
+                    for (0..cnt) |q| {
+                        if (!ka[q]) continue;
+                        inline for (0..cn) |c| {
+                            ia[c] += wo[c][q];
+                            s[c] += wa[c][q];
+                        }
+                    }
+                }
+            }
+            inline for (0..cn) |c| {
+                self.out.data[(i - 1) * self.out.stride + (j - 1) * cn + c] = satD(T, @as(f64, ia[c]) / @as(f64, s[c]));
+            }
+        }
+
         fn march(self: *Self, gpa: Allocator, q: *Queue, method: Method) !void {
             const g = &self.g;
             while (q.pop()) |p| {
@@ -448,8 +565,9 @@ fn Inpainter(comptime T: type, comptime cn: usize) type {
                         const dist = min4(g.f, g.t, g.cols, i, j);
                         g.t[i * g.cols + j] = dist;
                         switch (method) {
+                            // Telea's scalar loop is as fast as vectors here.
                             .telea => self.telea(i, j),
-                            .ns => self.ns(i, j),
+                            .ns => if (self.vectorOk(j)) self.nsVec(i, j) else self.ns(i, j),
                         }
                         g.f[i * g.cols + j] = BAND;
                         try q.push(gpa, i, j, dist);
