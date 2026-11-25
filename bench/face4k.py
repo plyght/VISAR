@@ -62,10 +62,17 @@ def one_shot(model_path, model, frame, w, h, threads):
     bgr4k = np.empty((H4K, W4K, 3), np.uint8)
     small = np.empty((h, w, 3), np.uint8)
     small4 = np.empty((h, w, 4), np.uint8)
+    gray4k = np.empty((H4K, W4K), np.uint8)
+    gray = np.empty((h, w), np.uint8)
 
     def cv_prep():
         cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR, dst=bgr4k)
         cv2.resize(bgr4k, (w, h), dst=small, interpolation=cv2.INTER_AREA)
+
+    def cv_prep_gray():
+        cv_prep()
+        cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY, dst=gray4k)
+        cv2.resize(gray4k, (w, h), dst=gray, interpolation=cv2.INTER_AREA)
 
     def cv_detect():
         f = ref.detect(small)[1]
@@ -93,6 +100,7 @@ def one_shot(model_path, model, frame, w, h, threads):
     r = {}
     det.prepare(frame)
     r["prep"] = (timeit(lambda: det.prepare(frame)), None)
+    r["prep_gray"] = (timeit(lambda: det.prepare_gray(frame, gray)), timeit(cv_prep_gray))
     r["net"] = (timeit(det.infer), None)
     r["decode"] = (timeit(det.decode), None)
     r["detect"] = (timeit(vs_detect), None)
@@ -153,6 +161,7 @@ def main():
         head = (f"### 3840x2160 BGRA -> {w}x{h} YuNet -> 4K boxes\n\n{len(got)} faces (OpenCV {len(want)}, "
                 f"{'same boxes' if ok else 'DIFFERENT'}), smallest {minw:.0f} px wide at 4K. Network on the CPU unless noted.{gpu_note}\n")
         rows = [("colour + downscale to the input", "prep", "fused into the f32 input", "cvtColor + resize AREA"),
+                ("the same + the gray tracking image", "prep_gray", "one pass for both", "+ cvtColor GRAY + resize AREA"),
                 ("network", "net", "", ""),
                 ("decode + NMS + map to 4K", "decode", "", ""),
                 ("detect (network + decode)", "detect", "", "FaceDetectorYN.detect + map"),
@@ -178,7 +187,7 @@ def main():
         lines = [f"### Face tracking steady state, 3840x2160, detector {fw} wide, selfie moving slowly (bench/face4k_steady.zig)\n",
                  "Per frame: gray tracking image + FaceTracker.step (MOSSE on every face, YuNet when scheduled). "
                  "Level 0 = whole-frame detection on schedule; level 2 = change-driven (postponed while still, "
-                 "crops around tracked faces, whole frame every 4th detection).\n",
+                 "crops around tracked faces, whole frame every 4th detection). On frames that will probably run a whole-frame detection the gray image and the detector input come from one pass over the frame (FaceTracker.trackingImage); that pass counts as gray.\n",
                  f"| Level, detect every | 1T ms/frame (fps) | {n}T ms/frame (fps) | {n}T p95 ms | {n}T detector runs: full / crop rounds / postponed | 1T ms/frame: gray / tracking / detection | {n}T ms/frame: gray / tracking / detection | faces | followed |",
                  "| --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: |"]
         for level, every in modes:
