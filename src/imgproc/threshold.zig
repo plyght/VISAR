@@ -314,7 +314,20 @@ pub fn adaptiveThreshold(exec: Exec, gpa: std.mem.Allocator, src: Image(u8), dst
     defer mean.deinit(gpa);
     switch (method) {
         .mean => try filter.boxFilter(exec, gpa, src, mean, .{ .kw = block, .kh = block, .border = .replicate }),
-        .gaussian => try filter.gaussianBlur(exec, gpa, src, mean, .{ .kw = block, .kh = block, .border = .replicate }),
+        .gaussian => {
+            // OpenCV blurs a float copy, then rounds back to 8 bits.
+            var f = try Image(f32).init(gpa, src.width, src.height, 1);
+            defer f.deinit(gpa);
+            var fb = try Image(f32).init(gpa, src.width, src.height, 1);
+            defer fb.deinit(gpa);
+            for (0..src.height) |y| {
+                for (src.data[y * src.stride ..][0..src.width], f.data[y * f.stride ..][0..src.width]) |v, *o| o.* = @floatFromInt(v);
+            }
+            try filter.gaussianBlur(exec, gpa, f, fb, .{ .kw = block, .kh = block, .border = .replicate });
+            for (0..src.height) |y| {
+                for (fb.data[y * fb.stride ..][0..src.width], mean.data[y * mean.stride ..][0..src.width]) |v, *o| o.* = sat.cast(u8, v);
+            }
+        },
     }
     const imax = sat.cast(u8, maxval);
     const idelta: i32 = @intFromFloat(if (kind == .binary) @ceil(delta) else @floor(delta));
