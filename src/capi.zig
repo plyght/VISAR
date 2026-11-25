@@ -11,9 +11,14 @@ const codecs = visar.codecs;
 const Image = core.Image;
 const Depth = core.Depth;
 
+// calib3d's entry points live in their own file.
+comptime {
+    _ = @import("capi_calib3d.zig");
+}
+
 /// The system allocator where libc is linked: it reuses freed blocks, where
 /// smp_allocator maps fresh pages (and page faults) for every large image.
-const gpa = if (builtin.cpu.arch.isWasm()) std.heap.wasm_allocator else if (builtin.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
+pub const gpa = if (builtin.cpu.arch.isWasm()) std.heap.wasm_allocator else if (builtin.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
 
 pub const CImage = extern struct {
     width: u32,
@@ -38,7 +43,7 @@ const Status = enum(c_int) {
 
 threadlocal var last_error: [256:0]u8 = @splat(0);
 
-fn fail(err: anyerror) c_int {
+pub fn fail(err: anyerror) c_int {
     const msg = @errorName(err);
     const n = @min(msg.len, last_error.len - 1);
     @memcpy(last_error[0..n], msg[0..n]);
@@ -65,7 +70,7 @@ var pool_mutex: std.atomic.Mutex = .unlocked;
 var pool: ?core.Pool = null;
 var want_threads: ?usize = null;
 
-fn exec() core.Exec {
+pub fn exec() core.Exec {
     if (!core.pool.threads_supported) return .serial;
     while (!pool_mutex.tryLock()) std.atomic.spinLoopHint();
     defer pool_mutex.unlock();
@@ -100,7 +105,7 @@ export fn visar_last_error() [*:0]const u8 {
 
 // ----------------------------------------------------------- conversion
 
-fn typed(comptime T: type, c: *const CImage) !Image(T) {
+pub fn typed(comptime T: type, c: *const CImage) !Image(T) {
     if (c.data == null) return error.InvalidArgument;
     if (c.depth != @backingInt(Depth.of(T))) return error.Unsupported;
     if (c.channels == 0 or c.channels > core.image.max_channels) return error.InvalidArgument;

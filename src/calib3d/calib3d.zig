@@ -1,0 +1,22 @@
+//! visar.calib3d: camera geometry, OpenCV's calib3d equivalent.
+//! Homographies and affine estimation (RANSAC / LMeDS + Levenberg-Marquardt),
+//! pose estimation, camera calibration and lens undistortion.
+
+const std = @import("std");
+
+pub const linalg = @import("linalg.zig");
+pub const ransac = @import("ransac.zig");
+pub const homography = @import("homography.zig");
+
+pub const Point2f = homography.Point2f;
+pub const Method = homography.Method;
+pub const findHomography = homography.findHomography;
+pub const getPerspectiveTransform = homography.getPerspectiveTransform;
+pub const getAffineTransform = homography.getAffineTransform;
+pub const perspectiveTransform = homography.perspectiveTransform;
+pub const estimateAffine2D = homography.estimateAffine2D;
+pub const estimateAffinePartial2D = homography.estimateAffinePartial2D;
+
+test {
+    std.testing.refAllDecls(@This());
+}
