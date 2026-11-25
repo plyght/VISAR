@@ -136,7 +136,7 @@ fn min4(f: []const u8, t: []const f32, cols: usize, i: usize, j: usize) f32 {
 
 /// OpenCV's icvCalcFMM with negate = true: arrival times outside the mask,
 /// stored negated.
-fn calcFmmOutside(gpa: Allocator, f: []u8, t: []f32, rows: usize, cols: usize, q: *Queue) !void {
+fn calcFmmOutside(gpa: Allocator, f: []u8, t: []f32, rows: usize, cols: usize, q: *Queue, ia0: usize, ia1: usize, ja0: usize, ja1: usize) !void {
     while (q.pop()) |p| {
         const ii = p[0];
         const jj = p[1];
@@ -163,11 +163,59 @@ fn calcFmmOutside(gpa: Allocator, f: []u8, t: []f32, rows: usize, cols: usize, q
             }
         }
     }
-    for (f, t) |*fv, *tv| {
-        if (fv.* == CHANGE) {
-            fv.* = KNOWN;
-            tv.* = -tv.*;
+    for (ia0..ia1) |i| for (ja0..ja1) |j| {
+        const p = i * cols + j;
+        if (f[p] == CHANGE) {
+            f[p] = KNOWN;
+            t[p] = -t[p];
         }
+    };
+}
+
+/// ring = max of `f` (0 or INSIDE) over the (2r+1)^2 square, minus `f`
+/// and `band` (saturating), for rows [ia0, ia1) and columns [ja0, ja1)
+/// of the interior; cv::dilate with a rectangle and two cv::subtract.
+fn dilateRing(gpa: Allocator, f: []const u8, band: []const u8, ring: []u8, cols: usize, ia0: usize, ia1: usize, ja0: usize, ja1: usize, r: usize) !void {
+    const L = 32;
+    const Vb = @Vector(L, u8);
+    // Source columns [ja0 - r, ja1 + r) clipped to the grid; the frame is 0.
+    const x0 = ja0 -| r;
+    const x1 = @min(ja1 + r, cols);
+    const rw = ja1 - ja0;
+    const rwv = (rw + L - 1) / L * L;
+    const nrows = ia1 - ia0;
+    const buf = try gpa.alloc(u8, (nrows + 2 * r) * rwv + 2 * rwv + 2 * r + 2 * L);
+    defer gpa.free(buf);
+    // Row maxima of rows [ia0 - r, ia1 + r), clipped to the grid.
+    const hm = buf[0 .. (nrows + 2 * r) * rwv];
+    const pad = buf[hm.len..][0 .. rwv + 2 * r + L];
+    const acc = buf[hm.len + pad.len ..][0..rwv];
+    const y0 = ia0 -| r;
+    const y1 = @min(ia1 + r, f.len / cols);
+    for (y0..y1) |y| {
+        @memset(pad, 0);
+        // pad[k] is column ja0 - r + k.
+        const off = x0 + r - ja0;
+        @memcpy(pad[off..][0 .. x1 - x0], f[y * cols + x0 ..][0 .. x1 - x0]);
+        const d = hm[(y - y0) * rwv ..][0..rwv];
+        var x: usize = 0;
+        while (x < rwv) : (x += L) {
+            var m: Vb = pad[x..][0..L].*;
+            for (1..2 * r + 1) |k| m = @max(m, @as(Vb, pad[x + k ..][0..L].*));
+            d[x..][0..L].* = m;
+        }
+    }
+    for (ia0..ia1) |i| {
+        const a = @max(i -| r, y0);
+        const b = @min(i + r + 1, y1);
+        @memset(acc, 0);
+        for (a..b) |yy| {
+            const srow = hm[(yy - y0) * rwv ..][0..rwv];
+            var x: usize = 0;
+            while (x < rwv) : (x += L) acc[x..][0..L].* = @max(@as(Vb, acc[x..][0..L].*), @as(Vb, srow[x..][0..L].*));
+        }
+        const p = i * cols + ja0;
+        for (ring[p..][0..rw], acc[0..rw], f[p..][0..rw], band[p..][0..rw]) |*o, m, fv, bv| o.* = m -| fv -| bv;
     }
 }
 
@@ -461,74 +509,56 @@ fn inpaintCn(comptime T: type, comptime cn: usize, gpa: Allocator, src: Image(T)
     var any = false;
     for (0..h) |y| {
         const mr = mask.row(y);
-        for (mr, 0..) |v, x| if (v != 0) {
-            f[(y + 1) * cols + x + 1] = INSIDE;
-            any = true;
-            r0 = @min(r0, y + 1);
-            r1 = y + 1;
-            c0 = @min(c0, x + 1);
-            c1 = @max(c1, x + 1);
-        };
+        var x: usize = 0;
+        while (x < w) {
+            if (x + 64 <= w) {
+                const v: @Vector(64, u8) = mr[x..][0..64].*;
+                if (@reduce(.Max, v) == 0) {
+                    x += 64;
+                    continue;
+                }
+            }
+            const e = @min(x + 64, w);
+            for (x..e) |xx| if (mr[xx] != 0) {
+                f[(y + 1) * cols + xx + 1] = INSIDE;
+                any = true;
+                r0 = @min(r0, y + 1);
+                r1 = y + 1;
+                c0 = @min(c0, xx + 1);
+                c1 = @max(c1, xx + 1);
+            };
+            x = e;
+        }
     }
-    // The band: 4-neighbours of the mask, outside it, not on the frame.
-    if (any) {
-        for (r0 -| 1..@min(r1 + 2, rows)) |i| for (c0 -| 1..@min(c1 + 2, cols)) |j| {
-            if (f[i * cols + j] == INSIDE) continue;
-            if (i == 0 or j == 0 or i == rows - 1 or j == cols - 1) continue;
-            if (f[(i - 1) * cols + j] == INSIDE or f[(i + 1) * cols + j] == INSIDE or
-                f[i * cols + j - 1] == INSIDE or f[i * cols + j + 1] == INSIDE) band[i * cols + j] = INSIDE;
-        };
-    }
+    // The band: 4-neighbours of the mask, outside it, not on the frame,
+    // queued in raster order with T = 0.
     var heap: Queue = .{};
     defer heap.deinit(gpa);
-    for (0..n) |p| if (band[p] != 0) try heap.push(gpa, p / cols, p % cols, 0);
-    for (0..n) |p| if (band[p] != 0) {
-        t[p] = 0;
-    };
+    var out_q: Queue = .{};
+    defer out_q.deinit(gpa);
+    if (any) {
+        for (@max(r0 - 1, 1)..@min(r1 + 2, rows - 1)) |i| for (@max(c0 - 1, 1)..@min(c1 + 2, cols - 1)) |j| {
+            const p = i * cols + j;
+            if (f[p] == INSIDE) continue;
+            if (f[p - cols] == INSIDE or f[p + cols] == INSIDE or f[p - 1] == INSIDE or f[p + 1] == INSIDE) {
+                band[p] = INSIDE;
+                t[p] = 0;
+                try heap.push(gpa, i, j, 0);
+                if (method == .telea) try out_q.push(gpa, i, j, 0);
+            }
+        };
+    }
 
     if (method == .telea and any) {
         // Ring of pixels within `range` (Chebyshev) of the mask, outside the
         // mask and the band: the outward march gives them negative times.
         @memset(ring, 0);
-        const ia0 = (r0 + 1) -| (range + 1);
-        const ja0 = (c0 + 1) -| (range + 1);
-        const ia1 = @min(r1 + range + 1, rows);
-        const ja1 = @min(c1 + range + 1, cols);
-        // Separable max filter of the mask (values 0/2) over the ROI.
-        const rw = ja1 - ja0;
-        const tmp = try gpa.alloc(u8, (ia1 - ia0) * rw);
-        defer gpa.free(tmp);
-        for (ia0..ia1) |i| {
-            for (ja0..ja1) |j| {
-                const a = if (j >= ja0 + range) j - range else ja0;
-                const b = @min(j + range + 1, ja1);
-                var m: u8 = 0;
-                for (a..b) |jj| m = @max(m, f[i * cols + jj]);
-                tmp[(i - ia0) * rw + (j - ja0)] = m;
-            }
-        }
-        for (ia0..ia1) |i| {
-            const a = if (i >= ia0 + range) i - range else ia0;
-            const b = @min(i + range + 1, ia1);
-            for (ja0..ja1) |j| {
-                var m: u8 = 0;
-                for (a..b) |ii| m = @max(m, tmp[(ii - ia0) * rw + (j - ja0)]);
-                const p = i * cols + j;
-                ring[p] = m -| f[p] -| band[p];
-            }
-        }
-        for (0..cols) |j| {
-            ring[j] = 0;
-            ring[(rows - 1) * cols + j] = 0;
-        }
-        for (0..rows) |i| {
-            ring[i * cols] = 0;
-            ring[i * cols + cols - 1] = 0;
-        }
-        var out_q: Queue = .{};
-        defer out_q.deinit(gpa);
-        for (0..n) |p| if (band[p] != 0) try out_q.push(gpa, p / cols, p % cols, 0);
-        try calcFmmOutside(gpa, ring, t, rows, cols, &out_q);
+        const ia0 = @max((r0 + 1) -| (range + 1), 1);
+        const ja0 = @max((c0 + 1) -| (range + 1), 1);
+        const ia1 = @min(r1 + range + 1, rows - 1);
+        const ja1 = @min(c1 + range + 1, cols - 1);
+        try dilateRing(gpa, f, band, ring, cols, ia0, ia1, ja0, ja1, range);
+        try calcFmmOutside(gpa, ring, t, rows, cols, &out_q, ia0, ia1, ja0, ja1);
     }
 
     var disk = try Disk.init(gpa, range);
