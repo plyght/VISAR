@@ -18,6 +18,7 @@ pub const shape = @import("shape.zig");
 pub const pyramid = @import("pyramid.zig");
 pub const corner = @import("corner.zig");
 pub const subpix = @import("subpix.zig");
+pub const lab = @import("lab.zig");
 
 pub const Border = border.Border;
 
