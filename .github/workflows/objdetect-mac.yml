@@ -22,7 +22,7 @@ jobs:
       - run: zig build -Doptimize=ReleaseFast
       - name: Differential tests
         continue-on-error: true
-        run: python3 -u -X faulthandler tests/py/test_objdetect_vs_opencv.py --lib zig-out/lib/libvisar.dylib > diff.txt 2>&1; echo "exit $?" >> diff.txt; cat diff.txt
+        run: python3 -u -X faulthandler tests/py/test_objdetect_vs_opencv.py --lib zig-out/lib/libvisar.dylib > diff.txt 2>&1 || echo "exit $?" >> diff.txt; cat diff.txt
       - name: Bench 1 thread
         run: |
           for f in "QR " "ArUco"; do
