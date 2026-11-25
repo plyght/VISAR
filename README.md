@@ -159,17 +159,17 @@ Speed against OpenCV 5.0 at one thread (x86_64 VM, AVX-512; `bench/bench_vs_open
 
 - **QRCodeEncoder**: 400 symbols (every level, versions 1-40, all modes, lengths 1-2000, UTF-8) and structured append are module-for-module identical to `cv2.QRCodeEncoder`, including OpenCV's own version choice and mask scoring.
 - **QRCodeDetector**: on 60 cv2-generated symbols rendered with random rotation, perspective, blur and noise (640x480 and 1280x720, plain and textured backgrounds), every symbol cv2 decodes, VISAR decodes to the same string (and it decodes 23 that cv2 misses); corners are within 1.3 px of cv2's (median). `detectAndDecodeMulti` finds every string cv2 finds in 16 scenes of 2-4 symbols (plus 17 that cv2 misses), and joins structured-append sequences like OpenCV. The detector is VISAR's own (block-mean binarisation, 1:1:3:1:1 finder scan with cross-checks, a homography from the finders' outer corners and the alignment pattern); the decoder follows OpenCV's (same Reed-Solomon correction, segment parsing and UTF-8/Latin-1 handling), except that it masks the version-information modules exactly where OpenCV's mask is one column off. Noise, tiny images and corrupted symbols are fuzzed: decoding never panics.
-- **ArUco**: `generateImageMarker` is pixel-identical; `detectMarkers` returns the same ids in the same order with identical corners (0 px difference) on 42 scenes over seven dictionaries, inverted markers, BGR input and the rejected candidates, and corners within 1.2e-4 px with CORNER_REFINE_SUBPIX. It reproduces OpenCV step by step: `adaptiveThreshold` (identical to cv2's), `findContours`, `approxPolyDP`, the candidate tree, OpenCV 5's f32 nearest-neighbour warp kernel, Otsu and the cell ratios; dictionary lookup uses word-wide bit masks. `drawDetectedMarkers` draws the same sides; its corner square is not anti-aliased and the ids use VISAR's bitmap font. Not yet: CORNER_REFINE_CONTOUR/APRILTAG, the AprilTag quad detector, Aruco3 pyramid detection, CharucoBoard/GridBoard and pose estimation, `QRCodeDetectorAruco`, `decodeCurved`.
+- **ArUco**: `generateImageMarker` is pixel-identical; `detectMarkers` returns the same ids in the same order with identical corners (0 px difference, on x86-64 and Apple Silicon) on 42 scenes over seven dictionaries, inverted markers, BGR input and the rejected candidates, and corners within 1.2e-4 px with CORNER_REFINE_SUBPIX. It reproduces OpenCV step by step: `adaptiveThreshold` (MEAN_C identical to cv2; GAUSSIAN_C within a last-bit rounding of its float blur), `findContours`, `approxPolyDP`, the candidate tree, OpenCV 5's f32 nearest-neighbour warp kernel, Otsu and the cell ratios; dictionary lookup uses word-wide bit masks. `drawDetectedMarkers` draws the same sides; its corner square is not anti-aliased and the ids use VISAR's bitmap font. Not yet: CORNER_REFINE_CONTOUR/APRILTAG, the AprilTag quad detector, Aruco3 pyramid detection, CharucoBoard/GridBoard and pose estimation, `QRCodeDetectorAruco`, `decodeCurved`.
 
 Speed against OpenCV 5.0 at one thread (`bench/bench_vs_opencv.py --threads 1 --filter QR` / `ArUco`; above 1x = VISAR faster):
 
 | Case | x86-64 (Xeon, AVX-512) | Apple M1 (3-core VM) |
 | --- | ---: | ---: |
-| QR detect+decode 640x480 | 16.0x (0.75 vs 11.9 ms) | MAC_QR640 |
-| QR detect+decode 1280x720 | 23.2x (1.65 vs 38.1 ms) | MAC_QR720 |
-| QR encode, version 10 | 58x (0.49 vs 28.3 ms) | MAC_QRENC |
-| ArUco detectMarkers, 20 markers, 1280x720 | 2.9x (8.9 vs 25.9 ms) | MAC_ARUCO |
-| ArUco detectMarkers SUBPIX, 1280x720 | 2.9x (8.6 vs 24.5 ms) | MAC_ARUCOSP |
+| QR detect+decode 640x480 | 16.0x (0.75 vs 11.9 ms) | 21x (0.59 vs 12.2 ms) |
+| QR detect+decode 1280x720 | 23.2x (1.65 vs 38.1 ms) | 37x (1.31 vs 48.4 ms) |
+| QR encode, version 10 | 58x (0.49 vs 28.3 ms) | 61x (0.44 vs 27.1 ms) |
+| ArUco detectMarkers, 20 markers, 1280x720 | 2.9x (8.9 vs 25.9 ms) | 3.3x (8.0 vs 26.2 ms) |
+| ArUco detectMarkers SUBPIX, 1280x720 | 2.9x (8.6 vs 24.5 ms) | 3.2x (7.7 vs 24.4 ms) |
 
 ### 4K face detection: measured, and what 120 fps on an M3 needs
 
