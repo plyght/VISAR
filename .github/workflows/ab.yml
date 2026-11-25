@@ -45,8 +45,25 @@ jobs:
             git worktree add "../src-$tag" "$ref"
             (cd "../src-$tag" && zig build -Doptimize=ReleaseFast --prefix "$GITHUB_WORKSPACE/../out-$tag")
           done
+      # The YuNet model and the selfie (face cases of the bench and face4k).
+      - name: Download models
+        run: |
+          mkdir -p "$RUNNER_TEMP/models"
+          zoo=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/face_detection_yunet_2023mar.onnx" "$zoo/face_detection_yunet_2023mar.onnx"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" "$zoo/example_outputs/largest_selfie.jpg"
+          echo "VISAR_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
+      # filter = face4k: the 4K face pipeline bench of B (bench/face4k.py)
+      # instead of the A/B cases; threads = its N (0 = all cores).
+      - name: Face pipeline 4K
+        if: inputs.filter == 'face4k'
+        run: |
+          set -eu
+          (cd ../src-B && zig build face4k-steady -Doptimize=ReleaseFast --prefix "$GITHUB_WORKSPACE/../out-S" && "$GITHUB_WORKSPACE/../out-S/bin/visar-face4k-steady" --profile --threads "${{ inputs.threads }}" || true)
+          (cd ../src-B && zig build face4k -Doptimize=ReleaseFast -- --threads "${{ inputs.threads }}" --md "$GITHUB_WORKSPACE/face.md")
+          { echo "### face4k, \`${{ inputs.head }}\` on ${{ inputs.runner }}"; echo; cat face.md; } >> "$GITHUB_STEP_SUMMARY"
       - name: Time
-        if: inputs.base != inputs.head
+        if: inputs.base != inputs.head && inputs.filter != 'face4k'
         run: |
           ext=so; [ "$RUNNER_OS" = macOS ] && ext=dylib
           python3 bench/ab.py "../out-A/lib/libvisar.$ext" "../out-B/lib/libvisar.$ext" \
@@ -55,7 +72,7 @@ jobs:
       # base == head: time VISAR alone at 1 and N threads (one library copy,
       # no OpenCV calls in between), to see thread scaling undisturbed.
       - name: Solo thread scaling
-        if: inputs.base == inputs.head
+        if: inputs.base == inputs.head && inputs.filter != 'face4k'
         run: |
           ext=so; [ "$RUNNER_OS" = macOS ] && ext=dylib
           python3 bench/solo.py "../out-A/lib/libvisar.$ext" --filter "${{ inputs.filter }}" --threads "${{ inputs.threads }}" --md solo.md
