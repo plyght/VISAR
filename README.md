@@ -102,12 +102,14 @@ ffmpeg -i clip.mp4 -c:v mjpeg -q:v 3 clip.avi && VISAR_MODELS=. visar faces clip
 | YUV4MPEG2 (`.y4m`) | yes | yes (4:2:0) | everywhere |
 | MP4 / QuickTime (H.264, HEVC, ...) | yes, hardware decoding | no | macOS (AVFoundation / VideoToolbox, loaded at run time); elsewhere an error that says how to convert with ffmpeg |
 
-Frames are read into a caller-owned BGR, BGRA or gray image; the frame count, rate and FourCC come from the file, and seeking is by frame number (AVI through its `idx1` or OpenDML index, rebuilt by scanning when a file was never finished; YUV4MPEG2 by arithmetic; MP4 by time). Files are treated as untrusted: every chunk size is bounds-checked, and truncated or corrupted files (fuzzed in the tests) give an error or fewer frames, never a crash. `zig build difftest` checks both directions against OpenCV: VISAR's AVIs open in `cv2.VideoCapture` (FFmpeg and OpenCV's own reader) with the right count and frames, and `cv2.VideoWriter('MJPG')` files (both backends) read in VISAR bit-identical to OpenCV's own MJPEG decode. Speed against OpenCV 5.0 for 16 frames of 1280x720 Motion-JPEG (x86_64, 4 cores; above 1x = VISAR faster):
+Frames are read into a caller-owned BGR, BGRA or gray image; the frame count, rate and FourCC come from the file, and seeking is by frame number (AVI through its `idx1` or OpenDML index, rebuilt by scanning when a file was never finished; YUV4MPEG2 by arithmetic; MP4 by time). Files are treated as untrusted: every chunk size is bounds-checked, and truncated or corrupted files (fuzzed in the tests) give an error or fewer frames, never a crash. `zig build difftest` checks both directions against OpenCV: VISAR's AVIs open in `cv2.VideoCapture` (FFmpeg and OpenCV's own reader) with the right count and frames, and `cv2.VideoWriter('MJPG')` files (both backends) read in VISAR bit-identical to OpenCV's own MJPEG decode. Speed against OpenCV 5.0 for 16 frames of 1280x720 Motion-JPEG (`bench/bench_vs_opencv.py --filter Video`; above 1x = VISAR faster):
 
-| | vs FFmpeg backend | vs OpenCV MJPEG backend |
-| --- | ---: | ---: |
-| read (open + decode every frame) | 1.62x | 1.21x |
-| write (encode q95 + mux) | 1.94x | 1.81x |
+| | x86_64, 4 cores: vs FFmpeg | vs OpenCV MJPEG | Apple M1 runner, 3 threads: vs FFmpeg | vs OpenCV MJPEG |
+| --- | ---: | ---: | ---: | ---: |
+| read (open + decode every frame) | 1.62x | 1.21x | 1.88x | 1.19x |
+| write (encode q95 + mux) | 1.94x | 1.81x | 3.23x | 2.04x |
+
+On macOS, .mp4/.mov frames come out of AVFoundation as 4:2:0 and are converted by VISAR, so they are bit-identical to FFmpeg's decode of the same file read through `.y4m` (checked in CI on H.264 and HEVC clips, including seeking). On the CI runner (a VM with no hardware decoder) AVFoundation reads at 0.4-0.7x of cv2's multi-threaded FFmpeg software decoding.
 
 ### 4K face detection: measured, and what 120 fps on an M3 needs
 
