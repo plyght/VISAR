@@ -121,7 +121,11 @@ pub const Pool = struct {
 
     /// Output row `oy` of plane `pc` (a channel block, or a channel when
     /// L = 1).
-    fn row(k: *const Pool, comptime L: usize, src: Rows, dst: Rows, pc: usize, oy: usize) void {
+    fn row(kp: *const Pool, comptime L: usize, src: Rows, dst: Rows, pc: usize, oy: usize) void {
+        // A local copy: the output stores could alias the kernel, and LLVM
+        // would reload its sizes after every one.
+        const kv = kp.*;
+        const k = &kv;
         const out = dst.at(pc, oy);
         const p = k.p;
         const fast2 = k.kind == .max and p.kernel[0] == 2 and p.kernel[1] == 2 and p.stride[0] == 2 and p.stride[1] == 2 and
@@ -714,7 +718,9 @@ pub const Extract = struct {
         }.f);
     }
 
-    fn row(k: *const Extract, base: [*]f32, r: usize) void {
+    fn row(kp: *const Extract, base: [*]f32, r: usize) void {
+        const kv = kp.*; // (see Pool.row)
+        const k = &kv;
         const h = k.s.d[2];
         const w = k.s.d[3];
         const n = r / h;
