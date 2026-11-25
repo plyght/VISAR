@@ -128,6 +128,15 @@ pub const Mosse = struct {
     /// Locates the target in `frame` (gray, same size as before), updates
     /// the filter when confident, and returns the new box.
     pub fn update(self: *Mosse, frame: Image(u8)) !Result {
+        return self.commit(frame, try self.search(frame));
+    }
+
+    /// Where `search` found the target (not yet taken over: see `commit`).
+    pub const Found = struct { cx: f32, cy: f32, w: f32, h: f32, psr: f32, ok: bool };
+
+    /// The first half of `update`: locates the target in `frame`, reading
+    /// only `searchBounds`; the filter is left as it is.
+    pub fn search(self: *Mosse, frame: Image(u8)) !Found {
         if (frame.channels != 1) return error.UnsupportedChannels;
         const scales = [_]f32{ 1.0 / self.o.scale_step, 1.0, self.o.scale_step };
         var best: Peak = .{ .dx = 0, .dy = 0, .value = -std.math.inf(f32), .psr = 0 };
@@ -149,16 +158,67 @@ pub const Mosse = struct {
             }
         }
         const ok = best.psr >= self.o.min_psr;
-        if (ok) {
-            const n: f32 = @floatFromInt(self.o.size);
-            self.cx += best.dx * self.w * self.o.padding * best_scale / n;
-            self.cy += best.dy * self.h * self.o.padding * best_scale / n;
-            self.w *= best_scale;
-            self.h *= best_scale;
+        if (!ok) return .{ .cx = self.cx, .cy = self.cy, .w = self.w, .h = self.h, .psr = best.psr, .ok = false };
+        const n: f32 = @floatFromInt(self.o.size);
+        return .{
+            .cx = self.cx + best.dx * self.w * self.o.padding * best_scale / n,
+            .cy = self.cy + best.dy * self.h * self.o.padding * best_scale / n,
+            .w = self.w * best_scale,
+            .h = self.h * best_scale,
+            .psr = best.psr,
+            .ok = true,
+        };
+    }
+
+    /// The second half of `update`: when `f` (from `search` on the same
+    /// frame) is confident, moves the target there and adapts the filter
+    /// to the patch there (reading only `commitBounds(f)`).
+    pub fn commit(self: *Mosse, frame: Image(u8), f: Found) !Result {
+        if (frame.channels != 1) return error.UnsupportedChannels;
+        if (f.ok) {
+            self.cx = f.cx;
+            self.cy = f.cy;
+            self.w = f.w;
+            self.h = f.h;
             self.patch(frame, self.cx, self.cy, 1.0, 0, 1);
             self.accumulate(self.o.rate);
         }
-        return .{ .box = self.box(), .psr = best.psr, .ok = ok };
+        return .{ .box = self.box(), .psr = f.psr, .ok = f.ok };
+    }
+
+    /// Pixel bounds { x0, y0, x1, y1 } (ends exclusive) of a `width` x
+    /// `height` frame that cover everything the next `search` reads.
+    pub fn searchBounds(self: Mosse, width: u32, height: u32) [4]u32 {
+        const s = if (self.o.scale) @max(self.o.scale_step, 1.0 / self.o.scale_step) else 1.0;
+        return patchBounds(self.cx, self.cy, self.w * self.o.padding * s, self.h * self.o.padding * s, width, height);
+    }
+
+    /// The same for `commit(frame, f)`.
+    pub fn commitBounds(self: Mosse, f: Found, width: u32, height: u32) [4]u32 {
+        if (!f.ok) return .{ 0, 0, 0, 0 };
+        return patchBounds(f.cx, f.cy, f.w * self.o.padding, f.h * self.o.padding, width, height);
+    }
+
+    /// The same for `init` (or `correct`) on `start` with options `o`
+    /// (its training patches are rotated and scaled a little).
+    pub fn initBounds(start: Box, o: Options, width: u32, height: u32) [4]u32 {
+        const side = 1.5 * o.padding * @max(@max(start.w, 4), @max(start.h, 4));
+        return patchBounds(start.cx(), start.cy(), side, side, width, height);
+    }
+
+    /// Bounds of a `rw` x `rh` region centred on (cx, cy), with margin for
+    /// bilinear sampling and rounding; samples are clamped into the frame,
+    /// so a region outside it still reads its edge.
+    fn patchBounds(cx: f32, cy: f32, rw: f32, rh: f32, width: u32, height: u32) [4]u32 {
+        if (width == 0 or height == 0) return .{ 0, 0, 0, 0 };
+        if (!std.math.isFinite(cx + cy + rw + rh)) return .{ 0, 0, width, height };
+        const mx: f32 = @floatFromInt(width - 1);
+        const my: f32 = @floatFromInt(height - 1);
+        const x0 = std.math.clamp(@floor(cx - rw / 2) - 2, 0, mx);
+        const y0 = std.math.clamp(@floor(cy - rh / 2) - 2, 0, my);
+        const x1 = std.math.clamp(@ceil(cx + rw / 2) + 2, 0, mx);
+        const y1 = std.math.clamp(@ceil(cy + rh / 2) + 2, 0, my);
+        return .{ @intFromFloat(x0), @intFromFloat(y0), @as(u32, @intFromFloat(x1)) + 1, @as(u32, @intFromFloat(y1)) + 1 };
     }
 
     /// Moves the target to `b` (an outside detection: drift correction)
@@ -423,4 +483,46 @@ test "mosse follows a moving textured patch" {
         if (!r.ok) lost = true;
     }
     try std.testing.expect(lost);
+}
+
+test "search, commit and init read only their bounds" {
+    const gpa = std.testing.allocator;
+    const W = 200;
+    const H = 150;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    var full = try Image(u8).init(gpa, W, H, 1);
+    defer full.deinit(gpa);
+    var part = try Image(u8).init(gpa, W, H, 1);
+    defer part.deinit(gpa);
+    const Copy = struct {
+        // `part` = noise, with `full` inside `b` only.
+        fn f(r: std.Random, src: Image(u8), dst: Image(u8), b: [4]u32) void {
+            r.bytes(dst.slice());
+            for (b[1]..b[3]) |y| @memcpy(dst.row(y)[b[0]..b[2]], src.row(y)[b[0]..b[2]]);
+        }
+    };
+    // Starts near the middle and at the edges (clamped samples).
+    for ([_]Box{ .{ .x = 80, .y = 60, .w = 24, .h = 30 }, .{ .x = -6, .y = 2, .w = 20, .h = 20 }, .{ .x = 185, .y = 135, .w = 22, .h = 18 } }) |start| {
+        for (0..H) |y| for (0..W) |x| full.set(x, y, 0, @intCast((x * 7 + y * 13 + (x * y) % 17) % 256));
+        Copy.f(rnd, full, part, Mosse.initBounds(start, .{}, W, H));
+        var a = try Mosse.init(gpa, full, start, .{});
+        defer a.deinit();
+        var b = try Mosse.init(gpa, part, start, .{});
+        defer b.deinit();
+        try std.testing.expectEqualSlices(Complex, a.filt, b.filt);
+        for (0..12) |i| {
+            // Shift the texture a little each frame.
+            for (0..H) |y| for (0..W) |x| full.set(x, y, 0, @intCast(((x + i) * 7 + (y + i / 2) * 13 + ((x + i) * y) % 17) % 256));
+            Copy.f(rnd, full, part, b.searchBounds(W, H));
+            const fa = try a.search(full);
+            const fb = try b.search(part);
+            try std.testing.expectEqual(fa, fb);
+            Copy.f(rnd, full, part, b.commitBounds(fb, W, H));
+            const ra = try a.commit(full, fa);
+            const rb = try b.commit(part, fb);
+            try std.testing.expectEqual(ra, rb);
+        }
+        try std.testing.expectEqualSlices(Complex, a.filt, b.filt);
+    }
 }

@@ -55,6 +55,7 @@ pub const opts = [_]args.Opt{
     .{ .long = "face-width", .value = "N", .help = "Width the face detector works at (default 320)" },
     .{ .long = "detect-every", .value = "N", .help = "Run the face detector every N frames, MOSSE in between (default 4)" },
     .{ .long = "change-level", .value = "N", .help = "0 off, 1 skip unchanged frames, 2 also detect around faces only (default)" },
+    .{ .long = "full-gray", .help = "Face tracking: the whole gray tracking image every frame (default: only around the faces between whole-frame detections)" },
     .{ .long = "list-cameras", .help = "List the cameras, their sizes and frame rates, and exit" },
 };
 
@@ -135,6 +136,7 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     if (p.value("face-width")) |v| cfg.face.face_width = try args.int(u32, ctx.diag, "--face-width", v, 32, 4096);
     if (p.value("detect-every")) |v| cfg.face.detect_every = try args.int(u32, ctx.diag, "--detect-every", v, 1, 1000);
     if (p.value("change-level")) |v| cfg.face.level = try args.int(u8, ctx.diag, "--change-level", v, 0, 2);
+    if (p.flag("full-gray")) cfg.face.partial_gray = false;
     if (cfg.faces_path == null) for ([_][]const u8{ "face-width", "detect-every", "change-level" }) |o| {
         if (p.value(o) != null) ctx.warn("--{s} applies to face tracking (--faces MODEL); ignored", .{o});
     };
@@ -542,6 +544,8 @@ fn updateLocks(live: *Live, slot: u8) !void {
     const nreq = live.request_count;
     live.request_count = 0;
     live.request_mutex.unlock(live.io);
+    // The face tracker may have computed only parts of the tracking image.
+    if (nreq > 0 or live.locks.items.len > 0) if (live.faces) |*ft| try ft.completeTrackingImage(live.exec, live.ring.image(slot), live.small);
     for (reqs[0..nreq]) |r| {
         if (live.locks.items.len == max_locks) {
             // The oldest lock makes room.

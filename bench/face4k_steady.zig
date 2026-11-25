@@ -14,8 +14,16 @@
 //!   zig build face4k -Doptimize=ReleaseFast    (bench/face4k.py runs this)
 //!   visar-face4k-steady [--models DIR] [--threads N] [--face-width N]
 //!       [--level L] [--detect-every N] [--frames N] [--size WxH]
-//!       [--backend auto|cpu|metal] [--separate]
+//!       [--backend auto|cpu|metal] [--separate] [--full-gray]
+//!       [--still-stride N]
 //!   --separate: the tracking image always on its own (grayDownsample).
+//!   --full-gray: the whole tracking image every frame (FaceOptions
+//!       .partial_gray off; by default frames without a whole-frame
+//!       detection compute it only where the tracker reads it).
+//! Tracking quality: "followed" frames with a track at IoU >= 0.5 to the
+//! face moved with the image, "mean_iou" and "mean_err_px" (centre error
+//! at 4K) of the best track; "gray_read" is the share of the tracking
+//! image computed (so of the frame read for it).
 //!   --profile: instead, the CPU program of YuNet step by step at 1 and
 //!       --threads threads (each step timed alone).
 
@@ -48,6 +56,10 @@ pub fn main(init: std.process.Init) !void {
             separate = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--full-gray")) {
+            opts.partial_gray = false;
+            continue;
+        }
         const v = if (i + 1 < args.len) args[i + 1] else "";
         i += 1;
         if (std.mem.eql(u8, a, "--models")) {
@@ -62,6 +74,8 @@ pub fn main(init: std.process.Init) !void {
             opts.level = try std.fmt.parseInt(u8, v, 10);
         } else if (std.mem.eql(u8, a, "--detect-every")) {
             opts.detect_every = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--still-stride")) {
+            opts.still_stride = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--frames")) {
             frames = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--size")) {
@@ -134,7 +148,8 @@ pub fn main(init: std.process.Init) !void {
         \\"mean_ms":{d:.3},"p50_ms":{d:.3},"p95_ms":{d:.3},"max_ms":{d:.3},"fps":{d:.1},
         \\"full_runs":{d},"crop_rounds":{d},"crops":{d},"postponed":{d},"mean_full_ms":{d:.3},"mean_crop_ms":{d:.3},
         \\"gray_ms":{d:.3},"track_ms":{d:.3},"detect_ms":{d:.3},
-        \\"faces":{d},"followed":{d},"truth_frames":{d},"fused_preps":{d},"fused_unused":{d}}}
+        \\"faces":{d},"followed":{d},"truth_frames":{d},"mean_iou":{d:.4},"mean_err_px":{d:.2},"fused_preps":{d},"fused_unused":{d},
+        \\"partial_gray":{},"partial_frames":{d},"gray_read":{d:.4}}}
         \\
     , .{
         W,                                                               H,
@@ -149,8 +164,10 @@ pub fn main(init: std.process.Init) !void {
         meanOr0(s.crop_ms - s0.crop_ms, s.crop_rounds - s0.crop_rounds), gray_ms / @as(f64, @floatFromInt(frames)),
         (s.track_ms - s0.track_ms) / @as(f64, @floatFromInt(frames)),    (s.detectMs() - s0.detectMs()) / @as(f64, @floatFromInt(frames)),
         ft.faces().len,                                                  truth.followed,
-        truth.frames,                                                    s.fused_preps - s0.fused_preps,
-        s.fused_unused - s0.fused_unused,
+        truth.frames,                                                    truth.iou_sum / @max(1, @as(f64, @floatFromInt(truth.frames))),
+        truth.err_sum / @max(1, @as(f64, @floatFromInt(truth.frames))),  s.fused_preps - s0.fused_preps,
+        s.fused_unused - s0.fused_unused,                                opts.partial_gray,
+        s.partial_frames - s0.partial_frames,                            @as(f64, @floatFromInt(s.gray_px - s0.gray_px)) / (@as(f64, @floatFromInt(frames)) * @as(f64, @floatFromInt(@as(u64, small.width) * small.height))),
     });
     try w.flush();
 }

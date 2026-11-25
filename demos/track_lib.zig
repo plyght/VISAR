@@ -644,11 +644,19 @@ pub const FaceOptions = struct {
     /// 2 = also run it only around the tracked faces (the default).
     level: u8 = 2,
     /// Level 1: the mean absolute gray-level difference (0-255) between the
-    /// tracking image now and at the last detection, over every 4th row,
-    /// below which the frame counts as unchanged. Webcam noise at the
-    /// tracking resolution (already box-averaged) gives about 1; a face
-    /// that moved by a few pixels gives several.
+    /// tracking image now and at the last detection, over every
+    /// `still_stride`-th row, below which the frame counts as unchanged.
+    /// Webcam noise at the tracking resolution (already box-averaged) gives
+    /// about 1; a face that moved by a few pixels gives several.
     still_threshold: f32 = 2.0,
+    /// Level 1: the rows the check compares (at least 4). With
+    /// `partial_gray` only they are computed for it, so a check reads
+    /// 1/`still_stride` of the frame. At the default 16 and the tracking
+    /// image of `visar track` (the detector's scale) the rows are 96 pixels
+    /// apart at 4K, closer than the smallest face the detector finds; a
+    /// change only between them waits for `max_postpone`. (Before
+    /// `partial_gray` the check read every 4th row.)
+    still_stride: u32 = 16,
     /// Level 1: a detection is never postponed beyond this many frames.
     max_postpone: u32 = 30,
     /// Level 2: every this many detections covers the whole frame.
@@ -667,6 +675,13 @@ pub const FaceOptions = struct {
     retrain_iou: f32 = 0.6,
     /// A track missed by this many detections in a row is dropped.
     drop_after: u32 = 2,
+    /// On frames that run no whole-frame detection, `trackingImage` leaves
+    /// the tracking image to `step`, which computes only the parts it reads
+    /// (the search windows of the MOSSE filters, the rows of the change
+    /// check, the patches of detections), each pixel bit-identical to the
+    /// whole image's: the same tracks, without reading most of the frame.
+    /// false = the whole tracking image every frame.
+    partial_gray: bool = true,
 };
 
 /// One tracked face. Boxes and landmarks are in frame pixels.
@@ -722,6 +737,12 @@ pub const FaceStats = struct {
     /// whose step then ran no whole-frame detection (the input unused).
     fused_preps: u64 = 0,
     fused_unused: u64 = 0,
+    /// Tracking-image pixels computed (by `trackingImage`, `step` and
+    /// `completeTrackingImage`): divided by frames x the image's pixels, the
+    /// share of the frame read for it.
+    gray_px: u64 = 0,
+    /// Frames whose tracking image was left partial (`partial_gray`).
+    partial_frames: u64 = 0,
 
     pub fn detectMs(s: FaceStats) f64 {
         return s.full_ms + s.crop_ms;
@@ -789,8 +810,23 @@ pub const FaceTracker = struct {
     /// The whole-frame detector's input already holds the frame of the
     /// next `step` (written by `trackingImage`).
     prepared: bool = false,
+    /// The tracking image of step `image_for` (a `stats.frames` value) is
+    /// computed only where `tiles` says so (`partial_gray`).
+    partial: bool = false,
+    image_for: u64 = 0,
+    /// Per tile of the tracking image (`tile_w` x `tile_h` pixels): computed
+    /// for this frame (1), or wanted by the current `ensure` (2).
+    tiles: []u8,
+    tiles_x: u32,
+    tiles_y: u32,
+    /// Scratch: windows wanted, runs of tiles to compute, MOSSE results.
+    rects: std.ArrayList([4]u32) = .empty,
+    runs: std.ArrayList([3]u32) = .empty,
+    found_at: std.ArrayList(visar.video.mosse.Mosse.Found) = .empty,
 
     const Plan = struct { w: u32, h: u32, det: visar.dnn.FaceDetector, used: u64 };
+    const tile_w = 32;
+    const tile_h = 8;
     const max_plans = 8;
     const min_crop = 64;
 
@@ -809,6 +845,10 @@ pub const FaceTracker = struct {
         errdefer det_bgr.deinit(gpa);
         const ref = try gpa.alloc(u8, @as(usize, (frame_h / k + 3) / 4) * (frame_w / k));
         errdefer gpa.free(ref);
+        const tiles_x = (frame_w / k + tile_w - 1) / tile_w;
+        const tiles_y = (frame_h / k + tile_h - 1) / tile_h;
+        const tiles = try gpa.alloc(u8, @as(usize, tiles_x) * tiles_y);
+        errdefer gpa.free(tiles);
         var self: FaceTracker = .{
             .gpa = gpa,
             .opts = opts,
@@ -822,6 +862,9 @@ pub const FaceTracker = struct {
             .det_bgr = det_bgr,
             .fused = visar.dnn.prep.factorsOf(frame_w, frame_h, dw, dh),
             .ref = ref,
+            .tiles = tiles,
+            .tiles_x = tiles_x,
+            .tiles_y = tiles_y,
         };
         // Plan the whole-frame detector now (this also checks the model).
         errdefer {
@@ -842,6 +885,10 @@ pub const FaceTracker = struct {
         self.det_bgra.deinit(gpa);
         self.det_bgr.deinit(gpa);
         gpa.free(self.ref);
+        gpa.free(self.tiles);
+        self.rects.deinit(gpa);
+        self.runs.deinit(gpa);
+        self.found_at.deinit(gpa);
         gpa.free(self.model);
         self.* = undefined;
     }
@@ -885,17 +932,38 @@ pub const FaceTracker = struct {
     /// run a whole-frame detection and the detector shrinks the frame by k
     /// itself, the detector input comes from the same pass over the frame
     /// (the same block sums; both outputs bit-identical to separate
-    /// passes), and `step` skips its own.
+    /// passes), and `step` skips its own. Otherwise, with `partial_gray`,
+    /// nothing is computed here: `step` computes the parts of `small` it
+    /// reads (and `completeTrackingImage` the rest, when wanted).
     pub fn trackingImage(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), small: Image(u8)) !void {
         self.prepared = false;
-        if (self.fused != null and self.fullLikely()) {
+        self.partial = false;
+        self.image_for = self.stats.frames + 1;
+        const full = self.fullLikely();
+        if (self.fused != null and full) {
             if (try self.plans.items[0].det.prepareWithGray(exec, frame, small)) {
                 self.prepared = true;
                 self.stats.fused_preps += 1;
+                self.stats.gray_px += @as(u64, small.width) * small.height;
                 return;
             }
         }
+        if (self.opts.partial_gray and !full and small.channels == 1 and small.width == self.frame_w / self.k and small.height == self.frame_h / self.k) {
+            self.partial = true;
+            @memset(self.tiles, 0);
+            self.stats.partial_frames += 1;
+            return;
+        }
         try visar.videoio.frame.grayDownsample(exec, frame, small, self.k);
+        self.stats.gray_px += @as(u64, small.width) * small.height;
+    }
+
+    /// After a `step` whose tracking image `trackingImage` left partial,
+    /// computes the rest of `small` (for other users of the image).
+    pub fn completeTrackingImage(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), small: Image(u8)) !void {
+        if (!self.partial or self.image_for != self.stats.frames) return;
+        try self.ensure(exec, frame, small, &.{.{ 0, 0, small.width, small.height }});
+        self.partial = false;
     }
 
     /// Whether the next step probably detects on the whole frame (the
@@ -925,9 +993,14 @@ pub const FaceTracker = struct {
         _ = clock.lap();
         s.frames += 1;
         self.since += 1;
+        if (self.image_for != s.frames) {
+            // `small` did not come from `trackingImage` for this frame.
+            self.prepared = false;
+            self.partial = false;
+        }
 
         // ---- every face follows its MOSSE filter
-        self.updateFilters(exec, small);
+        try self.updateFilters(exec, frame, small);
 
         // ---- is a detection due, and of what kind?
         var weak = false;
@@ -942,8 +1015,10 @@ pub const FaceTracker = struct {
         } else if (self.since >= @max(1, self.opts.detect_every)) {
             const crops_ok = self.opts.level >= 2 and healthy and self.crops_in_row + 1 < @max(1, self.opts.full_every);
             what = if (crops_ok) .crops else .full;
-            if (self.opts.level >= 1 and healthy and self.ref_valid and self.since < self.opts.max_postpone and
-                self.changeSinceRef(small) < self.opts.still_threshold) what = .postponed;
+            if (self.opts.level >= 1 and healthy and self.ref_valid and self.since < self.opts.max_postpone) {
+                try self.grayRows(exec, frame, small, self.stillStride());
+                if (self.changeSinceRef(small) < self.opts.still_threshold) what = .postponed;
+            }
         }
         s.track_ms += clock.lap();
         self.last = what;
@@ -955,7 +1030,12 @@ pub const FaceTracker = struct {
         const t_convert = clock.lap();
         self.found.clearRetainingCapacity();
         if (what == .crops and !try self.detectCrops(exec, frame)) what = .full;
-        if (what == .full) try self.detectIn(exec, frame, 0, 0, self.det_w, self.det_h);
+        if (what == .full) {
+            // New faces start tracks anywhere: the whole tracking image
+            // (with the detector input when it can come from the same pass).
+            if (self.partial) try self.completeGray(exec, frame, small);
+            try self.detectIn(exec, frame, 0, 0, self.det_w, self.det_h);
+        }
         const t_det = t_convert + clock.lap();
         s.convert_ms += t_convert;
         s.detect_frames += 1;
@@ -972,8 +1052,14 @@ pub const FaceTracker = struct {
         self.last_detect_ms = t_det;
 
         // ---- correct the tracks, start new ones, drop lost ones
+        if (self.partial) {
+            self.rects.clearRetainingCapacity();
+            for (self.found.items) |f| try self.rects.append(self.gpa, visar.video.Mosse.initBounds(self.toSmall(self.clampBox(faceBox(f))), .{}, small.width, small.height));
+            try self.ensure(exec, frame, small, self.rects.items);
+        }
         try self.match(small, what == .full);
         self.since = 0;
+        try self.grayRows(exec, frame, small, self.stillStride());
         self.snapshot(small);
         s.track_ms += clock.lap();
         s.max_faces = @max(s.max_faces, @as(u32, @intCast(self.tracks.items.len)));
@@ -986,7 +1072,8 @@ pub const FaceTracker = struct {
         try ip.cvtColor(exec, self.det_bgra, self.det_bgr, .bgra2bgr);
     }
 
-    fn updateFilters(self: *FaceTracker, exec: visar.Exec, small: Image(u8)) void {
+    fn updateFilters(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), small: Image(u8)) !void {
+        if (self.partial) return self.updateFiltersPartial(exec, frame, small);
         const Job = struct { tracks: []FaceTrack, gray: Image(u8), k: f32 };
         exec.parallelFor(self.tracks.items.len, 1, Job{ .tracks = self.tracks.items, .gray = small, .k = @floatFromInt(self.k) }, struct {
             fn run(j: Job, a: usize, b: usize) void {
@@ -999,6 +1086,123 @@ pub const FaceTracker = struct {
                 }
             }
         }.run);
+    }
+
+    /// `updateFilters` on a partial tracking image: each filter's search
+    /// window computed, the searches, the windows where they found the
+    /// faces computed, the filters' updates there (the results are those of
+    /// `Mosse.update` on the whole image).
+    fn updateFiltersPartial(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), small: Image(u8)) !void {
+        const gpa = self.gpa;
+        const n = self.tracks.items.len;
+        if (n == 0) return;
+        try self.found_at.resize(gpa, n);
+        self.rects.clearRetainingCapacity();
+        for (self.tracks.items) |t| try self.rects.append(gpa, t.mosse.searchBounds(small.width, small.height));
+        try self.ensure(exec, frame, small, self.rects.items);
+        const Job = struct { tracks: []FaceTrack, found: []visar.video.mosse.Mosse.Found, gray: Image(u8), k: f32 };
+        const job: Job = .{ .tracks = self.tracks.items, .found = self.found_at.items, .gray = small, .k = @floatFromInt(self.k) };
+        exec.parallelFor(n, 1, job, struct {
+            fn run(j: Job, a: usize, b: usize) void {
+                for (j.tracks[a..b], j.found[a..b]) |*t, *f| {
+                    const m = &t.mosse;
+                    f.* = m.search(j.gray) catch .{ .cx = m.cx, .cy = m.cy, .w = m.w, .h = m.h, .psr = 0, .ok = false };
+                }
+            }
+        }.run);
+        self.rects.clearRetainingCapacity();
+        for (self.tracks.items, self.found_at.items) |t, f| try self.rects.append(gpa, t.mosse.commitBounds(f, small.width, small.height));
+        try self.ensure(exec, frame, small, self.rects.items);
+        exec.parallelFor(n, 1, job, struct {
+            fn run(j: Job, a: usize, b: usize) void {
+                for (j.tracks[a..b], j.found[a..b]) |*t, f| {
+                    const r = t.mosse.commit(j.gray, f) catch visar.video.mosse.Result{ .box = t.mosse.box(), .psr = 0, .ok = false };
+                    t.box = .{ .x = r.box.x * j.k, .y = r.box.y * j.k, .w = r.box.w * j.k, .h = r.box.h * j.k };
+                    t.psr = r.psr;
+                    t.ok = r.ok;
+                    t.frames += 1;
+                }
+            }
+        }.run);
+    }
+
+    /// Computes the tiles of the partial tracking image under `rects`
+    /// ({ x0, y0, x1, y1 } in tracking pixels, ends exclusive) that are not
+    /// computed yet (nothing when the image is whole).
+    fn ensure(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), small: Image(u8), rects: []const [4]u32) !void {
+        if (!self.partial) return;
+        const tx = self.tiles_x;
+        for (rects) |r| {
+            if (r[0] >= r[2] or r[1] >= r[3]) continue;
+            const ty1 = @min(self.tiles_y, (r[3] + tile_h - 1) / tile_h);
+            const tx1 = @min(tx, (r[2] + tile_w - 1) / tile_w);
+            for (r[1] / tile_h..ty1) |ty| for (self.tiles[ty * tx ..][r[0] / tile_w .. tx1]) |*t| {
+                if (t.* == 0) t.* = 2;
+            };
+        }
+        // Runs of wanted tiles, row by row.
+        self.runs.clearRetainingCapacity();
+        for (0..self.tiles_y) |ty| {
+            const row = self.tiles[ty * tx ..][0..tx];
+            var x: u32 = 0;
+            while (x < tx) {
+                if (row[x] != 2) {
+                    x += 1;
+                    continue;
+                }
+                const x0 = x;
+                while (x < tx and row[x] == 2) : (x += 1) row[x] = 1;
+                try self.runs.append(self.gpa, .{ @intCast(ty), x0, x });
+            }
+        }
+        if (self.runs.items.len == 0) return;
+        const Job = struct { runs: [][3]u32, frame: Image(u8), small: Image(u8), k: u32 };
+        exec.parallelFor(self.runs.items.len, 1, Job{ .runs = self.runs.items, .frame = frame, .small = small, .k = self.k }, struct {
+            fn run(j: Job, a: usize, b: usize) void {
+                for (j.runs[a..b]) |r| {
+                    const x0 = r[1] * tile_w;
+                    const y0 = r[0] * tile_h;
+                    const x1 = @min(j.small.width, r[2] * tile_w);
+                    const y1 = @min(j.small.height, y0 + tile_h);
+                    visar.videoio.frame.grayDownsampleRect(.serial, j.frame, j.small, j.k, x0, y0, x1 - x0, y1 - y0) catch unreachable;
+                }
+            }
+        }.run);
+        for (self.runs.items) |r| {
+            const w = @min(small.width, r[2] * tile_w) - r[1] * tile_w;
+            const h = @min(small.height, r[0] * tile_h + tile_h) - r[0] * tile_h;
+            self.stats.gray_px += @as(u64, w) * h;
+        }
+    }
+
+    /// Computes every `stride`-th row of a partial tracking image (nothing
+    /// when it is whole).
+    fn grayRows(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), small: Image(u8), stride: u32) !void {
+        if (!self.partial) return;
+        const n = (small.height + stride - 1) / stride;
+        const Job = struct { frame: Image(u8), small: Image(u8), k: u32, stride: u32 };
+        exec.parallelFor(n, 4, Job{ .frame = frame, .small = small, .k = self.k, .stride = stride }, struct {
+            fn run(j: Job, a: usize, b: usize) void {
+                for (a..b) |i| {
+                    const y: u32 = @as(u32, @intCast(i)) * j.stride;
+                    visar.videoio.frame.grayDownsampleRect(.serial, j.frame, j.small, j.k, 0, y, j.small.width, 1) catch unreachable;
+                }
+            }
+        }.run);
+        self.stats.gray_px += @as(u64, n) * small.width;
+    }
+
+    /// The whole tracking image for a partial one, from the same pass as
+    /// the whole-frame detector's input when it can.
+    fn completeGray(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), small: Image(u8)) !void {
+        self.partial = false;
+        self.stats.gray_px += @as(u64, small.width) * small.height;
+        if (self.fused != null and try self.plans.items[0].det.prepareWithGray(exec, frame, small)) {
+            self.prepared = true;
+            self.stats.fused_preps += 1;
+            return;
+        }
+        try visar.videoio.frame.grayDownsample(exec, frame, small, self.k);
     }
 
     /// Runs the detector on the (x, y, w, h) window of the detector input
@@ -1167,15 +1371,21 @@ pub const FaceTracker = struct {
         return .{ .x = b.x / k, .y = b.y / k, .w = @max(4, b.w / k), .h = @max(4, b.h / k) };
     }
 
-    /// Mean absolute difference between every 4th row of `small` and the
-    /// same rows at the last detection.
+    /// The change check's row stride (`ref` has room for every 4th row).
+    fn stillStride(self: *const FaceTracker) u32 {
+        return @max(4, self.opts.still_stride);
+    }
+
+    /// Mean absolute difference between every `still_stride`-th row of
+    /// `small` and the same rows at the last detection.
     fn changeSinceRef(self: *const FaceTracker, small: Image(u8)) f32 {
         const w = small.width;
+        const stride = self.stillStride();
         var sum: u64 = 0;
         var n: u64 = 0;
         var y: usize = 0;
         var off: usize = 0;
-        while (y < small.height) : (y += 4) {
+        while (y < small.height) : (y += stride) {
             sum += sad(small.row(y)[0..w], self.ref[off..][0..w]);
             off += w;
             n += w;
@@ -1185,9 +1395,10 @@ pub const FaceTracker = struct {
 
     fn snapshot(self: *FaceTracker, small: Image(u8)) void {
         const w = small.width;
+        const stride = self.stillStride();
         var y: usize = 0;
         var off: usize = 0;
-        while (y < small.height) : (y += 4) {
+        while (y < small.height) : (y += stride) {
             @memcpy(self.ref[off..][0..w], small.row(y)[0..w]);
             off += w;
         }
@@ -1424,27 +1635,46 @@ test "face tracking follows a moving selfie with few detector runs" {
     const k = 2;
     var scene = try StillScene.init(gpa, exec, decoded.u8, W, H);
     defer scene.deinit();
+    // `ft` computes the tracking image only where it reads it; `whole`
+    // computes all of it every frame. Both must track the same.
     var ft = try FaceTracker.create(gpa, model, W, H, k, .{ .face_width = 640 });
     defer ft.deinit();
+    var whole = try FaceTracker.create(gpa, model, W, H, k, .{ .face_width = 640, .partial_gray = false });
+    defer whole.deinit();
     var frame = try Image(u8).init(gpa, W, H, 4);
     defer frame.deinit(gpa);
     var small = try Image(u8).init(gpa, W / k, H / k, 1);
     defer small.deinit(gpa);
+    var small_whole = try Image(u8).init(gpa, W / k, H / k, 1);
+    defer small_whole.deinit(gpa);
     var ref = try Image(u8).init(gpa, W / k, H / k, 1);
     defer ref.deinit(gpa);
     var truth: StillTruth = .{};
     const n = StillScene.period + 60;
-    for (0..n) |_| {
+    for (0..n) |i| {
         const off = scene.render(frame);
+        // Whatever the partial image does not compute must not matter.
+        small.fill(@intCast(i * 37 % 256));
         try ft.trackingImage(exec, frame, small);
+        try whole.trackingImage(exec, frame, small_whole);
         // The same tracking image whether or not it came with the detector input.
         try visar.videoio.frame.grayDownsample(exec, frame, ref, k);
+        try std.testing.expectEqualSlices(u8, ref.slice(), small_whole.slice());
+        const what = try ft.step(exec, std.testing.io, frame, small);
+        try std.testing.expectEqual(what, try whole.step(exec, std.testing.io, frame, small_whole));
+        try std.testing.expectEqual(whole.faces().len, ft.faces().len);
+        for (ft.faces(), whole.faces()) |a, b| {
+            try std.testing.expectEqual(b.box, a.box);
+            try std.testing.expectEqual(b.psr, a.psr);
+        }
+        // Completed, the partial image is the whole one.
+        try ft.completeTrackingImage(exec, frame, small);
         try std.testing.expectEqualSlices(u8, ref.slice(), small.slice());
-        _ = try ft.step(exec, std.testing.io, frame, small);
         truth.score(ft.faces(), off);
     }
     const s = ft.stats;
     try std.testing.expect(s.fused_preps > s.fused_unused);
+    try std.testing.expect(s.partial_frames > n / 2);
     try std.testing.expect(truth.n >= 1);
     // Every frame has a face that moved with the image.
     try std.testing.expectEqual(@as(u64, n), truth.frames);

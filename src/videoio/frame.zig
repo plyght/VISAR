@@ -173,6 +173,19 @@ pub fn grayDownsample(exec: Exec, src: Image(u8), dst: Image(u8), k: u32) error{
     if (src.channels == 4) exec.parallelFor(dst.height, 8, c, Kernel(4).run) else exec.parallelFor(dst.height, 8, c, Kernel(3).run);
 }
 
+/// The (x, y, w, h) window of `grayDownsample`'s output (dst pixels): only
+/// the k x k source blocks under it are read, and each pixel is bit-identical
+/// to the one the whole-image call writes (every output depends on its own
+/// block only). The rest of `dst` is left as it is.
+pub fn grayDownsampleRect(exec: Exec, src: Image(u8), dst: Image(u8), k: u32, x: u32, y: u32, w: u32, h: u32) error{ SizeMismatch, OutOfBounds }!void {
+    if (k == 0 or k > 16 or dst.channels != 1 or (src.channels != 3 and src.channels != 4)) return error.SizeMismatch;
+    if (dst.width != src.width / k or dst.height != src.height / k) return error.SizeMismatch;
+    if (w == 0 or h == 0) return;
+    const d = dst.roi(x, y, w, h) catch return error.OutOfBounds;
+    const s = src.roi(x * k, y * k, w * k, h * k) catch return error.OutOfBounds;
+    grayDownsample(exec, s, d, k) catch unreachable;
+}
+
 const KernelCtx = struct { src: Image(u8), dst: Image(u8), k: u32 };
 
 /// BT.601 luma weights in 14-bit fixed point (OpenCV's), for B, G and R.
@@ -398,6 +411,36 @@ test "grayDownsample matches cvtColor + area resize" {
             defer ref.deinit(gpa);
             try imgproc.cvtColor(.serial, src, ref, if (cn == 4) .bgra2gray else .bgr2gray);
             for (ref.slice(), dst.slice()) |r, d| try std.testing.expect(@abs(@as(i32, r) - d) <= 1);
+        }
+    };
+}
+
+test "grayDownsampleRect equals the whole image in its window" {
+    const gpa = std.testing.allocator;
+    inline for (.{ 4, 3 }) |cn| for ([_]u32{ 1, 2, 3, 5, 6, 8 }) |k| {
+        const W = 61 * k + 3;
+        const H = 23 * k + 1;
+        var src = try Image(u8).init(gpa, W, H, cn);
+        defer src.deinit(gpa);
+        var prng = std.Random.DefaultPrng.init(k * 7 + cn);
+        const rnd = prng.random();
+        rnd.bytes(src.slice());
+        var want = try Image(u8).init(gpa, W / k, H / k, 1);
+        defer want.deinit(gpa);
+        try grayDownsample(.serial, src, want, k);
+        var got = try Image(u8).init(gpa, W / k, H / k, 1);
+        defer got.deinit(gpa);
+        for (0..40) |_| {
+            got.fill(0);
+            const x = rnd.uintLessThan(u32, want.width);
+            const y = rnd.uintLessThan(u32, want.height);
+            const w = 1 + rnd.uintLessThan(u32, want.width - x);
+            const h = 1 + rnd.uintLessThan(u32, want.height - y);
+            try grayDownsampleRect(.serial, src, got, k, x, y, w, h);
+            for (0..want.height) |yy| for (0..want.width) |xx| {
+                const inside = xx >= x and xx < x + w and yy >= y and yy < y + h;
+                try std.testing.expectEqual(if (inside) want.at(xx, yy, 0) else 0, got.at(xx, yy, 0));
+            };
         }
     };
 }
