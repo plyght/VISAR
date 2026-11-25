@@ -19,6 +19,7 @@ pub const pyramid = @import("pyramid.zig");
 pub const corner = @import("corner.zig");
 pub const subpix = @import("subpix.zig");
 pub const lab = @import("lab.zig");
+pub const bilateral = @import("bilateral.zig");
 
 pub const Border = border.Border;
 
@@ -33,6 +34,7 @@ pub const boxFilter = filter.boxFilter;
 pub const blur = filter.blur;
 pub const sobel = filter.sobel;
 pub const sepFilter2D = filter.sepFilter2D;
+pub const bilateralFilter = bilateral.bilateralFilter;
 
 pub const ThresholdType = threshold_mod.Type;
 pub const threshold = threshold_mod.threshold;

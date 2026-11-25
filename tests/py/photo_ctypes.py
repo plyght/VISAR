@@ -71,3 +71,12 @@ def pencil_sketch(src, sigma_s=60, sigma_r=0.07, shade_factor=0.02):
     _check(lib.visar_pencil_sketch(ctypes.byref(desc(src)), ctypes.byref(desc(gray)), ctypes.byref(desc(color)),
                                    float(sigma_s), float(sigma_r), float(shade_factor)))
     return gray, color
+
+
+lib.visar_bilateral_filter.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_double, ctypes.c_double,
+                                       ctypes.c_int]
+
+
+def bilateral_filter(src, d, sigma_color, sigma_space, border=4):
+    """cv2.bilateralFilter(src, d, sigmaColor, sigmaSpace, borderType=border)."""
+    return _run(lib.visar_bilateral_filter, src, int(d), float(sigma_color), float(sigma_space), int(border))

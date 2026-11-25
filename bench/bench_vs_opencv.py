@@ -140,6 +140,13 @@ def photo_cases():
             for img, kind in ((c, "BGR"), (g, "gray")):
                 yield f"inpaint {name} r3 5% {kind} {w}x{h}", (lambda img=img, f=flags, m=m: ph.inpaint(img, m, 3, f)), \
                     (lambda img=img, f=flags, m=m: cv2.inpaint(img, m, 3, f))
+        s = cv2.GaussianBlur(c, (0, 0), 2)
+        yield f"edgePreservingFilter RECURS {w}x{h}", (lambda s=s: ph.edge_preserving_filter(s, 1)), \
+            (lambda s=s: cv2.edgePreservingFilter(s, flags=cv2.RECURS_FILTER))
+        yield f"edgePreservingFilter NORMCONV {w}x{h}", (lambda s=s: ph.edge_preserving_filter(s, 2)), \
+            (lambda s=s: cv2.edgePreservingFilter(s, flags=cv2.NORMCONV_FILTER))
+        yield f"stylization {w}x{h}", (lambda s=s: ph.stylization(s)), (lambda s=s: cv2.stylization(s))
+        yield f"pencilSketch {w}x{h}", (lambda s=s: ph.pencil_sketch(s)), (lambda s=s: cv2.pencilSketch(s))
 
 
 def feature_image(h, w, seed=0):

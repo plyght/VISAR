@@ -97,3 +97,12 @@ export fn visar_pencil_sketch(src: *const capi.CImage, gray: *const capi.CImage,
     const c = typed(u8, color) catch |e| return fail(e);
     return run(photo.pencilSketch(gpa, s, g, c, sigma_s, sigma_r, shade_factor));
 }
+
+/// bilateralFilter: VISAR_8U, 1 or 3 channels; dst must not be src.
+/// border: OpenCV's BORDER_* (not WRAP).
+export fn visar_bilateral_filter(src: *const capi.CImage, dst: *const capi.CImage, d: c_int, sigma_color: f64, sigma_space: f64, border: c_int) c_int {
+    const s = typed(u8, src) catch |e| return fail(e);
+    const t = typed(u8, dst) catch |e| return fail(e);
+    const b = std.enums.fromInt(visar.imgproc.Border, border) orelse return fail(error.InvalidArgument);
+    return run(visar.imgproc.bilateralFilter(exec(), gpa, s, t, .{ .d = d, .sigma_color = sigma_color, .sigma_space = sigma_space, .border = b }));
+}

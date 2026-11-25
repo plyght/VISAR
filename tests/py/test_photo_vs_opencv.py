@@ -108,12 +108,36 @@ def inpaint_cases():
             run(f"inpaint {flags} {name} mask", lambda m=m, flags=flags: (ph.inpaint(g, m, 3, flags), cv2.inpaint(g, m, 3, flags)))
 
 
+def npr_cases():
+    """Domain-transform filters: OpenCV's float operations per sample, but
+    OpenCV raises the feedback coefficient with the C library's powf and
+    (stylization) takes Sobel magnitudes with fused multiply-adds, so a few
+    pixels in 10^5 may differ by one level."""
+    tol, pct = 1, 0.01
+    for (h, w) in [(480, 640), (37, 53), (720, 1280), (100, 120)]:
+        rough = noisy(h, w, 3, seed=w)
+        smooth = cv2.GaussianBlur(rough, (0, 0), 2)
+        for img, kind in ((rough, "noisy"), (smooth, "smooth")):
+            for flags, fname in ((cv2.RECURS_FILTER, "RECURS"), (cv2.NORMCONV_FILTER, "NORMCONV")):
+                for ss, sr in ((60, 0.4), (20, 0.1)):
+                    run(f"edgePreservingFilter {fname} {w}x{h} {kind} s={ss} r={sr}",
+                        lambda img=img, f=flags, ss=ss, sr=sr: (ph.edge_preserving_filter(img, f, ss, sr),
+                                                                cv2.edgePreservingFilter(img, flags=f, sigma_s=ss, sigma_r=sr)),
+                        tol, pct)
+            run(f"stylization {w}x{h} {kind}", lambda img=img: (ph.stylization(img), cv2.stylization(img)), tol, pct)
+            run(f"pencilSketch gray {w}x{h} {kind}", lambda img=img: (ph.pencil_sketch(img)[0], cv2.pencilSketch(img)[0]),
+                tol, pct)
+            run(f"pencilSketch color {w}x{h} {kind}",
+                lambda img=img: (ph.pencil_sketch(img)[1], cv2.pencilSketch(img)[1]), tol, pct)
+
+
 def main():
     vs.set_num_threads(0)
     print(f"VISAR {vs.version()} ({vs.lib.visar_build_info().decode()}) vs OpenCV {cv2.__version__}")
     lab_cases()
     nlm_cases()
     inpaint_cases()
+    npr_cases()
     width = max(len(r[0]) for r in results)
     failed = [r for r in results if not r[3]]
     for name, mx, frac, ok in results:
