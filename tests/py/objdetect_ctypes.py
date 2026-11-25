@@ -181,7 +181,8 @@ def aruco_draw(img, corners, ids=None, color=(0, 255, 0)):
         ida = np.ascontiguousarray(np.array(ids, np.int32).reshape(-1))
         idp = ida.ctypes.data
     col = (ctypes.c_double * 3)(*[float(x) for x in color])
-    _check(lib.visar_aruco_draw(ctypes.byref(desc(img)), flat.ctypes.data, ctypes.c_void_p(idp), ctypes.c_size_t(n), col))
+    _check(lib.visar_aruco_draw(ctypes.byref(desc(img)), ctypes.c_void_p(flat.ctypes.data), ctypes.c_void_p(idp),
+                                ctypes.c_size_t(n), col))
     return img
 
 
