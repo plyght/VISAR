@@ -162,6 +162,30 @@ void visar_image_free(visar_image *img);
 int visar_imencode(const char *ext, const visar_image *img, int bgr, int quality, uint8_t **out, size_t *out_len);
 void visar_free(uint8_t *p, size_t len);
 
+/* videoio: video files, like cv2.VideoCapture / cv2.VideoWriter. Reading: .avi (Motion-JPEG,
+   uncompressed RGB, I420/YV12, Y800) and .y4m everywhere; .mp4/.mov (H.264, HEVC, ...) on macOS
+   through AVFoundation (elsewhere VISAR_UNSUPPORTED, and visar_last_error() says how to convert the
+   file with ffmpeg). read() fills a caller-owned 8U image of the video's size: 3 channels BGR,
+   4 BGRA or 1 gray; *got is 0 at the end. get/set take cv2.CAP_PROP_* numbers: 0 POS_MSEC,
+   1 POS_FRAMES (set = seek), 3 FRAME_WIDTH, 4 FRAME_HEIGHT, 5 FPS, 6 FOURCC, 7 FRAME_COUNT
+   (-1 when unknown). */
+typedef struct visar_video_capture visar_video_capture;
+int visar_video_capture_open(const char *path, visar_video_capture **out);
+void visar_video_capture_free(visar_video_capture *c);
+int visar_video_capture_read(visar_video_capture *c, const visar_image *dst, int *got);
+double visar_video_capture_get(visar_video_capture *c, int prop);
+int visar_video_capture_set(visar_video_capture *c, int prop, double value);
+const char *visar_video_capture_backend(visar_video_capture *c); /* "AVI", "YUV4MPEG2", "AVFoundation" */
+/* Writing: .avi (fourcc 'MJPG' as cv2.VideoWriter_fourcc builds it: Motion-JPEG, OpenDML past 1 GB;
+   0: uncompressed BGR) or .y4m ('I420'); fourcc -1 picks the extension's default. quality 1-100
+   for Motion-JPEG (<= 0: 95). Frames are 8U BGR, BGRA or gray of the given size. close() finishes
+   the file and frees the writer, also when it fails. */
+typedef struct visar_video_writer visar_video_writer;
+int visar_video_writer_open(const char *path, int fourcc, double fps, int width, int height, int quality,
+                            visar_video_writer **out);
+int visar_video_writer_write(visar_video_writer *w, const visar_image *frame);
+int visar_video_writer_close(visar_video_writer *w);
+
 /* dnn: ONNX inference (f32). Model bytes are copied. A net is planned for one input shape;
    the input buffer (plain NCHW) and outputs live inside the net and stay valid until the next plan. */
 typedef struct visar_net visar_net;

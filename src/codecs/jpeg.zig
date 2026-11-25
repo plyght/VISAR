@@ -18,6 +18,7 @@ const enc = @import("jpeg/encode.zig");
 
 pub const Info = dec.Info;
 pub const info = dec.info;
+pub const decodeInto = dec.decodeInto;
 pub const orientation = dec.orientation;
 pub const Subsampling = enc.Subsampling;
 pub const EncodeExtra = enc.Options;
@@ -95,6 +96,40 @@ test "jpeg round trip color" {
             try testing.expectEqual(@as(u16, 3), o.channels);
             if (sz[0] >= 17) try testing.expect(psnr(img, o) > 28);
         }
+    }
+}
+
+test "jpeg decodeInto matches decode" {
+    const gpa = testing.allocator;
+    var rgb = try synthetic(gpa, 37, 21, 3);
+    defer rgb.deinit(gpa);
+    var gray = try synthetic(gpa, 37, 21, 1);
+    defer gray.deinit(gpa);
+    for ([_]common.Image(u8){ rgb, gray }) |src| {
+        const bytes = try encode(gpa, .{ .u8 = src }, .{ .quality = 90 });
+        defer gpa.free(bytes);
+        var want = try decode(gpa, bytes, .{ .mode = .color, .order = .bgr });
+        defer want.deinit(gpa);
+        const w = want.as(u8).?;
+        // Into a strided BGR view, a BGRA image and a gray one.
+        var big = try common.Image(u8).init(gpa, 40, 21, 3);
+        defer big.deinit(gpa);
+        const view = try common.Image(u8).fromSliceStrided(big.owned.?, 37, 21, 3, 40 * 3);
+        try decodeInto(gpa, bytes, view, .bgr, 1 << 30);
+        for (0..21) |y| try testing.expectEqualSlices(u8, w.row(y), view.row(y));
+        var bgra = try common.Image(u8).init(gpa, 37, 21, 4);
+        defer bgra.deinit(gpa);
+        try decodeInto(gpa, bytes, bgra, .bgr, 1 << 30);
+        for (0..21) |y| for (0..37) |x| {
+            try testing.expectEqualSlices(u8, w.row(y)[x * 3 ..][0..3], bgra.row(y)[x * 4 ..][0..3]);
+            try testing.expectEqual(@as(u8, 255), bgra.row(y)[x * 4 + 3]);
+        };
+        var g = try common.Image(u8).init(gpa, 37, 21, 1);
+        defer g.deinit(gpa);
+        try decodeInto(gpa, bytes, g, .bgr, 1 << 30);
+        var wrong = try common.Image(u8).init(gpa, 36, 21, 3);
+        defer wrong.deinit(gpa);
+        try testing.expectError(error.SizeMismatch, decodeInto(gpa, bytes, wrong, .bgr, 1 << 30));
     }
 }
 

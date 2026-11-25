@@ -1,5 +1,6 @@
 //! `visar faces`: YuNet face detection on an image, or face tracking
-//! through a video (a .y4m file, or several images as its frames).
+//! through a video (an .avi or .y4m file, .mp4 / .mov on macOS, or several
+//! images as its frames).
 //!
 //! An image goes through `visar.dnn.FaceDetector` once. A video goes
 //! through track_lib's `FaceTracker`, as `visar track --faces` runs it: the
@@ -7,7 +8,8 @@
 //! and mostly only around the tracked faces: --change-level), MOSSE filters
 //! in between. Faces are printed one per line (box, score and the five
 //! landmarks, in input pixels) or as JSON; --out writes the input with the
-//! faces drawn on it (an animated GIF for a video).
+//! faces drawn on it (for a video: an animated GIF, or a Motion-JPEG .avi /
+//! .y4m at full size).
 
 const std = @import("std");
 const visar = @import("visar");
@@ -23,10 +25,11 @@ const Image = visar.Image;
 const Face = visar.dnn.Face;
 const draw = visar.imgproc.draw;
 const y4m = visar.videoio.y4m;
+const capture = visar.videoio.capture;
 
 pub const opts = [_]args.Opt{
     .{ .long = "model", .value = "FILE", .help = "YuNet model (default: face_detection_yunet_2023mar.onnx in VISAR_MODELS)" },
-    .{ .long = "out", .value = "FILE", .help = "Write the input with the faces drawn (a GIF for a video); or -o" },
+    .{ .long = "out", .value = "FILE", .help = "Write the input with the faces drawn (video: .gif, .avi or .y4m); or -o" },
     .{ .long = "face-width", .value = "N", .help = "Detector width (default: image up to 1280, video 640; 0 = full size)" },
     .{ .long = "score", .value = "S", .help = "Lowest face score, 0-1 (default 0.9)" },
     .{ .long = "detect-every", .value = "N", .help = "Video: detector every N frames, MOSSE in between (default 4)" },
@@ -54,8 +57,8 @@ const Config = struct {
 pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     const paths = p.positionals.items;
     if (paths.len == 0) {
-        ctx.hint("e.g. 'visar faces selfie.jpg', 'visar faces clip.y4m --json' or 'visar faces f1.png f2.png f3.png'", .{});
-        return ctx.usage("faces needs an image, a .y4m video or several images (the frames of a video)", .{});
+        ctx.hint("e.g. 'visar faces selfie.jpg', 'visar faces clip.avi --json' or 'visar faces f1.png f2.png f3.png'", .{});
+        return ctx.usage("faces needs an image, a video (.avi, .y4m{s}) or several images (the frames of a video)", .{if (capture.native_supported) ", .mp4, .mov" else ""});
     }
     var cfg: Config = .{};
     if (p.value("face-width")) |v| cfg.face_width = try args.int(u32, ctx.diag, "--face-width", v, 0, 8192);
@@ -75,15 +78,22 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     const out_path = p.value("out") orelse ctx.output;
     for (paths) |path| if (std.mem.eql(u8, path, "-") and paths.len > 1) return ctx.usage("'-' (stdin) reads one image or video, not a frame of several", .{});
 
-    const video = paths.len > 1 or isY4mPath(paths[0]);
+    const video = paths.len > 1 or capture.isVideoPath(paths[0]);
     if (!video) for ([_][]const u8{ "detect-every", "change-level", "frames", "detect-slices" }) |o| {
         if (p.value(o) != null) ctx.warn("--{s} applies to videos; ignored for an image", .{o});
     };
     if (!video and p.flag("full-gray")) ctx.warn("--full-gray applies to videos; ignored for an image", .{});
 
     var out: ?imageio.Output = null;
+    var video_out: ?[]const u8 = null;
     if (out_path) |path| {
-        if (video) {
+        if (video and capture.kindFromExtension(path) != null) {
+            if (capture.kindFromExtension(path).? == .mp4) {
+                ctx.hint("write .avi (Motion-JPEG) or .y4m, or an animated .gif", .{});
+                return ctx.usage("VISAR does not write .mp4/.mov", .{});
+            }
+            video_out = path;
+        } else if (video) {
             if (ctx.format) |f| if (f != .gif) {
                 ctx.hint("a video is written as an animated GIF; drop --format", .{});
                 return ctx.usage("--format {s} does not apply to a video", .{@tagName(f)});
@@ -91,39 +101,28 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
             if (std.mem.eql(u8, path, "-")) return ctx.usage("--out needs a file name for a video", .{});
             ctx.format = .gif;
         }
-        out = try imageio.prepare(ctx, path);
+        if (video_out == null) out = try imageio.prepare(ctx, path);
     }
 
     const model = try loadModel(ctx, p.value("model"));
     defer ctx.gpa.free(model);
 
-    // '-': an image, or a .y4m video, from stdin.
+    // '-': an image, or a .y4m / .avi video, from stdin.
     if (std.mem.eql(u8, paths[0], "-")) {
         const bytes = try imageio.readAll(ctx, "-");
         defer ctx.gpa.free(bytes);
-        if (y4m.detect(bytes)) {
-            var r: Io.Reader = .fixed(bytes);
-            return runVideo(ctx, cfg, model, .{ .stream = &r }, "<stdin>", out);
+        if (y4m.detect(bytes) or visar.videoio.avi.detect(bytes)) {
+            return runVideo(ctx, cfg, model, .{ .memory = bytes }, "<stdin>", out, video_out);
         }
         var in = try imageio.decodeBytes(ctx, "-", bytes, .color);
         defer in.deinit(ctx.gpa);
         return runImage(ctx, cfg, model, in.img.u8, "<stdin>", out);
     }
-    if (paths.len > 1) return runVideo(ctx, cfg, model, .{ .images = paths }, paths[0], out);
-    if (video) {
-        const file = Io.Dir.cwd().openFile(ctx.io, paths[0], .{}) catch |e| return ctx.fail("cannot read '{s}': {s}", .{ paths[0], cx.describe(e) });
-        defer file.close(ctx.io);
-        var buf: [64 * 1024]u8 = undefined;
-        var fr = file.readerStreaming(ctx.io, &buf);
-        return runVideo(ctx, cfg, model, .{ .stream = &fr.interface }, paths[0], out);
-    }
+    if (paths.len > 1) return runVideo(ctx, cfg, model, .{ .images = paths }, paths[0], out, video_out);
+    if (video) return runVideo(ctx, cfg, model, .{ .path = paths[0] }, paths[0], out, video_out);
     var in = try imageio.load(ctx, paths[0], .color);
     defer in.deinit(ctx.gpa);
     return runImage(ctx, cfg, model, in.img.u8, paths[0], out);
-}
-
-fn isY4mPath(path: []const u8) bool {
-    return std.ascii.endsWithIgnoreCase(path, ".y4m");
 }
 
 /// The model bytes: --model, or the YuNet file in $VISAR_MODELS.
@@ -209,8 +208,10 @@ fn runImage(ctx: *Ctx, cfg: Config, model: []const u8, rgb: Image(u8), name: []c
 // ---------------------------------------------------------------------------
 
 const VideoIn = union(enum) {
-    /// A .y4m stream.
-    stream: *Io.Reader,
+    /// A video file (.avi, .y4m; .mp4 / .mov on macOS).
+    path: []const u8,
+    /// A whole .avi or .y4m file in memory (stdin).
+    memory: []const u8,
     /// Image files, one per frame.
     images: []const []const u8,
 };
@@ -218,7 +219,7 @@ const VideoIn = union(enum) {
 /// Frames of a video, as BGRA.
 const Frames = struct {
     ctx: *Ctx,
-    src: union(enum) { y4m: y4m.Reader, images: []const []const u8 },
+    src: union(enum) { cap: capture.VideoCapture, images: []const []const u8 },
     width: u32,
     height: u32,
     fps: f64 = 0,
@@ -228,13 +229,13 @@ const Frames = struct {
 
     fn open(ctx: *Ctx, in: VideoIn, name: []const u8) !Frames {
         switch (in) {
-            .stream => |r| {
-                const rd = y4m.Reader.init(ctx.gpa, r) catch |e| {
-                    if (e == error.Unsupported) ctx.hint("convert it: ffmpeg -i in.y4m -pix_fmt yuv420p out.y4m", .{});
-                    return ctx.fail("cannot read '{s}' as a YUV4MPEG2 video: {s}", .{ name, cx.describe(e) });
-                };
-                const fps: f64 = if (rd.fps_den > 0) @as(f64, @floatFromInt(rd.fps_num)) / @as(f64, @floatFromInt(rd.fps_den)) else 0;
-                return .{ .ctx = ctx, .src = .{ .y4m = rd }, .width = rd.width, .height = rd.height, .fps = fps };
+            .path, .memory => {
+                const c = switch (in) {
+                    .path => |path| capture.VideoCapture.open(ctx.gpa, ctx.io, path),
+                    .memory => |bytes| capture.VideoCapture.openMemory(ctx.gpa, bytes),
+                    else => unreachable,
+                } catch |e| return videoOpenFailed(ctx, name, e);
+                return .{ .ctx = ctx, .src = .{ .cap = c }, .width = c.width, .height = c.height, .fps = c.fps };
             },
             .images => |paths| {
                 var in0 = try imageio.load(ctx, paths[0], .color);
@@ -250,7 +251,7 @@ const Frames = struct {
 
     fn deinit(self: *Frames) void {
         switch (self.src) {
-            .y4m => |*r| r.deinit(),
+            .cap => |*c| c.close(),
             .images => {},
         }
         if (self.first) |*f| f.deinit(self.ctx.gpa);
@@ -261,7 +262,10 @@ const Frames = struct {
         const ctx = self.ctx;
         defer self.index += 1;
         switch (self.src) {
-            .y4m => |*r| return r.next(dst) catch |e| ctx.fail("cannot read frame {d} of '{s}': {s}", .{ self.index + 1, name, cx.describe(e) }),
+            .cap => |*c| return c.read(dst) catch |e| {
+                if (capture.detail().len > 0) ctx.hint("{s}", .{capture.detail()});
+                return ctx.fail("cannot read frame {d} of '{s}': {s}", .{ self.index + 1, name, cx.describe(e) });
+            },
             .images => |paths| {
                 if (self.index >= paths.len) return false;
                 if (self.index == 0) {
@@ -283,7 +287,18 @@ const Frames = struct {
     }
 };
 
-fn runVideo(ctx: *Ctx, cfg: Config, model: []const u8, in: VideoIn, name: []const u8, out: ?imageio.Output) !void {
+/// Explains why a video file did not open (with ffmpeg advice when it
+/// helps).
+pub fn videoOpenFailed(ctx: *Ctx, name: []const u8, e: anyerror) error{ Failed, Usage } {
+    if (capture.detail().len > 0) ctx.hint("{s}", .{capture.detail()});
+    return ctx.fail("cannot read '{s}' as a video: {s}", .{ name, switch (e) {
+        error.UnknownFormat => "not a video format VISAR reads",
+        error.Unsupported => "a codec or format VISAR cannot decode here",
+        else => cx.describe(e),
+    } });
+}
+
+fn runVideo(ctx: *Ctx, cfg: Config, model: []const u8, in: VideoIn, name: []const u8, out: ?imageio.Output, video_out: ?[]const u8) !void {
     const gpa = ctx.gpa;
     const exec = ctx.exec();
     var frames = try Frames.open(ctx, in, name);
@@ -304,6 +319,12 @@ fn runVideo(ctx: *Ctx, cfg: Config, model: []const u8, in: VideoIn, name: []cons
 
     var gif: ?Gif = if (out != null) try Gif.init(gpa, W, H) else null;
     defer if (gif) |*g| g.deinit(gpa);
+    var writer: ?capture.VideoWriter = null;
+    defer if (writer) |*vw| vw.close() catch {};
+    if (video_out) |path| writer = capture.VideoWriter.open(gpa, ctx.io, path, W, H, if (frames.fps > 0) frames.fps else 30, .{ .quality = 90 }) catch |e| {
+        if (capture.detail().len > 0) ctx.hint("{s}", .{capture.detail()});
+        return ctx.fail("cannot write '{s}': {s}", .{ path, cx.describe(e) });
+    };
     const delay_cs: u16 = if (frames.fps > 0) @intFromFloat(std.math.clamp(@round(100 / frames.fps), 2, 6000)) else 4;
 
     if (!ctx.quiet and !ctx.json) {
@@ -335,10 +356,9 @@ fn runVideo(ctx: *Ctx, cfg: Config, model: []const u8, in: VideoIn, name: []cons
             for (tracks, list) |t, *j| j.* = .of(trackFace(t), t.id);
             try json_frames.append(ctx.arena, .{ .frame = n, .step = @tagName(what), .ms = ms, .faces = list });
         } else for (tracks) |t| try writeFace(w, n, t.id, trackFace(t));
-        if (gif) |*g| {
-            for (tracks) |t| drawFace(frame, .bgr, trackFace(t), t.id, t.ok);
-            try g.add(exec, gpa, frame, delay_cs);
-        }
+        if (gif != null or writer != null) for (tracks) |t| drawFace(frame, .bgr, trackFace(t), t.id, t.ok);
+        if (gif) |*g| try g.add(exec, gpa, frame, delay_cs);
+        if (writer) |*vw| vw.write(frame) catch |e| return ctx.fail("cannot write frame {d} of '{s}': {s}", .{ n, video_out.?, cx.describe(e) });
     }
     if (n == 0) return ctx.fail("'{s}' has no frames", .{name});
     const s = ft.stats;
@@ -367,6 +387,17 @@ fn runVideo(ctx: *Ctx, cfg: Config, model: []const u8, in: VideoIn, name: []cons
         w.flush() catch {};
         ctx.se.print(ctx.err, .dim, "  {d} frames, faces on {d} · {d} face{s} seen · detector: {d} whole-frame, {d} crop-only, {d} postponed · {d:.2} ms/frame (max {d:.2})\n", .{ n, with_faces, summary.faces_seen, if (summary.faces_seen == 1) "" else "s", s.full_runs, s.crop_rounds, s.postponed, summary.mean_ms, ms_max }) catch {};
         ctx.err.flush() catch {};
+    }
+    if (writer) |vw_value| {
+        var vw = vw_value;
+        const frames_written = vw.frameCount();
+        writer = null;
+        vw.close() catch |e| return ctx.fail("cannot finish '{s}': {s}", .{ video_out.?, cx.describe(e) });
+        if (!ctx.quiet and !ctx.json) {
+            ctx.se.print(ctx.err, .ok, "  {s} {s}", .{ ctx.se.glyph("✓", "ok"), video_out.? }) catch {};
+            ctx.se.print(ctx.err, .dim, " · {d}x{d}, {d} frames\n", .{ W, H, frames_written }) catch {};
+            ctx.err.flush() catch {};
+        }
     }
     if (out) |o| {
         const bytes = try gif.?.anim.finish();

@@ -128,7 +128,53 @@ pub fn runInspect(ctx: *Ctx, p: *args.Parsed) !void {
 
 pub fn runConvert(ctx: *Ctx, p: *args.Parsed) !void {
     const io_paths = try inOut(ctx, p, "convert", 0);
+    const capture = visar.videoio.capture;
+    const in_video = capture.isVideoPath(io_paths.in);
+    const out_video = capture.isVideoPath(io_paths.out);
+    if (in_video or out_video) {
+        if (!in_video or !out_video) {
+            ctx.hint("a video converts to a video (.avi, .y4m), an image to an image", .{});
+            return ctx.usage("cannot convert '{s}' to '{s}'", .{ io_paths.in, io_paths.out });
+        }
+        return convertVideo(ctx, io_paths.in, io_paths.out);
+    }
     try process(ctx, io_paths.in, io_paths.out, &.{});
+}
+
+/// Video to video: every frame decoded and written again (.avi as
+/// Motion-JPEG at --quality, or .y4m).
+fn convertVideo(ctx: *Ctx, in: []const u8, out: []const u8) !void {
+    const capture = visar.videoio.capture;
+    const gpa = ctx.gpa;
+    var cap = capture.VideoCapture.open(gpa, ctx.io, in) catch |e| return @import("cmd_faces.zig").videoOpenFailed(ctx, in, e);
+    defer cap.close();
+    var frame = try visar.Image(u8).init(gpa, cap.width, cap.height, 3);
+    defer frame.deinit(gpa);
+    const fps = if (cap.fps > 0) cap.fps else 30;
+    var w = capture.VideoWriter.open(gpa, ctx.io, out, cap.width, cap.height, fps, .{ .quality = ctx.quality }) catch |e| {
+        if (capture.detail().len > 0) ctx.hint("{s}", .{capture.detail()});
+        return ctx.fail("cannot write '{s}': {s}", .{ out, cx.describe(e) });
+    };
+    var done = false;
+    defer if (!done) w.close() catch {};
+    const t0 = std.Io.Timestamp.now(ctx.io, .awake);
+    var n: u64 = 0;
+    while (cap.read(frame) catch |e| {
+        if (capture.detail().len > 0) ctx.hint("{s}", .{capture.detail()});
+        return ctx.fail("cannot read frame {d} of '{s}': {s}", .{ n + 1, in, cx.describe(e) });
+    }) {
+        w.write(frame) catch |e| return ctx.fail("cannot write frame {d} of '{s}': {s}", .{ n + 1, out, cx.describe(e) });
+        n += 1;
+    }
+    done = true;
+    w.close() catch |e| return ctx.fail("cannot finish '{s}': {s}", .{ out, cx.describe(e) });
+    if (n == 0) ctx.warn("'{s}' has no frames", .{in});
+    if (!ctx.quiet) {
+        const ms = term.msSince(ctx.io, t0);
+        ctx.se.print(ctx.err, .ok, "  {s} {s}", .{ ctx.se.glyph("✓", "ok"), out }) catch {};
+        ctx.se.print(ctx.err, .dim, " · {d}x{d}, {d} frames at {d:.2} fps from {s} ({s}) in {d:.0} ms\n", .{ cap.width, cap.height, n, fps, cap.backend.name(), std.mem.sliceTo(&cap.fourcc, 0), ms }) catch {};
+        ctx.err.flush() catch {};
+    }
 }
 
 pub fn runOp(ctx: *Ctx, p: *args.Parsed, kind: ops.Kind) !void {

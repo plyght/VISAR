@@ -295,6 +295,10 @@ const Decoder = struct {
     eobrun: u32 = 0,
 
     img: ?Image(u8) = null,
+    /// A caller's image to decode into (decodeInto), used when its size
+    /// and channel count are what the decoder produces.
+    into: ?Image(u8) = null,
+    into_used: bool = false,
     cs: ColorSpace = .gray,
     out_ch: u16 = 1,
     out_bgr: bool = false,
@@ -579,7 +583,11 @@ const Decoder = struct {
         for (d.comps[0..d.ncomp], 0..) |*c, i| {
             c.needed = !(want_gray and d.cs == .ycc and i != 0);
         }
-        d.img = try Image(u8).init(d.gpa, d.width, d.height, d.out_ch);
+        if (d.into) |dst| if (dst.width == d.width and dst.height == d.height and dst.channels == d.out_ch) {
+            d.img = dst;
+            d.into_used = true;
+        };
+        if (d.img == null) d.img = try Image(u8).init(d.gpa, d.width, d.height, d.out_ch);
 
         var max_dw: u32 = 0;
         for (d.comps[0..d.ncomp]) |*c| {
@@ -1357,6 +1365,57 @@ pub fn decode(gpa: Allocator, bytes: []const u8, opts: common.DecodeOptions) Dec
     var fo = opts;
     if (d.out_bgr) fo.order = .rgb;
     return common.finish(gpa, .{ .u8 = d.img.? }, fo);
+}
+
+/// Decodes into `dst` (8-bit, 1, 3 or 4 channels, the image's size) with
+/// the colour channels in `order`: straight into its rows when it has 3
+/// channels and the file is colour (the Motion-JPEG frame case), else
+/// through a temporary image. Alpha, when `dst` has it, is set to 255.
+/// error.SizeMismatch when the image's size is not `dst`'s.
+pub fn decodeInto(gpa: Allocator, bytes: []const u8, dst: Image(u8), order: common.Order, max_pixels: u64) DecodeError!void {
+    if (dst.channels != 1 and dst.channels != 3 and dst.channels != 4) return error.Unsupported;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const d = try arena_state.allocator().create(Decoder);
+    const mode: common.Mode = if (dst.channels == 1) .gray else .color;
+    d.* = .{ .arena = arena_state.allocator(), .gpa = gpa, .data = bytes, .opts = .{ .mode = mode, .order = order, .max_pixels = max_pixels }, .into = dst };
+    defer if (!d.into_used) if (d.img) |*im| im.deinit(gpa);
+    // The frame header decides the size; refuse a mismatch before decoding.
+    const inf = try info(bytes);
+    if (inf.width != dst.width or inf.height != dst.height) return error.SizeMismatch;
+    try d.run();
+    if (d.into_used) return;
+    // A gray file into colour, or colour into BGRA: convert.
+    const src = d.img.?;
+    if (src.width != dst.width or src.height != dst.height) return error.SizeMismatch;
+    // The decoder's 3-channel output is already in `order` when out_bgr or
+    // RGB was asked; gray needs no order.
+    const swap = src.channels == 3 and order == .bgr and !d.out_bgr;
+    for (0..dst.height) |y| {
+        const s = src.row(y);
+        const o = dst.row(y);
+        for (0..dst.width) |x| {
+            var px: [4]u8 = .{ 0, 0, 0, 255 };
+            switch (src.channels) {
+                1 => px = .{ s[x], s[x], s[x], 255 },
+                else => {
+                    px[0] = s[x * 3];
+                    px[1] = s[x * 3 + 1];
+                    px[2] = s[x * 3 + 2];
+                    if (swap) std.mem.swap(u8, &px[0], &px[2]);
+                },
+            }
+            switch (dst.channels) {
+                1 => o[x] = if (src.channels == 1) s[x] else blk: {
+                    const b: u32 = if (order == .bgr) px[0] else px[2];
+                    const r: u32 = if (order == .bgr) px[2] else px[0];
+                    break :blk @intCast((b * 7471 + @as(u32, px[1]) * 38470 + r * 19595 + 32768) >> 16);
+                },
+                3 => o[x * 3 ..][0..3].* = px[0..3].*,
+                else => o[x * 4 ..][0..4].* = px,
+            }
+        }
+    }
 }
 
 /// Reads width, height and component count without decoding.

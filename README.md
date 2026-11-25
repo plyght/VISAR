@@ -29,6 +29,7 @@ See [PRD.md](PRD.md) for the full scope and roadmap. VISAR is early: the roadmap
 | Codecs | PNG (all colour types and depths, Adam7; custom inflate), JPEG (in progress), QOI, PNM/PAM, BMP (incl. RLE), animated GIF (encode) |
 | dnn | ONNX inference engine (protobuf reader, graph IR, fusion passes, liveness memory plan with in-place concatenation, blocked-layout SIMD CPU kernels with row-streamed conv chains and cache-blocked GEMM-class convolutions; a Metal GPU backend on macOS that runs the whole plan in one command buffer, loaded at run time with no SDK); `FaceDetector` runs YuNet with results matching `cv2.FaceDetectorYN` and about 3.5x faster on CPU; `ObjectDetector` runs the Model Zoo's NanoDet and YOLOX (COCO) with the zoo pipelines' detections, faster than `cv2.dnn` |
 | Video | Background subtraction, multi-object tracker, MOSSE correlation tracker (follows a selected object, ~5000 updates/s per object with its three-scale search) |
+| Video I/O | `VideoCapture` / `VideoWriter`: AVI (Motion-JPEG, uncompressed, I420/YV12/Y800; idx1 and OpenDML indexes, seeking by frame) and YUV4MPEG2 in pure Zig on every platform; .mp4/.mov (H.264, HEVC) through AVFoundation on macOS; cameras (AVFoundation, V4L2) |
 | Interfaces | Zig module, C ABI, `visar` CLI (clig.dev-style: JSON output, helpful errors, pipelines, bench, demos) |
 
 ## Build
@@ -61,7 +62,8 @@ $ cat photo.png | visar gray - - --format png | visar inspect -
 $ visar demo track --out track.gif          # the demo above, on your machine
 $ visar bench --filter blur,resize          # time the kernels on this CPU
 $ visar faces group.jpg --out boxed.png     # YuNet faces: score, box and landmarks per line (or --json)
-$ visar faces clip.y4m --json               # tracked through a video (ffmpeg -i clip.mp4 clip.y4m)
+$ visar faces clip.avi --json               # tracked through a video (.avi, .y4m; .mp4/.mov on macOS)
+$ visar convert clip.mp4 clip.avi           # video to Motion-JPEG AVI (or .y4m)
 ```
 
 ### Live tracking and face tracking
@@ -79,12 +81,33 @@ Faces are detected with YuNet (`visar.dnn.FaceDetector`) and followed by MOSSE f
 visar track --faces face_detection_yunet_2023mar.onnx --source image:selfie.jpg --face-width 640 --headless --frames 600 --json
 ```
 
-`visar faces` runs the same detector and tracker on files: an image (one detection; `--out` draws the faces), or a video as a YUV4MPEG2 file or a list of frame images (the tracker with the same `--detect-every` / `--change-level` options; `--out` writes an annotated GIF). The model comes from `--model FILE` or `VISAR_MODELS`:
+`--source video:PATH` plays a video file through the pipeline instead (at its frame rate in a window, as fast as it decodes with `--headless`), and `--record FILE.avi` (or `.y4m`) writes the annotated frames at full size instead of a GIF.
+
+`visar faces` runs the same detector and tracker on files: an image (one detection; `--out` draws the faces), or a video (.avi, .y4m, .mp4/.mov on macOS, or a list of frame images; the tracker with the same `--detect-every` / `--change-level` options; `--out` writes an annotated GIF, or a full-size `.avi` / `.y4m`). The model comes from `--model FILE` or `VISAR_MODELS`:
 
 ```sh
 VISAR_MODELS=. visar faces selfie.jpg --json --out boxed.png
-ffmpeg -i clip.mp4 -pix_fmt yuv420p clip.y4m && VISAR_MODELS=. visar faces clip.y4m --out tracked.gif
+VISAR_MODELS=. visar faces clip.mp4 --out tracked.avi        # macOS; elsewhere convert first:
+ffmpeg -i clip.mp4 -c:v mjpeg -q:v 3 clip.avi && VISAR_MODELS=. visar faces clip.avi --out tracked.gif
 ```
+
+### Video files
+
+`visar.videoio.VideoCapture` and `VideoWriter` are OpenCV's VideoCapture/VideoWriter for files (also in the C ABI as `visar_video_capture_*` / `visar_video_writer_*`, with `cv2.CAP_PROP_*` numbers):
+
+| Format | Read | Write | Where |
+| --- | --- | --- | --- |
+| AVI, Motion-JPEG (`MJPG`, OpenCV's portable writer format) | yes | yes (default for `.avi`; OpenDML past 1 GB) | everywhere, pure Zig |
+| AVI, uncompressed BGR / I420 / YV12 / Y800 | yes | BGR (fourcc 0) | everywhere |
+| YUV4MPEG2 (`.y4m`) | yes | yes (4:2:0) | everywhere |
+| MP4 / QuickTime (H.264, HEVC, ...) | yes, hardware decoding | no | macOS (AVFoundation / VideoToolbox, loaded at run time); elsewhere an error that says how to convert with ffmpeg |
+
+Frames are read into a caller-owned BGR, BGRA or gray image; the frame count, rate and FourCC come from the file, and seeking is by frame number (AVI through its `idx1` or OpenDML index, rebuilt by scanning when a file was never finished; YUV4MPEG2 by arithmetic; MP4 by time). Files are treated as untrusted: every chunk size is bounds-checked, and truncated or corrupted files (fuzzed in the tests) give an error or fewer frames, never a crash. `zig build difftest` checks both directions against OpenCV: VISAR's AVIs open in `cv2.VideoCapture` (FFmpeg and OpenCV's own reader) with the right count and frames, and `cv2.VideoWriter('MJPG')` files (both backends) read in VISAR bit-identical to OpenCV's own MJPEG decode. Speed against OpenCV 5.0 for 16 frames of 1280x720 Motion-JPEG (x86_64, 4 cores; above 1x = VISAR faster):
+
+| | vs FFmpeg backend | vs OpenCV MJPEG backend |
+| --- | ---: | ---: |
+| read (open + decode every frame) | 1.62x | 1.21x |
+| write (encode q95 + mux) | 1.94x | 1.81x |
 
 ### 4K face detection: measured, and what 120 fps on an M3 needs
 
@@ -122,7 +145,7 @@ Before the partial gray image the steady state was 2.72 / 1.42 ms on macOS (1T /
 
 So on the M1-class runner the end-to-end detection of every 4K frame is at 7.9 ms on one thread (127 fps median, 7.1 ms best) and fits it easily with 3 threads (357 fps); the change-driven tracker needs about 1 ms per frame on one thread. *Extrapolation, not measured:* an M3 performance core runs scalar and NEON code roughly 1.3-1.4x faster than an M1's and a base M3 has 4 of them, so the one-thread end-to-end time would be about 6 ms (inside 8.3 ms with some headroom) and under 2 ms on the performance cores; 960x540 (about 14 ms on one M1 thread) needs 2-3 cores. The network is still 75% of the one-thread time, at about 65% of the core's FMA peak (the two row-streamed chains of 3x3/1x1 convs at full resolution: 1.5 and 2.0 ms of it; the first 3x3 stride-2 conv runs at about 75% of peak, the depthwise 3x3s at about 65%, the 1x1s at 75-90%); once detections are change-driven and the gray tracking image is computed only around the faces, the tracker no longer reads most of the 33 MB frame on most frames: what is left per frame is the MOSSE filters (a few 64x64 FFTs per face) and the amortised detections, each whole-frame one spread over 4 frames. The Metal backend ran YuNet in 2-4 ms on the runners' paravirtual GPU, which says nothing about a real M3 GPU.
 
-Commands: `info`, `inspect`, `convert`, `resize`, `rotate`, `flip`, `gray`, `blur`, `threshold`, `edges`, `equalize`, `morph`, `pipeline`, `bench`, `demo`, `track`. Every command takes `--json`, `--threads`, `-q` and `-v`. Errors come with a hint, and mistyped commands, options and file names get a "did you mean". An existing output file is never overwritten without `-f`. Run `visar help <command>` for examples.
+Commands: `info`, `inspect`, `convert` (images, and video to `.avi` / `.y4m`), `resize`, `rotate`, `flip`, `gray`, `blur`, `threshold`, `edges`, `equalize`, `morph`, `pipeline`, `bench`, `demo`, `track`. Every command takes `--json`, `--threads`, `-q` and `-v`. Errors come with a hint, and mistyped commands, options and file names get a "did you mean". An existing output file is never overwritten without `-f`. Run `visar help <command>` for examples.
 
 ## Use from Zig
 

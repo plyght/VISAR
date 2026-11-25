@@ -21,6 +21,9 @@
 //! tracked faces, or not at all while nothing changes, and MOSSE filters
 //! carry the faces in between. --source image:PATH moves a still image
 //! over a canvas, a source with a known motion to check this against.
+//! --source video:PATH plays a video file (.avi, .y4m; .mp4 / .mov on
+//! macOS) through the same pipeline, at its frame rate in a window and as
+//! fast as it goes with --headless, and stops at its end.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,6 +39,7 @@ const Io = std.Io;
 const Image = visar.Image;
 const videoio = visar.videoio;
 const camera = videoio.camera;
+const capture = videoio.capture;
 const FrameRing = videoio.FrameRing;
 const ui = visar.ui;
 const draw = visar.imgproc.draw;
@@ -44,11 +48,11 @@ pub const opts = [_]args.Opt{
     .{ .long = "camera", .value = "N", .help = "Camera number from --list-cameras (default: the default camera)" },
     .{ .long = "size", .value = "WxH", .help = "Largest frame size wanted (default 1280x720)" },
     .{ .long = "fps", .value = "N", .help = "Frame rate wanted (default: the camera's fastest; synthetic: 60)" },
-    .{ .long = "source", .value = "SRC", .help = "camera (default), synthetic (demo scene) or image:PATH (a moving still)" },
+    .{ .long = "source", .value = "SRC", .help = "camera (default), synthetic, image:PATH (a moving still) or video:PATH" },
     .{ .long = "headless", .help = "No window: print stats every second and a summary" },
     .{ .long = "frames", .short = 'n', .value = "N", .help = "Stop after N processed frames" },
     .{ .long = "detect-width", .value = "N", .help = "Width the detector works at (default 640; 0 = full size)" },
-    .{ .long = "record", .value = "FILE", .help = "Also write the annotated frames to an animated GIF; same as -o" },
+    .{ .long = "record", .value = "FILE", .help = "Also write the annotated frames: .gif, or .avi / .y4m (full size); same as -o" },
     .{ .long = "lock", .value = "X,Y,W,H", .help = "Lock onto the object in this box (frame pixels); repeatable" },
     .{ .long = "mode", .value = "MODE", .help = "both (default), motion, locks or faces (default with --faces); Tab cycles" },
     .{ .long = "faces", .value = "MODEL", .help = "Track faces with this YuNet model (face_detection_yunet_2023mar.onnx)" },
@@ -85,7 +89,7 @@ const lost_after = 10;
 /// The synthetic scene starts this many frames in, so objects are on screen.
 const synthetic_preroll = 100;
 
-pub const Source = enum { camera, synthetic, image };
+pub const Source = enum { camera, synthetic, image, video };
 
 pub const yunet_url = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx";
 
@@ -108,6 +112,13 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
             if (cfg.image_path.len == 0) {
                 ctx.hint("e.g. --source image:selfie.jpg", .{});
                 return ctx.usage("--source image: needs a file name", .{});
+            }
+        } else if (std.mem.startsWith(u8, v, "video:")) {
+            cfg.source = .video;
+            cfg.image_path = v["video:".len..];
+            if (cfg.image_path.len == 0) {
+                ctx.hint("e.g. --source video:clip.avi", .{});
+                return ctx.usage("--source video: needs a file name", .{});
             }
         } else if (std.mem.eql(u8, v, "image")) {
             ctx.hint("e.g. --source image:selfie.jpg", .{});
@@ -159,7 +170,13 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     if (p.value("record") != null and ctx.output != null) return ctx.usage("give the recording once, with --record or -o", .{});
     const record_path = p.value("record") orelse ctx.output;
     var record_out: ?imageio.Output = null;
-    if (record_path) |path| {
+    if (record_path) |path| if (capture.kindFromExtension(path)) |kind| {
+        if (kind == .mp4) {
+            ctx.hint("record to .avi (Motion-JPEG), .y4m or .gif", .{});
+            return ctx.usage("VISAR does not write .mp4/.mov", .{});
+        }
+        cfg.record_video = path;
+    } else {
         if (ctx.format) |f| if (f != .gif) {
             ctx.hint("recordings are animated GIFs; drop --format", .{});
             return ctx.usage("--format {s} does not apply to 'visar track'", .{@tagName(f)});
@@ -167,7 +184,7 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
         if (std.mem.eql(u8, path, "-")) return ctx.usage("--record needs a file name", .{});
         ctx.format = .gif;
         record_out = try imageio.prepare(ctx, path);
-    }
+    };
 
     if (cfg.source == .camera and !camera.supported) {
         ctx.hint("try 'visar track --source synthetic', which runs the tracker on a generated scene", .{});
@@ -196,8 +213,11 @@ const Config = struct {
     mode: Mode = .both,
     locks: [max_locks][4]f32 = undefined,
     lock_count: usize = 0,
+    /// The image (image:PATH) or video (video:PATH) source's file.
     image_path: []const u8 = "",
     faces_path: ?[]const u8 = null,
+    /// --record to a video file (.avi / .y4m) instead of a GIF.
+    record_video: ?[]const u8 = null,
     face: track.FaceOptions = .{},
 };
 
@@ -288,6 +308,11 @@ const Live = struct {
     /// Synthetic or image source (the producer thread owns it).
     scene: ?*track.Scene = null,
     still: ?*track.StillScene = null,
+    /// Video file source (the producer thread reads it).
+    video: ?*capture.VideoCapture = null,
+    /// The video source reached its end.
+    eof: std.atomic.Value(bool) = .init(false),
+    video_error: ?anyerror = null,
     synthetic_fps: ?f64 = null,
     hud_label: []const u8 = "",
     hud_cache: Hud,
@@ -416,6 +441,7 @@ fn syntheticMain(live: *Live) void {
             live.io.sleep(.fromMicroseconds(50), .awake) catch {};
             continue;
         }
+        if (live.eof.load(.acquire)) return;
         if (!produceSynthetic(live, rgb)) {
             // Every buffer is in use: the consumers are behind.
             live.io.sleep(.fromMicroseconds(200), .awake) catch {};
@@ -434,7 +460,17 @@ fn syntheticMain(live: *Live) void {
 fn produceSynthetic(live: *Live, rgb: Image(u8)) bool {
     const ring = live.ring;
     const i = ring.acquire() orelse return false;
-    if (live.still) |still| {
+    if (live.video) |v| {
+        const more = v.read(ring.image(i)) catch |e| blk: {
+            live.video_error = e;
+            break :blk false;
+        };
+        if (!more) {
+            ring.release(i);
+            live.eof.store(true, .release);
+            return true;
+        }
+    } else if (live.still) |still| {
         live.still_off[i] = still.render(ring.image(i));
     } else {
         live.scene.?.render(rgb, .fast);
@@ -453,7 +489,14 @@ fn produceSynthetic(live: *Live, rgb: Image(u8)) bool {
 
 fn workerMain(live: *Live) void {
     while (!live.shouldStop()) {
-        const i = live.ring.waitCaptured(live.io, 20 * std.time.ns_per_ms) orelse continue;
+        const i = live.ring.waitCaptured(live.io, 20 * std.time.ns_per_ms) orelse {
+            // A video source ended and its last frame is processed.
+            if (live.eof.load(.acquire) and live.ring.captured.load(.acquire) == videoio.frame.none) {
+                live.done.store(true, .release);
+                return;
+            }
+            continue;
+        };
         processOne(live, i) catch |e| {
             live.ring.release(i);
             live.worker_error = e;
@@ -861,10 +904,13 @@ fn drawTracks32(frame: Image(u8), tracker: visar.video.Tracker, k: f32, thick: i
     }
 }
 
+/// The annotated frames: an animated GIF (shrunk, at most
+/// `max_record_frames`), or a video file at full size.
 const Recorder = struct {
-    anim: visar.codecs.gif.Animation,
-    small: Image(u8),
-    delay_cs: u16,
+    anim: ?visar.codecs.gif.Animation = null,
+    small: ?Image(u8) = null,
+    video: ?capture.VideoWriter = null,
+    delay_cs: u16 = 4,
     frames: u32 = 0,
     full: bool = false,
     failed: ?anyerror = null,
@@ -882,21 +928,30 @@ const Recorder = struct {
     }
 
     fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
-        self.anim.deinit();
-        self.small.deinit(gpa);
+        if (self.anim) |*a| a.deinit();
+        if (self.small) |*sm| sm.deinit(gpa);
+        if (self.video) |*v| v.close() catch {};
     }
 
     fn add(self: *Recorder, live: *Live, frame: Image(u8)) void {
         if (self.full or self.failed != null) return;
+        if (self.video) |*v| {
+            v.write(frame) catch |e| {
+                self.failed = e;
+                return;
+            };
+            self.frames += 1;
+            return;
+        }
         if (self.frames >= max_record_frames) {
             self.full = true;
             return;
         }
-        visar.imgproc.resize(live.exec, live.gpa, frame, self.small, .area) catch |e| {
+        visar.imgproc.resize(live.exec, live.gpa, frame, self.small.?, .area) catch |e| {
             self.failed = e;
             return;
         };
-        self.anim.addFrame(self.small, self.delay_cs) catch |e| {
+        self.anim.?.addFrame(self.small.?, self.delay_cs) catch |e| {
             self.failed = e;
             return;
         };
@@ -926,6 +981,8 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     defer if (scene) |*s| s.deinit();
     var still: ?track.StillScene = null;
     defer if (still) |*s| s.deinit();
+    var video: ?capture.VideoCapture = null;
+    defer if (video) |*v| v.close();
     var W: u32 = cfg.width;
     var H: u32 = cfg.height;
     var input_fps: f64 = 0;
@@ -978,6 +1035,17 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
             pixel_format = "BGRA";
             input_fps = cfg.fps orelse if (cfg.headless) 0 else 60;
         },
+        .video => {
+            video = capture.VideoCapture.open(gpa, io, cfg.image_path) catch |e| return @import("cmd_faces.zig").videoOpenFailed(ctx, cfg.image_path, e);
+            const v = &video.?;
+            if (v.width < track.Options.min_width or v.height < track.Options.min_height) return ctx.fail("'{s}' is {d}x{d}; tracking needs at least {d}x{d}", .{ cfg.image_path, v.width, v.height, track.Options.min_width, track.Options.min_height });
+            W = v.width;
+            H = v.height;
+            device_name = imageio.displayName(cfg.image_path, "stdin");
+            pixel_format = &v.fourcc;
+            // In a window, the video's own rate; headless, as fast as it goes.
+            input_fps = cfg.fps orelse if (cfg.headless) 0 else (if (v.fps > 0) v.fps else 30);
+        },
     }
 
     var ring = FrameRing.init(gpa, W, H, 4) catch |e| return ctx.fail("cannot allocate frame buffers: {s}", .{cx.describe(e)});
@@ -1017,11 +1085,13 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
         .small = small,
         .scene = if (scene) |*s| s else null,
         .still = if (still) |*s| s else null,
+        .video = if (video) |*v| v else null,
         .faces = faces,
         .synthetic_fps = if (cfg.source != .camera) (if (input_fps > 0) input_fps else null) else null,
         .hud_label = upperLabel(&label_buf, switch (cfg.source) {
             .synthetic => "SYNTHETIC",
             .image => "IMAGE",
+            .video => "VIDEO",
             .camera => device_name,
         }),
         .hud_cache = Hud.init(gpa, W, H) catch |e| return ctx.fail("out of memory: {s}", .{cx.describe(e)}),
@@ -1045,7 +1115,15 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     defer det = live.det;
     defer if (live.faces) |*f| f.deinit();
     defer live.times.deinit(gpa);
-    if (record_out != null) live.recorder = Recorder.init(gpa, W, H, if (input_fps > 0) input_fps else 30) catch |e| return ctx.fail("cannot start the recording: {s}", .{cx.describe(e)});
+    const record_fps = if (video) |v| (if (v.fps > 0) v.fps else 30) else if (input_fps > 0) input_fps else 30;
+    if (record_out != null) live.recorder = Recorder.init(gpa, W, H, record_fps) catch |e| return ctx.fail("cannot start the recording: {s}", .{cx.describe(e)});
+    if (cfg.record_video) |path| {
+        const vw = capture.VideoWriter.open(gpa, io, path, W, H, record_fps, .{ .quality = 90 }) catch |e| {
+            if (capture.detail().len > 0) ctx.hint("{s}", .{capture.detail()});
+            return ctx.fail("cannot write '{s}': {s}", .{ path, cx.describe(e) });
+        };
+        live.recorder = .{ .video = vw };
+    }
     defer if (live.recorder) |*r| r.deinit(gpa);
 
     if (!ctx.quiet and !ctx.json) {
@@ -1071,7 +1149,7 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
         // No threads (wasm): capture and process in turn.
         var rgb = Image(u8).init(gpa, W, H, 3) catch |e| return ctx.fail("out of memory: {s}", .{cx.describe(e)});
         defer rgb.deinit(gpa);
-        while (!live.done.load(.acquire)) {
+        while (!live.done.load(.acquire) and !live.eof.load(.acquire)) {
             _ = produceSynthetic(live, rgb);
             const i = ring.takeCaptured() orelse continue;
             processOne(live, i) catch |e| return ctx.fail("tracking failed: {s}", .{cx.describe(e)});
@@ -1093,7 +1171,7 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
 
         switch (cfg.source) {
             .camera => cam.?.start() catch |e| return cameraError(ctx, e, cfg),
-            .synthetic, .image => producer = std.Thread.spawn(.{}, syntheticMain, .{live}) catch |e| return ctx.fail("cannot start the scene thread: {s}", .{cx.describe(e)}),
+            .synthetic, .image, .video => producer = std.Thread.spawn(.{}, syntheticMain, .{live}) catch |e| return ctx.fail("cannot start the scene thread: {s}", .{cx.describe(e)}),
         }
 
         const outcome = if (live.windowed) try windowLoop(ctx, live, device_name, W, H) else headlessLoop(ctx, live);
@@ -1114,6 +1192,10 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     }
     ring.drain();
     if (live.worker_error) |e| return ctx.fail("tracking failed: {s}", .{cx.describe(e)});
+    if (live.video_error) |e| {
+        if (capture.detail().len > 0) ctx.hint("{s}", .{capture.detail()});
+        return ctx.fail("cannot read '{s}': {s}", .{ cfg.image_path, cx.describe(e) });
+    }
     // Locks still running are reported too.
     for (live.locks.items) |*l| try retireLock(live, l);
     live.locks.clearRetainingCapacity();
@@ -1134,15 +1216,23 @@ fn runLive(ctx: *Ctx, cfg: Config, record_out: ?imageio.Output) !void {
     st.locks = live.lock_reports.items;
     if (live.faces) |f| st.faces = faceSummary(live, f, cfg, st);
 
-    if (live.recorder) |*r| {
+    if (live.recorder) |*r| if (r.video) |vw_value| {
+        var vw = vw_value;
+        const n = vw.frameCount();
+        r.video = null;
+        if (r.failed) |e| ctx.warn("the recording failed: {s}", .{cx.describe(e)});
+        vw.close() catch |e| return ctx.fail("cannot finish '{s}': {s}", .{ cfg.record_video.?, cx.describe(e) });
+        st.recorded = @intCast(n);
+        st.record_path = cfg.record_video;
+    } else {
         if (r.failed) |e| ctx.warn("the recording failed: {s}", .{cx.describe(e)}) else if (r.frames > 0) {
             if (r.full) ctx.warn("the recording stopped at {d} frames", .{max_record_frames});
-            const bytes = try r.anim.finish();
+            const bytes = try r.anim.?.finish();
             defer gpa.free(bytes);
             try imageio.writeBytes(ctx, record_out.?, bytes);
             st.recorded = r.frames;
         }
-    }
+    };
     try report(ctx, st, record_out);
 }
 
@@ -1232,7 +1322,7 @@ fn windowLoop(ctx: *Ctx, live: *Live, name: []const u8, W: u32, H: u32) !Outcome
             shown += 1;
         }
         _ = meter.tick(live, shown);
-        if (live.captured.load(.monotonic) == 0 and secondsSince(live, t0) > no_frames_timeout_s and live.scene == null and live.still == null) return .no_frames;
+        if (live.captured.load(.monotonic) == 0 and secondsSince(live, t0) > no_frames_timeout_s and live.scene == null and live.still == null and live.video == null) return .no_frames;
     }
     if (live.done.load(.acquire)) {
         // Show the last frame.
@@ -1280,7 +1370,7 @@ fn headlessLoop(ctx: *Ctx, live: *Live) Outcome {
                 ctx.err.flush() catch {};
             }
         }
-        if (live.captured.load(.monotonic) == 0 and secondsSince(live, t0) > no_frames_timeout_s and live.scene == null and live.still == null) return .no_frames;
+        if (live.captured.load(.monotonic) == 0 and secondsSince(live, t0) > no_frames_timeout_s and live.scene == null and live.still == null and live.video == null) return .no_frames;
     }
     return .ok;
 }
@@ -1314,6 +1404,8 @@ const Summary = struct {
     dropped: u64 = 0,
     tracks: u32 = 0,
     recorded: u32 = 0,
+    /// The video file recorded to (--record FILE.avi / .y4m).
+    record_path: ?[]const u8 = null,
     mode: Mode = .both,
     locks: []const LockReport = &.{},
     faces: ?FaceSummary = null,
@@ -1468,7 +1560,7 @@ fn report(ctx: *Ctx, s: Summary, record_out: ?imageio.Output) !void {
     defer writeLocks(w, st, s.locks) catch {};
     defer if (s.faces) |f| writeFaces(w, st, f) catch {};
     try term.writeFields(w, st, 2, &.{
-        .{ "source", std.fmt.bufPrint(&b[0], "{s}{s}, {d}x{d}{s}{s}", .{ if (s.source == .image) "image " else "", s.device, s.width, s.height, if (s.source == .camera) " " else "", if (s.source == .camera) s.pixel_format else "" }) catch "" },
+        .{ "source", std.fmt.bufPrint(&b[0], "{s}{s}, {d}x{d}{s}{s}", .{ if (s.source == .image) "image " else if (s.source == .video) "video " else "", s.device, s.width, s.height, if (s.source == .camera) " " else "", if (s.source == .camera) s.pixel_format else "" }) catch "" },
         .{ "input", std.fmt.bufPrint(&b[1], "{d:.1} fps measured{s}", .{ s.input_fps, if (s.source != .camera and s.input_fps_set == 0) " (unpaced)" else "" }) catch "" },
         .{ "visar", std.fmt.bufPrint(&b[2], "{d:.2} ms per frame = {d:.0} fps (p50 {d:.2}, p95 {d:.2} ms)", .{ ms.mean_ms, ms.fps, ms.p50_ms, ms.p95_ms }) catch "" },
         .{ "stages", if (s.mode == .faces)
@@ -1479,7 +1571,7 @@ fn report(ctx: *Ctx, s: Summary, record_out: ?imageio.Output) !void {
         .{ "display", if (s.display_fps) |d| std.fmt.bufPrint(&b[5], "{d:.1} fps", .{d}) catch "" else "none (headless)" },
         .{ "detector", std.fmt.bufPrint(&b[6], "{d}x{d}, {d} thread{s}, {d} {s} seen", .{ s.detect_width, s.detect_height, s.threads, if (s.threads == 1) "" else "s", s.tracks, if (s.mode == .faces) "faces" else "objects" }) catch "" },
         .{ "mode", @tagName(s.mode) },
-        .{ "recording", if (record_out) |o| std.fmt.bufPrint(&b[7], "{s} ({d} frames)", .{ o.name(), s.recorded }) catch "" else "none" },
+        .{ "recording", if (record_out) |o| std.fmt.bufPrint(&b[7], "{s} ({d} frames)", .{ o.name(), s.recorded }) catch "" else if (s.record_path) |rp| std.fmt.bufPrint(&b[7], "{s} ({d} frames)", .{ rp, s.recorded }) catch "" else "none" },
     });
 }
 

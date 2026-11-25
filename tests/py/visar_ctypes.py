@@ -804,3 +804,85 @@ class ObjectDetector:
 
 def coco_class_name(i):
     return lib.visar_coco_class_name(int(i)).decode()
+
+
+# ------------------------------------------------------------------ videoio
+
+if hasattr(lib, "visar_video_capture_open"):
+    lib.visar_video_capture_free.argtypes = [_vp]
+    lib.visar_video_capture_read.argtypes = [_vp, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    lib.visar_video_capture_get.argtypes = [_vp, ctypes.c_int]
+    lib.visar_video_capture_get.restype = ctypes.c_double
+    lib.visar_video_capture_set.argtypes = [_vp, ctypes.c_int, ctypes.c_double]
+    lib.visar_video_capture_backend.argtypes = [_vp]
+    lib.visar_video_capture_backend.restype = ctypes.c_char_p
+    lib.visar_video_writer_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_double, ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int, ctypes.POINTER(_vp)]
+    lib.visar_video_writer_write.argtypes = [_vp, ctypes.c_void_p]
+    lib.visar_video_writer_close.argtypes = [_vp]
+
+
+def fourcc(code):
+    """cv2.VideoWriter_fourcc for a 4-character string."""
+    return sum(ord(c) << (8 * i) for i, c in enumerate(code))
+
+
+class VideoCapture:
+    """cv2.VideoCapture-like reader (CAP_PROP_* numbers for get/set)."""
+
+    def __init__(self, path):
+        self._h = _vp()
+        _check(lib.visar_video_capture_open(os.fsencode(path), ctypes.byref(self._h)))
+        self.width = int(self.get(3))
+        self.height = int(self.get(4))
+        self._frame = None
+
+    def __del__(self):
+        self.release()
+
+    def release(self):
+        if getattr(self, "_h", None):
+            lib.visar_video_capture_free(self._h)
+            self._h = None
+
+    def get(self, prop):
+        return lib.visar_video_capture_get(self._h, int(prop))
+
+    def set(self, prop, value):
+        _check(lib.visar_video_capture_set(self._h, int(prop), float(value)))
+        return True
+
+    @property
+    def backend(self):
+        return lib.visar_video_capture_backend(self._h).decode()
+
+    def read(self, out=None, channels=3):
+        """(ok, frame) like cv2; frame is BGR (or BGRA / gray with channels=4 / 1)."""
+        if out is None:
+            shape = (self.height, self.width) if channels == 1 else (self.height, self.width, channels)
+            out = np.empty(shape, np.uint8)
+        got = ctypes.c_int(0)
+        _check(lib.visar_video_capture_read(self._h, ctypes.byref(desc(out)), ctypes.byref(got)))
+        return (True, out) if got.value else (False, None)
+
+
+class VideoWriter:
+    """cv2.VideoWriter-like writer (.avi Motion-JPEG / uncompressed, .y4m)."""
+
+    def __init__(self, path, fourcc_code, fps, size, quality=95):
+        self._h = _vp()
+        _check(lib.visar_video_writer_open(os.fsencode(path), int(fourcc_code), float(fps), int(size[0]), int(size[1]),
+                                           int(quality), ctypes.byref(self._h)))
+
+    def write(self, frame):
+        _check(lib.visar_video_writer_write(self._h, ctypes.byref(desc(np.ascontiguousarray(frame)))))
+
+    def release(self):
+        if getattr(self, "_h", None):
+            h, self._h = self._h, None
+            _check(lib.visar_video_writer_close(h))
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            lib.visar_video_writer_close(self._h)
+            self._h = None

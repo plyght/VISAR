@@ -869,6 +869,146 @@ export fn visar_free(p: ?[*]u8, len: usize) void {
     if (p) |ptr| gpa.free(ptr[0..len]);
 }
 
+// -------------------------------------------------------------- videoio
+
+const videoio = visar.videoio;
+
+fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Like `fail`, with videoio's explanation (e.g. how to convert an .mp4
+/// with ffmpeg) appended when it has one.
+fn failVideo(err: anyerror) c_int {
+    const rc = fail(err);
+    const d = videoio.capture.detail();
+    if (d.len == 0) return rc;
+    const n = std.mem.indexOfScalar(u8, &last_error, 0) orelse last_error.len;
+    const msg = std.fmt.bufPrint(last_error[n .. last_error.len - 1], ": {s}", .{d}) catch last_error[n .. last_error.len - 1];
+    last_error[n + msg.len] = 0;
+    return rc;
+}
+
+fn videoStatus(err: anyerror) c_int {
+    return switch (err) {
+        error.FileNotFound, error.AccessDenied, error.OpenFailed, error.UnknownFormat, error.NotSeekable => blk: {
+            _ = failVideo(err);
+            break :blk @backingInt(if (err == error.UnknownFormat) Status.unsupported else Status.invalid_argument);
+        },
+        error.ReadFailed, error.WriteFailed, error.RuntimeUnavailable => blk: {
+            _ = failVideo(err);
+            break :blk @backingInt(Status.internal);
+        },
+        else => failVideo(err),
+    };
+}
+
+/// Opens a video file (.avi Motion-JPEG/uncompressed, .y4m; .mp4/.mov on
+/// macOS). Free with visar_video_capture_free.
+export fn visar_video_capture_open(path: [*:0]const u8, out: *?*videoio.VideoCapture) c_int {
+    out.* = null;
+    const c = gpa.create(videoio.VideoCapture) catch |e| return fail(e);
+    c.* = videoio.VideoCapture.open(gpa, io(), std.mem.span(path)) catch |e| {
+        gpa.destroy(c);
+        return videoStatus(e);
+    };
+    out.* = c;
+    return 0;
+}
+
+export fn visar_video_capture_free(c: ?*videoio.VideoCapture) void {
+    const cap = c orelse return;
+    cap.close();
+    gpa.destroy(cap);
+}
+
+/// Reads the next frame into `dst` (8U, the video's size, 3 = BGR, 4 =
+/// BGRA or 1 = gray channels). *got is 1 for a frame, 0 at the end.
+export fn visar_video_capture_read(c: *videoio.VideoCapture, dst: *const CImage, got: *c_int) c_int {
+    got.* = 0;
+    const d = typed(u8, dst) catch |e| return fail(e);
+    const ok = c.read(d) catch |e| return videoStatus(e);
+    got.* = @intFromBool(ok);
+    return 0;
+}
+
+/// cv2.CAP_PROP_*: 1 POS_FRAMES, 3 FRAME_WIDTH, 4 FRAME_HEIGHT, 5 FPS,
+/// 6 FOURCC, 7 FRAME_COUNT (-1 when unknown), 0 POS_MSEC. Others: 0.
+export fn visar_video_capture_get(c: *videoio.VideoCapture, prop: c_int) f64 {
+    return switch (prop) {
+        0 => c.timeOf(c.pos) * 1000,
+        1 => @floatFromInt(c.pos),
+        3 => @floatFromInt(c.width),
+        4 => @floatFromInt(c.height),
+        5 => c.fps,
+        6 => @floatFromInt(std.mem.readInt(u32, &c.fourcc, .little)),
+        7 => if (c.frame_count) |n| @floatFromInt(n) else -1,
+        else => 0,
+    };
+}
+
+/// Sets 1 POS_FRAMES (seek to a frame) or 0 POS_MSEC.
+export fn visar_video_capture_set(c: *videoio.VideoCapture, prop: c_int, value: f64) c_int {
+    if (!(value >= 0) or value > 1e15) return fail(error.InvalidArgument);
+    const frame: u64 = switch (prop) {
+        1 => @intFromFloat(@round(value)),
+        0 => @intFromFloat(@round(value / 1000 * (if (c.fps > 0) c.fps else 0))),
+        else => return fail(error.Unsupported),
+    };
+    c.seek(frame) catch |e| return videoStatus(e);
+    return 0;
+}
+
+/// The backend's name: "AVI", "YUV4MPEG2" or "AVFoundation".
+export fn visar_video_capture_backend(c: *videoio.VideoCapture) [*:0]const u8 {
+    return switch (c.backend) {
+        .avi => "AVI",
+        .y4m => "YUV4MPEG2",
+        .avfoundation => "AVFoundation",
+    };
+}
+
+/// Creates a video file, .avi or .y4m. `fourcc` as cv2.VideoWriter_fourcc
+/// builds it: 'MJPG' (Motion-JPEG), 0 (uncompressed BGR, .avi) or 'I420'
+/// (.y4m); -1 picks the extension's default (MJPG, I420). quality 1-100
+/// for Motion-JPEG (<= 0: 95).
+export fn visar_video_writer_open(path: [*:0]const u8, fourcc: c_int, fps: f64, width: c_int, height: c_int, quality: c_int, out: *?*videoio.VideoWriter) c_int {
+    out.* = null;
+    if (width <= 0 or height <= 0) return fail(error.InvalidArgument);
+    var cc: ?[4]u8 = null;
+    if (fourcc != -1) {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, @bitCast(fourcc), .little);
+        cc = b;
+    }
+    const w = gpa.create(videoio.VideoWriter) catch |e| return fail(e);
+    w.* = videoio.VideoWriter.open(gpa, io(), std.mem.span(path), @intCast(width), @intCast(height), fps, .{
+        .fourcc = cc,
+        .quality = if (quality > 0 and quality <= 100) @intCast(quality) else 95,
+    }) catch |e| {
+        gpa.destroy(w);
+        return videoStatus(e);
+    };
+    out.* = w;
+    return 0;
+}
+
+/// Appends a frame (8U BGR, BGRA or gray, the video's size).
+export fn visar_video_writer_write(w: *videoio.VideoWriter, frame: *const CImage) c_int {
+    const f = typed(u8, frame) catch |e| return fail(e);
+    w.write(f) catch |e| return videoStatus(e);
+    return 0;
+}
+
+/// Finishes the file and frees the writer (also on failure).
+export fn visar_video_writer_close(w: ?*videoio.VideoWriter) c_int {
+    const wr = w orelse return 0;
+    const r = wr.close();
+    gpa.destroy(wr);
+    r catch |e| return videoStatus(e);
+    return 0;
+}
+
 // ------------------------------------------------------------------ dnn
 
 const dnn = visar.dnn;

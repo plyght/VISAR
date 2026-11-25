@@ -114,6 +114,7 @@ def cases(h, w):
     yield "imdecode JPEG", lambda: vs.imdecode(jpgb), lambda: cv2.imdecode(jpg, cv2.IMREAD_UNCHANGED)
     yield "imencode JPEG q90", lambda: vs.imencode(".jpg", bgr, quality=90), lambda: cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
     yield from contour_cases(h, w)
+    yield from video_cases(h, w)
     yield from dnn_cases()
     yield from tracking_cases()
 
@@ -369,6 +370,70 @@ def tracking_cases(h=720, w=1280):
     po, _ = pipeline(vs.Background(w, h, 4))
     _, pt = pipeline("mog2")
     yield "track pipeline 720p vs OpenCV (MOG2)", stepper(po), stepper(pt)
+
+
+def video_cases(h, w, n=16):
+    """Motion-JPEG AVI: write n frames, and read them all back (open, then
+    every frame into a reused BGR buffer), against cv2.VideoWriter /
+    cv2.VideoCapture with their default backend (FFmpeg) and OpenCV's own
+    AVI/MJPEG backend."""
+    if not hasattr(vs.lib, "visar_video_capture_open"):
+        return
+    import tempfile
+    d = tempfile.mkdtemp(prefix="visar-bench-video-")
+    frames = [natural(h, w, 3) for _ in range(2)]
+    frames = [np.roll(frames[i % 2], 7 * i, axis=1) for i in range(n)]
+    path_vs = os.path.join(d, "vs.avi")
+    path_cv = os.path.join(d, "cv.avi")
+    mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+    backends = {b for b in cv2.videoio_registry.getBackends()}
+    apis = [("FFmpeg", cv2.CAP_FFMPEG)] if cv2.CAP_FFMPEG in backends else [("default", cv2.CAP_ANY)]
+    if cv2.CAP_OPENCV_MJPEG in backends:
+        apis.append(("OpenCV MJPEG", cv2.CAP_OPENCV_MJPEG))
+
+    def write_vs():
+        wr = vs.VideoWriter(path_vs, vs.fourcc("MJPG"), 30, (w, h), quality=95)
+        for f in frames:
+            wr.write(f)
+        wr.release()
+
+    def writer_cv(api):
+        def f():
+            # FFmpeg takes no quality parameter (it encodes at its own default).
+            params = [] if api == cv2.CAP_FFMPEG else [cv2.VIDEOWRITER_PROP_QUALITY, 95]
+            wr = cv2.VideoWriter(path_cv, api, mjpg, 30, (w, h), params)
+            assert wr.isOpened()
+            for fr in frames:
+                wr.write(fr)
+            wr.release()
+        return f
+
+    buf_vs = np.empty((h, w, 3), np.uint8)
+    buf_cv = np.empty((h, w, 3), np.uint8)
+
+    def read_vs():
+        cap = vs.VideoCapture(path_vs)
+        k = 0
+        while cap.read(buf_vs)[0]:
+            k += 1
+        cap.release()
+        assert k == n
+
+    def reader_cv(api):
+        def f():
+            cap = cv2.VideoCapture(path_vs, api)
+            k = 0
+            while cap.read(buf_cv)[0]:
+                k += 1
+            cap.release()
+            assert k == n
+        return f
+
+    write_vs()
+    for label, api in apis:
+        yield f"VideoWriter MJPG {n}f vs {label}", write_vs, writer_cv(api)
+    for label, api in apis:
+        yield f"VideoCapture MJPG {n}f vs {label}", read_vs, reader_cv(api)
 
 
 def main():

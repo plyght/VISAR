@@ -118,35 +118,135 @@ pub const Reader = struct {
         const y_plane = r.buf[0 .. w * h];
         const u_plane = r.buf[w * h ..][0 .. c[0] * c[1]];
         const v_plane = r.buf[w * h + c[0] * c[1] ..][0 .. c[0] * c[1]];
-        const ch: usize = dst.channels;
-        // Fixed point, 8 fractional bits (as camera_linux.yuyvToBgra).
-        const ky: i32 = if (r.full_range) 256 else 298;
-        const y0: i32 = if (r.full_range) 0 else 16;
-        const ku_b: i32 = if (r.full_range) 454 else 516;
-        const ku_g: i32 = if (r.full_range) 88 else 100;
-        const kv_g: i32 = if (r.full_range) 183 else 208;
-        const kv_r: i32 = if (r.full_range) 359 else 409;
-        for (0..h) |y| {
-            const d = dst.row(y);
-            const yr = y_plane[y * w ..][0..w];
-            const cy = switch (r.chroma) {
-                .c420 => y / 2,
-                else => y,
-            };
-            for (0..w) |x| {
-                const l: i32 = (@as(i32, yr[x]) - y0) * ky;
-                var u: i32 = 0;
-                var v: i32 = 0;
-                if (r.chroma != .mono) {
-                    const cx = if (r.chroma == .c444) x else x / 2;
-                    u = @as(i32, u_plane[cy * c[0] + cx]) - 128;
-                    v = @as(i32, v_plane[cy * c[0] + cx]) - 128;
-                }
-                const px = d[x * ch ..][0..3];
-                px.* = .{ clampU8((l + ku_b * u + 128) >> 8), clampU8((l - ku_g * u - kv_g * v + 128) >> 8), clampU8((l + kv_r * v + 128) >> 8) };
-                if (ch == 4) d[x * 4 + 3] = 255;
+        yuvToBgr(r.chroma, r.full_range, y_plane, u_plane, v_plane, dst);
+    }
+};
+
+/// Planar 8-bit YUV (BT.601; limited range unless `full_range`) to BGR or
+/// BGRA `dst`, chroma taken from the nearest sample. The planes are
+/// `dst`'s size (Y) and the chroma size `chroma` implies (U, V; ignored
+/// for mono), rows packed.
+pub fn yuvToBgr(chroma: Chroma, full_range: bool, y_plane: []const u8, u_plane: []const u8, v_plane: []const u8, dst: Image(u8)) void {
+    const w: usize = dst.width;
+    const h: usize = dst.height;
+    const cw: usize = switch (chroma) {
+        .c444 => w,
+        .mono => 0,
+        else => (w + 1) / 2,
+    };
+    const ch: usize = dst.channels;
+    // Fixed point, 8 fractional bits (as camera_linux.yuyvToBgra).
+    const ky: i32 = if (full_range) 256 else 298;
+    const y0: i32 = if (full_range) 0 else 16;
+    const ku_b: i32 = if (full_range) 454 else 516;
+    const ku_g: i32 = if (full_range) 88 else 100;
+    const kv_g: i32 = if (full_range) 183 else 208;
+    const kv_r: i32 = if (full_range) 359 else 409;
+    for (0..h) |y| {
+        const d = dst.row(y);
+        const yr = y_plane[y * w ..][0..w];
+        const cy = switch (chroma) {
+            .c420 => y / 2,
+            else => y,
+        };
+        for (0..w) |x| {
+            const l: i32 = (@as(i32, yr[x]) - y0) * ky;
+            var u: i32 = 0;
+            var v: i32 = 0;
+            if (chroma != .mono) {
+                const cx = if (chroma == .c444) x else x / 2;
+                u = @as(i32, u_plane[cy * cw + cx]) - 128;
+                v = @as(i32, v_plane[cy * cw + cx]) - 128;
             }
+            const px = d[x * ch ..][0..3];
+            px.* = .{ clampU8((l + ku_b * u + 128) >> 8), clampU8((l - ku_g * u - kv_g * v + 128) >> 8), clampU8((l + kv_r * v + 128) >> 8) };
+            if (ch == 4) d[x * 4 + 3] = 255;
         }
+    }
+}
+
+/// Bytes of a 4:2:0 frame of this size (Y, U and V planes).
+pub fn i420Bytes(width: u32, height: u32) usize {
+    const cw: usize = (width + 1) / 2;
+    const chh: usize = (height + 1) / 2;
+    return @as(usize, width) * height + 2 * cw * chh;
+}
+
+/// BGR or BGRA `src` to planar 4:2:0 YUV (BT.601, limited range), chroma
+/// averaged over each 2x2 block. `out` holds i420Bytes bytes: Y, then U,
+/// then V.
+pub fn bgrToI420(src: Image(u8), out: []u8) void {
+    const w: usize = src.width;
+    const h: usize = src.height;
+    const cw = (w + 1) / 2;
+    const chh = (h + 1) / 2;
+    const ch: usize = src.channels;
+    const yp = out[0 .. w * h];
+    const up = out[w * h ..][0 .. cw * chh];
+    const vp = out[w * h + cw * chh ..][0 .. cw * chh];
+    for (0..h) |y| {
+        const s = src.row(y);
+        for (0..w) |x| {
+            const b: i32 = s[x * ch];
+            const g: i32 = s[x * ch + 1];
+            const r: i32 = s[x * ch + 2];
+            yp[y * w + x] = @intCast(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+        }
+    }
+    for (0..chh) |cy| {
+        const r0 = src.row(2 * cy);
+        const r1 = src.row(@min(2 * cy + 1, h - 1));
+        for (0..cw) |cx| {
+            const x0 = 2 * cx;
+            const x1 = @min(2 * cx + 1, w - 1);
+            var sum: [3]i32 = .{ 0, 0, 0 };
+            for ([_][]const u8{ r0, r1 }) |row| {
+                for ([_]usize{ x0, x1 }) |x| {
+                    for (0..3) |k| sum[k] += row[x * ch + k];
+                }
+            }
+            const b = @divTrunc(sum[0] + 2, 4);
+            const g = @divTrunc(sum[1] + 2, 4);
+            const r = @divTrunc(sum[2] + 2, 4);
+            up[cy * cw + cx] = clampU8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+            vp[cy * cw + cx] = clampU8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+        }
+    }
+}
+
+/// Writes YUV4MPEG2: 4:2:0 (C420jpeg), progressive, limited range.
+pub const Writer = struct {
+    gpa: Allocator,
+    out: *Io.Writer,
+    width: u32,
+    height: u32,
+    buf: []u8,
+    frames: u64 = 0,
+
+    pub const WriteError = error{ InvalidData, SizeMismatch, UnsupportedChannels, OutOfMemory, WriteFailed };
+
+    /// Writes the header to `out` (which must outlive the writer).
+    pub fn init(gpa: Allocator, out: *Io.Writer, width: u32, height: u32, fps_num: u32, fps_den: u32) WriteError!Writer {
+        if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidData;
+        const buf = try gpa.alloc(u8, i420Bytes(width, height));
+        errdefer gpa.free(buf);
+        try out.print("YUV4MPEG2 W{d} H{d} F{d}:{d} Ip A1:1 C420jpeg XYSCSS=420JPEG\n", .{ width, height, @max(fps_num, 1), @max(fps_den, 1) });
+        return .{ .gpa = gpa, .out = out, .width = width, .height = height, .buf = buf };
+    }
+
+    pub fn deinit(w: *Writer) void {
+        w.gpa.free(w.buf);
+        w.* = undefined;
+    }
+
+    /// Appends a BGR or BGRA frame of the video's size.
+    pub fn write(w: *Writer, frame: Image(u8)) WriteError!void {
+        if (frame.width != w.width or frame.height != w.height) return error.SizeMismatch;
+        if (frame.channels != 3 and frame.channels != 4) return error.UnsupportedChannels;
+        bgrToI420(frame, w.buf);
+        try w.out.writeAll("FRAME\n");
+        try w.out.writeAll(w.buf);
+        w.frames += 1;
     }
 };
 
@@ -188,6 +288,36 @@ test "y4m: header, 420 frames, conversion and the end" {
     try std.testing.expect(buf[2] > 200 and buf[0] < 140 and buf[1] < 60);
     try std.testing.expect(!try r.next(img));
     try std.testing.expectEqual(@as(u64, 2), r.frames);
+}
+
+test "y4m: writer round trip" {
+    const gpa = std.testing.allocator;
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    var src = try Image(u8).init(gpa, 6, 4, 3);
+    defer src.deinit(gpa);
+    for (0..4) |y| for (0..6) |x| {
+        src.row(y)[x * 3 ..][0..3].* = .{ @intCast(100 + 10 * x), @intCast(80 + 20 * y), 128 };
+    };
+    var w = try Writer.init(gpa, &aw.writer, 6, 4, 25, 1);
+    try w.write(src);
+    try w.write(src);
+    w.deinit();
+    var in: Io.Reader = .fixed(aw.written());
+    var r = try Reader.init(gpa, &in);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u32, 25), r.fps_num);
+    var out = try Image(u8).init(gpa, 6, 4, 3);
+    defer out.deinit(gpa);
+    var n: usize = 0;
+    while (try r.next(out)) n += 1;
+    try std.testing.expectEqual(@as(usize, 2), n);
+    // 4:2:0 loses chroma detail; the mean error stays small.
+    var err: u64 = 0;
+    for (0..4) |y| for (out.row(y), src.row(y)) |a, b| {
+        err += @abs(@as(i32, a) - @as(i32, b));
+    };
+    try std.testing.expect(err / (6 * 4 * 3) < 6);
 }
 
 test "y4m: rejects what it cannot read" {
