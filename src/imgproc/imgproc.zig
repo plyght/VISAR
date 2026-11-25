@@ -36,6 +36,8 @@ pub const sepFilter2D = filter.sepFilter2D;
 pub const ThresholdType = threshold_mod.Type;
 pub const threshold = threshold_mod.threshold;
 pub const inRange = threshold_mod.inRange;
+pub const adaptiveThreshold = threshold_mod.adaptiveThreshold;
+pub const AdaptiveMethod = threshold_mod.AdaptiveMethod;
 pub const applyLut = threshold_mod.applyLut;
 
 pub const MorphShape = morph.Shape;

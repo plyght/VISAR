@@ -183,3 +183,11 @@ def aruco_draw(img, corners, ids=None, color=(0, 255, 0)):
     col = (ctypes.c_double * 3)(*[float(x) for x in color])
     _check(lib.visar_aruco_draw(ctypes.byref(desc(img)), flat.ctypes.data, ctypes.c_void_p(idp), ctypes.c_size_t(n), col))
     return img
+
+
+def adaptive_threshold(img, maxval, method, kind, block, delta):
+    """cv2.adaptiveThreshold(img, maxval, method, kind, block, delta)."""
+    out = np.empty_like(img)
+    _check(lib.visar_adaptive_threshold(ctypes.byref(desc(img)), ctypes.byref(desc(out)), ctypes.c_double(maxval),
+                                        int(method), int(kind), int(block), ctypes.c_double(delta)))
+    return out
