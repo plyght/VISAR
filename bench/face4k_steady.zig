@@ -159,7 +159,8 @@ fn profileNet(gpa: std.mem.Allocator, io: Io, exec: visar.Exec, model: []const u
     var ob: [4096]u8 = undefined;
     var ow = Io.File.Writer.initStreaming(.stdout(), io, &ob);
     const w = &ow.interface;
-    try w.print("YuNet {d}x{d}: item, steps, 1T ms, {d}T ms, scaling\n", .{ det.pad_w, det.pad_h, exec.threads() });
+    const macs = visar.dnn.metal.encode.convMacs(&c.plan);
+    try w.print("YuNet {d}x{d} ({d:.1} M conv MACs): item, steps, 1T ms, {d}T ms, scaling\n", .{ det.pad_w, det.pad_h, @as(f64, @floatFromInt(macs)) / 1e6, exec.threads() });
     var tot = [2]f64{ 0, 0 };
     var whole = [2]f64{ 0, 0 };
     for (0..2) |e| {
