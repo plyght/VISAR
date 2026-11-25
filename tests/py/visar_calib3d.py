@@ -141,3 +141,32 @@ def solve_pnp_ransac(obj, img, K, dist=None, iterations=100, reprojection_error=
     if not found.value:
         return False, None, None, None
     return True, rv.reshape(3, 1), tv.reshape(3, 1), np.flatnonzero(inl).reshape(-1, 1).astype(np.int32)
+
+
+def undistort(img, K, dist=None, new_k=None, dst=None):
+    dst = np.empty_like(img) if dst is None else dst
+    d, nd = _dist(dist)
+    nk = _f64(new_k).ravel() if new_k is not None else None
+    _check(lib.visar_undistort(ctypes.byref(vs.desc(img)), ctypes.byref(vs.desc(dst)), _p(_f64(K).ravel()),
+                               _p(d) if d is not None else None, c_size_t(nd), _p(nk) if nk is not None else None))
+    return dst
+
+
+def init_undistort_rectify_map(K, dist, R, new_k, size):
+    w, h = size
+    mx = np.empty((h, w), np.float32)
+    my = np.empty((h, w), np.float32)
+    d, nd = _dist(dist)
+    r = _f64(R).ravel() if R is not None else None
+    nk = _f64(new_k)[:3, :3].ravel().copy() if new_k is not None else None
+    _check(lib.visar_init_undistort_rectify_map(_p(_f64(K).ravel()), _p(d) if d is not None else None, c_size_t(nd),
+                                                _p(r) if r is not None else None, _p(nk) if nk is not None else None,
+                                                ctypes.byref(vs.desc(mx)), ctypes.byref(vs.desc(my))))
+    return mx, my
+
+
+def remap(img, mapx, mapy, value=0, dst=None):
+    dst = np.empty(mapx.shape + img.shape[2:], img.dtype) if dst is None else dst
+    _check(lib.visar_remap(ctypes.byref(vs.desc(img)), ctypes.byref(vs.desc(dst)), ctypes.byref(vs.desc(mapx)),
+                           ctypes.byref(vs.desc(mapy)), c_double(value)))
+    return dst

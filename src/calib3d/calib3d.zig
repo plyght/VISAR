@@ -9,6 +9,7 @@ pub const ransac = @import("ransac.zig");
 pub const homography = @import("homography.zig");
 pub const camera = @import("camera.zig");
 pub const pose = @import("pose.zig");
+pub const undistort_mod = @import("undistort.zig");
 
 pub const Point2f = homography.Point2f;
 pub const Method = homography.Method;
@@ -25,6 +26,10 @@ pub const projectPoints = camera.projectPoints;
 pub const undistortPoints = camera.undistortPoints;
 pub const solvePnP = pose.solvePnP;
 pub const solvePnPRansac = pose.solvePnPRansac;
+
+pub const undistort = undistort_mod.undistort;
+pub const initUndistortRectifyMap = undistort_mod.initUndistortRectifyMap;
+pub const remap = undistort_mod.remap;
 
 test {
     std.testing.refAllDecls(@This());

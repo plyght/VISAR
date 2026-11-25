@@ -179,3 +179,35 @@ export fn visar_solve_pnp_ransac(obj: [*]const f64, img: [*]const f64, n: usize,
     }
     return 0;
 }
+
+// ------------------------------------------------------------- undistort
+
+/// undistort of a VISAR_8U image (1-4 channels); `new_k` may be null.
+export fn visar_undistort(src: *const capi.CImage, dst: *const capi.CImage, k: *const [9]f64, dist: ?[*]const f64, nd: usize, new_k: ?*const [9]f64) c_int {
+    const s = capi.typed(u8, src) catch |e| return fail(e);
+    const d = capi.typed(u8, dst) catch |e| return fail(e);
+    c3.undistort(capi.exec(), s, d, k.*, distSlice(dist, nd), if (new_k) |m| m.* else null) catch |e| return fail(e);
+    return 0;
+}
+
+/// initUndistortRectifyMap into two VISAR_32F one-channel maps (CV_32FC1);
+/// `r` and `new_k` may be null.
+export fn visar_init_undistort_rectify_map(k: *const [9]f64, dist: ?[*]const f64, nd: usize, r: ?*const [9]f64, new_k: ?*const [9]f64, mapx: *const capi.CImage, mapy: *const capi.CImage) c_int {
+    const mx = capi.typed(f32, mapx) catch |e| return fail(e);
+    const my = capi.typed(f32, mapy) catch |e| return fail(e);
+    const p = c3.undistort_mod.MapParams.init(k.*, distSlice(dist, nd), if (r) |m| m.* else null, if (new_k) |m| m.* else null) catch |e| return fail(e);
+    c3.initUndistortRectifyMap(capi.exec(), p, mx, my) catch |e| return fail(e);
+    return 0;
+}
+
+/// remap of a VISAR_8U image through VISAR_32F maps, INTER_LINEAR with a
+/// constant border of `value`.
+export fn visar_remap(src: *const capi.CImage, dst: *const capi.CImage, mapx: *const capi.CImage, mapy: *const capi.CImage, value: f64) c_int {
+    const s = capi.typed(u8, src) catch |e| return fail(e);
+    const d = capi.typed(u8, dst) catch |e| return fail(e);
+    const mx = capi.typed(f32, mapx) catch |e| return fail(e);
+    const my = capi.typed(f32, mapy) catch |e| return fail(e);
+    const v: u8 = @intFromFloat(std.math.clamp(@round(value), 0, 255));
+    c3.remap(capi.exec(), s, d, mx, my, @splat(v)) catch |e| return fail(e);
+    return 0;
+}
