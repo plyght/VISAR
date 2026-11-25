@@ -45,6 +45,27 @@ jobs:
             git worktree add "../src-$tag" "$ref"
             (cd "../src-$tag" && zig build -Doptimize=ReleaseFast --prefix "$GITHUB_WORKSPACE/../out-$tag")
           done
+      # filter contains "features2d": the features2d difftest and bench of B
+      # (throwaway).
+      - name: features2d
+        if: contains(inputs.filter, 'features2d')
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/models"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/models/largest_selfie.jpg" https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/example_outputs/largest_selfie.jpg || true
+          export VISAR_MODELS="$RUNNER_TEMP/models"
+          ext=so; [ "$RUNNER_OS" = macOS ] && ext=dylib
+          lib="$GITHUB_WORKSPACE/../out-B/lib/libvisar.$ext"
+          cd ../src-B
+          {
+          echo '```'
+          python3 -c "import cv2; print(cv2.getBuildInformation())" | grep -i "hal\|cpu\|baseline\|dispatch" | head -20
+          VERBOSE=${{ inputs.threads == '9' && '1' || '' }} python3 tests/py/test_features2d_vs_opencv.py --lib "$lib" 2>&1 | tail -120
+          for f in FAST ORB BFMatcher; do python3 bench/bench_vs_opencv.py --lib "$lib" --threads 1 --filter "$f" 2>&1; done
+          for f in FAST ORB BFMatcher; do python3 bench/bench_vs_opencv.py --lib "$lib" --threads 0 --filter "$f" 2>&1; done
+          echo '```'
+          } | tee f2d.md
+          cat f2d.md >> "$GITHUB_STEP_SUMMARY"
       - name: Time
         if: inputs.base != inputs.head
         run: |
@@ -55,7 +76,7 @@ jobs:
       # base == head: time VISAR alone at 1 and N threads (one library copy,
       # no OpenCV calls in between), to see thread scaling undisturbed.
       - name: Solo thread scaling
-        if: inputs.base == inputs.head
+        if: inputs.base == inputs.head && !contains(inputs.filter, 'features2d')
         run: |
           ext=so; [ "$RUNNER_OS" = macOS ] && ext=dylib
           python3 bench/solo.py "../out-A/lib/libvisar.$ext" --filter "${{ inputs.filter }}" --threads "${{ inputs.threads }}" --md solo.md
