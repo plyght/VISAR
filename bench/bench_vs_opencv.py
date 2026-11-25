@@ -117,6 +117,44 @@ def cases(h, w):
     yield from video_cases(h, w)
     yield from dnn_cases()
     yield from tracking_cases()
+    yield from features2d_cases()
+
+
+def feature_image(h, w, seed=0):
+    """natural() with extra noise and random boxes: enough corners that ORB
+    fills its feature budget."""
+    rng = np.random.default_rng(seed)
+    img = natural(h, w, 1).astype(np.float32) + rng.normal(0, 20, (h, w))
+    for _ in range(h * w // 1500):
+        x, y = int(rng.integers(0, w)), int(rng.integers(0, h))
+        cv2.rectangle(img, (x, y), (x + int(rng.integers(3, 40)), y + int(rng.integers(3, 40))), float(rng.integers(0, 256)), -1)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def features2d_cases():
+    """FAST, ORB and BFMatcher at fixed sizes (independent of --size)."""
+    if not hasattr(vs.lib, "visar_orb_detect_and_compute"):
+        return
+    import features2d_ctypes as fd
+    for (w, h) in [(640, 480), (1280, 720)]:
+        g = feature_image(h, w)
+        fast = cv2.FastFeatureDetector_create(20, True)
+        yield f"FAST-9 t20 nms {w}x{h}", (lambda g=g: fd.fast(g, 20, True)), (lambda g=g, f=fast: f.detect(g))
+        for n in (500, 1000):
+            orb = cv2.ORB_create(n)
+            yield f"ORB {n} detect+compute {w}x{h}", (lambda g=g, n=n: fd.orb(g, nfeatures=n)), (lambda g=g, o=orb: o.detectAndCompute(g, None))
+    rng = np.random.default_rng(5)
+    q = rng.integers(0, 256, (1000, 32), dtype=np.uint8)
+    t = rng.integers(0, 256, (1000, 32), dtype=np.uint8)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    bfc = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    yield "BFMatcher Hamming match 1000x1000", (lambda: fd.bf_match(q, t)), (lambda: bf.match(q, t))
+    yield "BFMatcher Hamming knn2 1000x1000", (lambda: fd.bf_knn_match(q, t, 2)), (lambda: bf.knnMatch(q, t, 2))
+    yield "BFMatcher Hamming crossCheck 1000x1000", (lambda: fd.bf_match(q, t, cross_check=True)), (lambda: bfc.match(q, t))
+    qf = rng.random((1000, 128), dtype=np.float32)
+    tf = rng.random((1000, 128), dtype=np.float32)
+    bfl = cv2.BFMatcher(cv2.NORM_L2)
+    yield "BFMatcher L2 f32x128 knn2 1000x1000", (lambda: fd.bf_knn_match(qf, tf, 2, fd.NORM_L2)), (lambda: bfl.knnMatch(qf, tf, 2))
 
 
 def dnn_cases():

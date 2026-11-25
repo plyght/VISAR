@@ -420,38 +420,38 @@ inline fn fmaV(comptime n: comptime_int, a: @Vector(n, f32), b: @Vector(n, f32),
 fn blurLevel(gpa: Allocator, src: Level, dst: Level, border: usize) Allocator.Error!void {
     const w = src.w;
     const h = src.h;
-    const V = 8;
+    const V = 16;
     const wp = std.mem.alignForward(usize, w, V);
-    const ring = try gpa.alloc(f32, 7 * wp);
+    const ring = try gpa.alloc(f32, 8 * wp + 2 * V);
     defer gpa.free(ring);
     @memset(ring, 0);
+    const conv = ring[7 * wp ..]; // one source row as f32 (w + 6 values)
     const VF = @Vector(V, f32);
     const S = struct {
-        fn rowFilter(l: Level, b: usize, y: isize, out: []f32, n: usize) void {
+        fn rowFilter(l: Level, b: usize, y: isize, out: []f32, n: usize, f: []f32) void {
             const p = l.at(b, -3, y);
             var x: usize = 0;
+            while (x + V <= n + 6) : (x += V) f[x..][0..V].* = simd.toF32(V, @as(@Vector(V, u8), p[x..][0..V].*));
+            while (x < n + 6) : (x += 1) f[x] = @floatFromInt(p[x]);
+            x = 0;
             while (x + V <= n) : (x += V) {
                 var acc: VF = @splat(0);
-                inline for (0..7) |k| {
-                    const v: VF = simd.toF32(V, @as(@Vector(V, u8), p[x + k ..][0..V].*));
-                    acc = fmaV(V, v, @splat(gauss7[k]), acc);
-                }
+                inline for (0..7) |k| acc = fmaV(V, f[x + k ..][0..V].*, @splat(gauss7[k]), acc);
                 out[x..][0..V].* = acc;
             }
             while (x < n) : (x += 1) {
                 var acc: @Vector(1, f32) = @splat(0);
-                inline for (0..7) |k| acc = fmaV(1, @splat(@floatFromInt(p[x + k])), @splat(gauss7[k]), acc);
+                inline for (0..7) |k| acc = fmaV(1, @splat(f[x + k]), @splat(gauss7[k]), acc);
                 out[x] = acc[0];
             }
         }
     };
     var slots: [7][]f32 = undefined;
     for (0..7) |i| slots[i] = ring[i * wp ..][0..wp];
-    for (0..6) |i| S.rowFilter(src, border, @as(isize, @intCast(i)) - 3, slots[i], w);
+    for (0..6) |i| S.rowFilter(src, border, @as(isize, @intCast(i)) - 3, slots[i], w, conv);
     var next_slot: usize = 6;
-    const magic: VF = @splat(12582912.0);
     for (0..h) |y| {
-        S.rowFilter(src, border, @as(isize, @intCast(y)) + 3, slots[next_slot], w);
+        S.rowFilter(src, border, @as(isize, @intCast(y)) + 3, slots[next_slot], w, conv);
         next_slot = (next_slot + 1) % 7;
         // Rows y - 3 .. y + 3 start at next_slot.
         var r: [7][]const f32 = undefined;
@@ -464,11 +464,12 @@ fn blurLevel(gpa: Allocator, src: Level, dst: Level, border: usize) Allocator.Er
                 const pair = @as(VF, r[3 + j][x..][0..V].*) + @as(VF, r[3 - j][x..][0..V].*);
                 s = fmaV(V, @splat(gauss7[3 + j]), pair, s);
             }
-            const q = @min(@max((s + magic) - magic, @as(VF, @splat(0))), @as(VF, @splat(255)));
-            const qi: @Vector(V, i32) = @intFromFloat(q);
-            const o: [V]u8 = simd.narrow(u8, qi);
-            const m = @min(V, w - x);
-            @memcpy(d[x..][0..m], o[0..m]);
+            const o: [V]u8 = simd.satF32(u8, V, s);
+            if (x + V <= w) {
+                d[x..][0..V].* = o;
+            } else {
+                @memcpy(d[x..], o[0 .. w - x]);
+            }
         }
     }
 }

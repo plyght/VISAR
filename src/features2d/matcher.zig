@@ -10,6 +10,7 @@
 //! tie to within an ulp.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("../core/core.zig");
 const kp_mod = @import("keypoint.zig");
 const Image = core.Image;
@@ -129,49 +130,87 @@ fn Ctx(comptime T: type) type {
     };
 }
 
+/// Byte-wise popcount plus a horizontal sum where the target has a vector
+/// byte popcount (NEON cnt, AVX-512 BITALG); four 64-bit popcnts elsewhere.
+const byte_popcount = switch (builtin.cpu.arch) {
+    .aarch64 => true,
+    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bitalg),
+    else => false,
+};
+
+/// Hamming distances of one 32-byte query to train rows [j0, j0 + out.len).
+fn hamming32Block(q: *const [32]u8, train: Image(u8), j0: usize, out: []f32) void {
+    if (byte_popcount) {
+        const V = @Vector(32, u8);
+        const qv: V = q.*;
+        for (out, 0..) |*o, j| {
+            const tv: V = train.row(j0 + j)[0..32].*;
+            const c: V = @popCount(qv ^ tv);
+            o.* = @floatFromInt(@reduce(.Add, @as(@Vector(32, u16), c)));
+        }
+        return;
+    }
+    const q0 = std.mem.readInt(u64, q[0..8], .little);
+    const q1 = std.mem.readInt(u64, q[8..16], .little);
+    const q2 = std.mem.readInt(u64, q[16..24], .little);
+    const q3 = std.mem.readInt(u64, q[24..32], .little);
+    for (out, 0..) |*o, j| {
+        const r = train.row(j0 + j)[0..32];
+        const d = @as(u32, @popCount(q0 ^ std.mem.readInt(u64, r[0..8], .little))) +
+            @popCount(q1 ^ std.mem.readInt(u64, r[8..16], .little)) +
+            @popCount(q2 ^ std.mem.readInt(u64, r[16..24], .little)) +
+            @popCount(q3 ^ std.mem.readInt(u64, r[24..32], .little));
+        o.* = @floatFromInt(d);
+    }
+}
+
+fn minOf(d: []const f32) f32 {
+    const V = 16;
+    var acc: @Vector(V, f32) = @splat(std.math.inf(f32));
+    var i: usize = 0;
+    while (i + V <= d.len) : (i += V) acc = @min(acc, @as(@Vector(V, f32), d[i..][0..V].*));
+    var lo = @reduce(.Min, acc);
+    while (i < d.len) : (i += 1) lo = @min(lo, d[i]);
+    return lo;
+}
+
 /// Best `k` train rows for each query row; dist/idx are nq * k, with
-/// unused entries left at +inf / -1.
+/// unused entries left at +inf / -1. Distances are computed a block of
+/// train rows at a time, then merged into the sorted list.
 fn topK(comptime T: type, exec: Exec, query: Image(T), train: Image(T), norm: Norm, k: usize, dist: []f32, idx: []i32) void {
     @memset(dist, std.math.inf(f32));
     @memset(idx, -1);
     exec.parallelFor(query.height, 16, Ctx(T){ .query = query, .train = train, .norm = norm, .k = k, .dist = dist, .idx = idx }, struct {
         fn run(c: Ctx(T), q0: usize, q1: usize) void {
             const n = c.train.height;
+            const B = 256;
+            var buf: [B]f32 = undefined;
+            const ham32 = T == u8 and c.norm == .hamming and c.query.width == 32;
             for (q0..q1) |q| {
                 const qd = c.query.row(q);
                 const dl = c.dist[q * c.k ..][0..c.k];
                 const il = c.idx[q * c.k ..][0..c.k];
-                if (T == u8 and c.norm == .hamming and qd.len == 32) {
-                    // ORB descriptors: one 256-bit XOR and popcount per row.
-                    const V = @Vector(4, u64);
-                    const qv: V = @bitCast(qd[0..32].*);
+                var j0: usize = 0;
+                while (j0 < n) : (j0 += B) {
+                    const m = @min(B, n - j0);
+                    const d = buf[0..m];
+                    if (ham32) {
+                        hamming32Block(qd[0..32], c.train, j0, d);
+                    } else for (d, 0..) |*o, j| {
+                        o.* = if (T == u8) distU8(c.norm, qd, c.train.row(j0 + j)) else distF32(c.norm, qd, c.train.row(j0 + j));
+                    }
                     if (c.k == 1) {
-                        var best: u32 = std.math.maxInt(u32);
-                        var bi: i32 = -1;
-                        for (0..n) |j| {
-                            const tv: V = @bitCast(c.train.row(j)[0..32].*);
-                            const d = @reduce(.Add, @as(@Vector(4, u32), @popCount(qv ^ tv)));
-                            if (d < best) {
-                                best = d;
-                                bi = @intCast(j);
-                            }
-                        }
-                        if (bi >= 0) {
-                            dl[0] = @floatFromInt(best);
-                            il[0] = bi;
+                        const lo = minOf(d);
+                        if (lo < dl[0]) {
+                            const at = std.mem.indexOfScalar(f32, d, lo).?;
+                            dl[0] = lo;
+                            il[0] = @intCast(j0 + at);
                         }
                         continue;
                     }
-                    for (0..n) |j| {
-                        const tv: V = @bitCast(c.train.row(j)[0..32].*);
-                        const d = @reduce(.Add, @as(@Vector(4, u32), @popCount(qv ^ tv)));
-                        insert(dl, il, @floatFromInt(d), @intCast(j));
+                    for (d, 0..) |x, j| {
+                        if (x < dl[c.k - 1]) insert(dl, il, x, @intCast(j0 + j));
                     }
-                    continue;
-                }
-                for (0..n) |j| {
-                    const d = if (T == u8) distU8(c.norm, qd, c.train.row(j)) else distF32(c.norm, qd, c.train.row(j));
-                    insert(dl, il, d, @intCast(j));
                 }
             }
         }

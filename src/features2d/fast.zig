@@ -60,7 +60,7 @@ fn offsets(comptime P: u8, stride: usize) [P]usize {
     return o;
 }
 
-const L = @min(32, @max(16, std.simd.suggestVectorLength(u8) orelse 16));
+const L = @min(64, @max(16, std.simd.suggestVectorLength(u8) orelse 16));
 const VU = @Vector(L, u8);
 const Mask = @Int(.unsigned, L);
 
@@ -68,45 +68,52 @@ inline fn sel(b: @Vector(L, bool)) VU {
     return @select(u8, b, @as(VU, @splat(0xff)), @as(VU, @splat(0)));
 }
 
-/// AND of `len` consecutive masks around the circle, for every start.
-inline fn runMask(comptime P: u8, comptime len: u8, m: [P]VU) VU {
+/// For every start around the circle, the minimum of `len` consecutive
+/// values, and the largest of those minima (runs built by doubling).
+inline fn runMinMax(comptime P: u8, comptime len: u8, m: [P]VU) VU {
     var acc: [P]VU = @splat(@as(VU, @splat(0xff)));
-    var pow = m; // pow[k] = AND of m[k .. k + span)
+    var pow = m; // pow[k] = min of m[k .. k + span)
     comptime var span: u8 = 1;
     comptime var pos: u8 = 0;
     inline while (span <= len) : (span *= 2) {
         if (len & span != 0) {
-            inline for (0..P) |k| acc[k] &= pow[(k + pos) % P];
+            inline for (0..P) |k| acc[k] = @min(acc[k], pow[(k + pos) % P]);
             pos += span;
         }
         if (span * 2 <= len) {
             var next: [P]VU = undefined;
-            inline for (0..P) |k| next[k] = pow[k] & pow[(k + span) % P];
+            inline for (0..P) |k| next[k] = @min(pow[k], pow[(k + span) % P]);
             pow = next;
         }
     }
     var r: VU = @splat(0);
-    inline for (0..P) |k| r |= acc[k];
+    inline for (0..P) |k| r = @max(r, acc[k]);
     return r;
 }
 
 /// OpenCV's pre-test (written for 16 points, applied to all patterns with
 /// pixel[k] = pixel[k mod P]): every antipodal pair must have a point
-/// beyond the threshold on the same side.
+/// beyond the threshold on the same side. Here on differences: the
+/// smallest over pairs of the larger difference of the pair.
 inline fn preTest(comptime P: u8, m: [P]VU) VU {
     var r: VU = @splat(0xff);
-    inline for (0..8) |k| r &= m[k % P] | m[(k + 8) % P];
+    inline for (0..8) |k| r = @min(r, @max(m[k % P], m[(k + 8) % P]));
     return r;
 }
 
-/// Corner mask of L pixels starting at `base` + 3 rows + 3 columns.
-inline fn segmentTest(comptime P: u8, base: [*]const u8, stride: usize, o: *const [P]usize, t: u8) Mask {
+/// Corner mask of L pixels starting at `base` + 3 rows + 3 columns, and
+/// (when `scores` is given) each corner's score. With b = circle -| centre
+/// and d = centre -| circle, a pixel is a corner when some arc of K+1
+/// points has min(b) > t or min(d) > t, and its score is the largest such
+/// minimum less one: OpenCV's cornerScore (whose extra arcs for the 7-12
+/// circle cover the same points as its first arc).
+inline fn segmentTest(comptime P: u8, base: [*]const u8, stride: usize, o: *const [P]usize, t: u8, scores: ?*[L]u8) Mask {
     const c: VU = base[3 * stride + 3 ..][0..L].*;
     const tv: VU = @splat(t);
-    const hi = c +| tv;
-    const lo = c -| tv;
     if (P == 16) {
         // Any run of 9 out of 16 covers two neighbouring points of 0/4/8/12.
+        const hi = c +| tv;
+        const lo = c -| tv;
         var q: [4]VU = undefined;
         inline for (0..4) |i| q[i] = base[o[4 * i]..][0..L].*;
         var b: [4]VU = undefined;
@@ -119,20 +126,25 @@ inline fn segmentTest(comptime P: u8, base: [*]const u8, stride: usize, o: *cons
             (d[0] & d[1]) | (d[1] & d[2]) | (d[2] & d[3]) | (d[3] & d[0]);
         if (@reduce(.Or, any) == 0) return 0;
     }
-    var bm: [P]VU = undefined;
-    var dm: [P]VU = undefined;
+    var bd: [P]VU = undefined;
+    var dd: [P]VU = undefined;
     inline for (0..P) |k| {
         const x: VU = base[o[k]..][0..L].*;
-        bm[k] = sel(x > hi);
-        dm[k] = sel(x < lo);
+        bd[k] = x -| c;
+        dd[k] = c -| x;
     }
     const K = P / 2;
-    const r = if (P == 16)
-        runMask(P, K + 1, bm) | runMask(P, K + 1, dm)
+    const rb = runMinMax(P, K + 1, bd);
+    const rd = runMinMax(P, K + 1, dd);
+    const corner = if (P == 16)
+        @max(rb, rd) > tv
     else
-        (runMask(P, K + 1, bm) & preTest(P, bm)) | (runMask(P, K + 1, dm) & preTest(P, dm));
-    if (@reduce(.Or, r) == 0) return 0;
-    return @bitCast(r == @as(VU, @splat(0xff)));
+        (@min(rb, preTest(P, bd)) > tv) | (@min(rd, preTest(P, dd)) > tv);
+    const m: Mask = @bitCast(corner);
+    if (m != 0) if (scores) |s| {
+        s.* = @max(rb, rd) -% @as(VU, @splat(1));
+    };
+    return m;
 }
 
 /// The scalar segment test, line for line OpenCV's FAST_t (used for the
@@ -303,14 +315,15 @@ fn bandP(comptime P: u8, c: Band, b: usize, y0: usize, y1: usize) Allocator.Erro
             const xe = w - 3;
             var x: usize = 3;
             while (x + L <= xe) : (x += L) {
-                var m = segmentTest(P, rowbase + (x - 3), img.stride, &o, t);
+                var sc: [L]u8 = undefined;
+                var m = segmentTest(P, rowbase + (x - 3), img.stride, &o, t, if (nms) &sc else null);
                 while (m != 0) {
                     const lane = @ctz(m);
                     m &= m - 1;
                     const xx = x + lane;
                     cp[nc] = @intCast(xx);
                     nc += 1;
-                    if (nms) curr[xx] = @intCast(cornerScore(P, rowbase + (xx - 3), img.stride, &o));
+                    if (nms) curr[xx] = sc[lane];
                 }
             }
             if (x < xe) {
@@ -318,7 +331,8 @@ fn bandP(comptime P: u8, c: Band, b: usize, y0: usize, y1: usize) Allocator.Erro
                     // One more vector ending at the last column; skip the
                     // lanes already tested.
                     const xs = xe - L;
-                    var m = segmentTest(P, rowbase + (xs - 3), img.stride, &o, t);
+                    var sc: [L]u8 = undefined;
+                    var m = segmentTest(P, rowbase + (xs - 3), img.stride, &o, t, if (nms) &sc else null);
                     m >>= @intCast(x - xs);
                     m <<= @intCast(x - xs);
                     while (m != 0) {
@@ -327,7 +341,7 @@ fn bandP(comptime P: u8, c: Band, b: usize, y0: usize, y1: usize) Allocator.Erro
                         const xx = xs + lane;
                         cp[nc] = @intCast(xx);
                         nc += 1;
-                        if (nms) curr[xx] = @intCast(cornerScore(P, rowbase + (xx - 3), img.stride, &o));
+                        if (nms) curr[xx] = sc[lane];
                     }
                 } else {
                     while (x < xe) : (x += 1) {
@@ -436,18 +450,20 @@ test "FAST vector and scalar paths agree for every pattern" {
                 var x: usize = 3;
                 while (x + L <= img.width - 3) : (x += L) {
                     const base = img.data + (y - 3) * img.stride + (x - 3);
-                    const m = segmentTest(P, base, img.stride, &o, t);
+                    var sc: [L]u8 = undefined;
+                    const m = segmentTest(P, base, img.stride, &o, t, &sc);
                     for (0..L) |lane| {
                         const s = isCornerScalar(P, base + lane, img.stride, &o, t);
                         try testing.expectEqual(s, (m >> @intCast(lane)) & 1 == 1);
                         if (s) {
                             // The score is the largest threshold that still
                             // detects the corner (for the 16-point circle).
-                            const sc = cornerScore(P, base + lane, img.stride, &o);
-                            try testing.expect(sc >= t);
+                            const scs = cornerScore(P, base + lane, img.stride, &o);
+                            try testing.expectEqual(scs, sc[lane]);
+                            try testing.expect(scs >= t);
                             if (P == 16) {
-                                try testing.expect(isCornerScalar(P, base + lane, img.stride, &o, sc));
-                                try testing.expect(!isCornerScalar(P, base + lane, img.stride, &o, sc + 1));
+                                try testing.expect(isCornerScalar(P, base + lane, img.stride, &o, scs));
+                                try testing.expect(!isCornerScalar(P, base + lane, img.stride, &o, scs + 1));
                             }
                         }
                     }
