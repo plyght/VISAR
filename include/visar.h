@@ -295,6 +295,58 @@ int visar_object_detector_detect(visar_object_detector *d, const visar_image *im
                                  size_t *count);
 const char *visar_coco_class_name(int i);
 
+/* calib3d. Points are interleaved floats (x, y) or doubles ((x, y) /
+   (x, y, z)) as noted; matrices are row-major doubles; methods and flags use
+   OpenCV's numbering. Robust estimators draw OpenCV's RANSAC samples (same
+   RNG and seed), so results are deterministic. *found = 0 means no model
+   (OpenCV's empty result). */
+int visar_find_homography(const float *src, const float *dst, size_t n, int method /* 0, 4 LMEDS, 8 RANSAC */,
+                          double ransac_threshold, int max_iters, double confidence, uint8_t *mask /* n or NULL */,
+                          double h[9], int *found);
+int visar_get_perspective_transform(const float src[8], const float dst[8], double m[9]);
+int visar_get_affine_transform(const float src[6], const float dst[6], double m[6]);
+void visar_perspective_transform(const float *src, float *dst, size_t n, const double m[9]);
+/* findFundamentalMat: method 1 FM_7POINT, 2 FM_8POINT, 4 FM_LMEDS, 8 FM_RANSAC; f receives up to 3 matrices
+   (*count of them; several only for FM_7POINT with 7 points). */
+int visar_find_fundamental_mat(const float *p1, const float *p2, size_t n, int method, double ransac_threshold,
+                               double confidence, int max_iters, uint8_t *mask, double f[27], int *count);
+/* solveCubic: real roots of c[0] x^3 + c[1] x^2 + c[2] x + c[3]; returns their number (-1: any x). */
+int visar_solve_cubic(const double c[4], double roots[3]);
+int visar_estimate_affine_2d(const float *src, const float *dst, size_t n, int partial, int method, double ransac_threshold,
+                             int max_iters, double confidence, int refine_iters, uint8_t *inliers, double m[6], int *found);
+/* Rodrigues: n = 3 (vector -> matrix, optional 3x9 jacobian dR/dr) or n = 9 (matrix -> vector, jac NULL). */
+int visar_rodrigues(const double *src, size_t n, double *dst, double jac[27]);
+/* dist: nd = 0, 4, 5 or 8 coefficients (k1 k2 p1 p2 [k3 [k4 k5 k6]]). jac (2n x (10 + nd), nd <= 5) may be NULL. */
+int visar_project_points(const double *obj, size_t n, const double rvec[3], const double tvec[3], const double k[9],
+                         const double *dist, size_t nd, double *out, double *jac);
+int visar_undistort_points(const double *src, size_t n, double *dst, const double k[9], const double *dist, size_t nd,
+                           const double *r /* 3x3 or NULL */, const double *p /* 3x3 or NULL */);
+/* flags: 0 SOLVEPNP_ITERATIVE, 1 SOLVEPNP_EPNP; use_guess seeds ITERATIVE with rvec/tvec. */
+int visar_solve_pnp(const double *obj, const double *img, size_t n, const double k[9], const double *dist, size_t nd,
+                    int flags, int use_guess, double rvec[3], double tvec[3]);
+int visar_solve_pnp_ransac(const double *obj, const double *img, size_t n, const double k[9], const double *dist, size_t nd,
+                           int iterations, double reprojection_error, double confidence, int flags, double rvec[3],
+                           double tvec[3], uint8_t *inliers /* n or NULL */, int *found);
+/* undistort: 8U, 1-4 channels, dst the size of src; new_k may be NULL. */
+int visar_undistort(const visar_image *src, const visar_image *dst, const double k[9], const double *dist, size_t nd,
+                    const double *new_k);
+/* CV_32FC1 maps (VISAR_32F, one channel, the destination size). */
+int visar_init_undistort_rectify_map(const double k[9], const double *dist, size_t nd, const double *r, const double *new_k,
+                                     const visar_image *mapx, const visar_image *mapy);
+/* remap: 8U 1-4 channels through 32F maps, INTER_LINEAR, BORDER_CONSTANT with `value`. */
+int visar_remap(const visar_image *src, const visar_image *dst, const visar_image *mapx, const visar_image *mapy,
+                double value);
+/* cornerSubPix on a 1-channel 8U or 32F image; criteria_type 1 COUNT, 2 EPS, 3 both; zero zone -1 = none. */
+int visar_corner_sub_pix(const visar_image *img, float *corners, size_t n, int win_w, int win_h, int zero_w, int zero_h,
+                         int criteria_type, int max_count, double epsilon);
+/* findChessboardCorners (8U gray, BGR or BGRA): pattern_w * pattern_h (x, y) floats in OpenCV's order. */
+int visar_find_chessboard_corners(const visar_image *img, int pattern_w, int pattern_h, float *corners, int flags,
+                                  int *found);
+/* calibrateCamera over planar views: counts[i] points per view, points back to back; dist has 5 coefficients.
+   Flags: USE_INTRINSIC_GUESS 1, FIX_PRINCIPAL_POINT 4, ZERO_TANGENT_DIST 8, FIX_FOCAL_LENGTH 16, FIX_K1..K3 32/64/128. */
+int visar_calibrate_camera(const double *obj, const double *img, const int *counts, size_t nviews, int width, int height,
+                           double k[9], double dist[5], int flags, double *rvecs, double *tvecs, double *rms);
+
 #ifdef __cplusplus
 }
 #endif
