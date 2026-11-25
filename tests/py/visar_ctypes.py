@@ -716,6 +716,28 @@ class FaceDetector:
                 return self._out[:cnt.value].copy()
             self._out = np.empty((cnt.value, 15), np.float32)
 
+    def detect_frame(self, img):
+        """BGR or BGRA uint8 frame of any size (shrunk to the detector size
+        with INTER_AREA) -> float32 array [N, 15] in frame pixels."""
+        self.prepare(img)
+        self.infer()
+        return self.decode()
+
+    def prepare(self, img):
+        d = desc(img)
+        _check(lib.visar_face_detector_prepare(self._h, ctypes.byref(d)))
+
+    def infer(self):
+        _check(lib.visar_face_detector_infer(self._h))
+
+    def decode(self):
+        cnt = _sz()
+        while True:
+            _check(lib.visar_face_detector_decode(self._h, self._out.ctypes.data_as(_vp), _sz(len(self._out)), ctypes.byref(cnt)))
+            if cnt.value <= len(self._out):
+                return self._out[:cnt.value].copy()
+            self._out = np.empty((cnt.value, 15), np.float32)
+
 
 class Detection(ctypes.Structure):
     _fields_ = [("box", ctypes.c_float * 4), ("score", ctypes.c_float), ("class_id", ctypes.c_int)]

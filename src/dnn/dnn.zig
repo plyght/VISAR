@@ -22,6 +22,7 @@ pub const plan = @import("plan.zig");
 pub const cpu = @import("cpu/backend.zig");
 pub const metal = @import("metal/metal.zig");
 pub const net = @import("net.zig");
+pub const prep = @import("prep.zig");
 pub const face = @import("face.zig");
 pub const detect = @import("detect.zig");
 
@@ -42,6 +43,7 @@ test {
     _ = plan;
     _ = net;
     _ = face;
+    _ = prep;
     _ = metal;
     _ = detect;
     _ = @import("tests.zig");

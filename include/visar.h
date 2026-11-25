@@ -191,6 +191,14 @@ int visar_face_detector_set_backend(visar_face_detector *d, int backend); /* re-
 int visar_face_detector_backend(visar_face_detector *d);
 void visar_face_detector_set_thresholds(visar_face_detector *d, float score_threshold, float nms_threshold, int top_k);
 int visar_face_detector_detect(visar_face_detector *d, const visar_image *img, float *out, size_t cap, size_t *count);
+/* detect() for a BGR or BGRA frame of any size: it is shrunk to the detector size with INTER_AREA
+   (integer factors such as 3840x2160 -> 640x360 in one fused pass into the network input) and the
+   results are in frame pixels. prepare/infer/decode are its three stages, for timing them. */
+int visar_face_detector_detect_frame(visar_face_detector *d, const visar_image *img, float *out, size_t cap,
+                                     size_t *count);
+int visar_face_detector_prepare(visar_face_detector *d, const visar_image *img);
+int visar_face_detector_infer(visar_face_detector *d);
+int visar_face_detector_decode(visar_face_detector *d, float *out, size_t cap, size_t *count);
 
 /* Object detection with the OpenCV Model Zoo's NanoDet and YOLOX models (COCO classes), matching
    the zoo's Python pipelines. arch: -1 detect from the model, 0 NanoDet, 1 YOLOX; a negative

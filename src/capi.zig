@@ -1064,6 +1064,10 @@ export fn visar_face_detector_detect(h: *CFaceDetector, img: *const CImage, out:
     count.* = 0;
     const src = typed(u8, img) catch |e| return fail(e);
     const faces = h.det.detect(exec(), src) catch |e| return failDnn(e);
+    return copyFaces(faces, out, cap, count);
+}
+
+fn copyFaces(faces: []const dnn.Face, out: ?[*]f32, cap: usize, count: *usize) c_int {
     count.* = faces.len;
     if (out) |o| {
         const n = @min(cap, faces.len);
@@ -1071,6 +1075,35 @@ export fn visar_face_detector_detect(h: *CFaceDetector, img: *const CImage, out:
         @memcpy(o[0 .. n * 15], flat[0 .. n * 15]);
     }
     return 0;
+}
+
+/// Detects faces in a BGR or BGRA VISAR_8U frame of any size: shrunk to the
+/// detector size with INTER_AREA (integer factors in one fused pass into the
+/// network input), results in frame pixels. Same output as detect.
+export fn visar_face_detector_detect_frame(h: *CFaceDetector, img: *const CImage, out: ?[*]f32, cap: usize, count: *usize) c_int {
+    count.* = 0;
+    const src = typed(u8, img) catch |e| return fail(e);
+    const faces = h.det.detectFrame(exec(), src) catch |e| return failDnn(e);
+    return copyFaces(faces, out, cap, count);
+}
+
+/// detect_frame in its three stages (to time them): the frame into the
+/// network input, the network, then decoding (results as detect_frame).
+export fn visar_face_detector_prepare(h: *CFaceDetector, img: *const CImage) c_int {
+    const src = typed(u8, img) catch |e| return fail(e);
+    h.det.prepare(exec(), src) catch |e| return failDnn(e);
+    return 0;
+}
+
+export fn visar_face_detector_infer(h: *CFaceDetector) c_int {
+    h.det.infer(exec()) catch |e| return failDnn(e);
+    return 0;
+}
+
+export fn visar_face_detector_decode(h: *CFaceDetector, out: ?[*]f32, cap: usize, count: *usize) c_int {
+    count.* = 0;
+    const faces = h.det.decode() catch |e| return failDnn(e);
+    return copyFaces(faces, out, cap, count);
 }
 
 const CObjectDetector = struct {

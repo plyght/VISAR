@@ -703,7 +703,8 @@ pub const FaceStats = struct {
     /// Detector time of whole-frame and crop rounds, conversion included.
     full_ms: f64 = 0,
     crop_ms: f64 = 0,
-    /// The frame to detector input conversion (part of the above).
+    /// The frame to detector input conversion (part of the above; 0 when
+    /// the detector shrinks the frame itself, see `FaceTracker.fused`).
     convert_ms: f64 = 0,
     /// MOSSE updates, scheduling, matching and re-initialisation.
     track_ms: f64 = 0,
@@ -753,6 +754,10 @@ pub const FaceTracker = struct {
     det_h: u32,
     det_bgra: Image(u8),
     det_bgr: Image(u8),
+    /// Frame pixels per detector pixel when both are integers (the
+    /// detector then shrinks the frame, or a window of it, straight into
+    /// its input; `det_bgra` and `det_bgr` are unused).
+    fused: ?[2]u32,
     /// Detectors planned per input size (the whole frame first, then crop
     /// sizes, which are multiples of 32).
     plans: std.ArrayList(Plan) = .empty,
@@ -801,6 +806,7 @@ pub const FaceTracker = struct {
             .det_h = dh,
             .det_bgra = det_bgra,
             .det_bgr = det_bgr,
+            .fused = visar.dnn.prep.factorsOf(frame_w, frame_h, dw, dh),
             .ref = ref,
         };
         // Plan the whole-frame detector now (this also checks the model).
@@ -897,11 +903,11 @@ pub const FaceTracker = struct {
         if (what != .full and what != .crops) return what;
 
         // ---- detect
-        try self.convert(exec, frame);
+        if (self.fused == null) try self.convert(exec, frame);
         const t_convert = clock.lap();
         self.found.clearRetainingCapacity();
-        if (what == .crops and !try self.detectCrops(exec)) what = .full;
-        if (what == .full) try self.detectIn(exec, 0, 0, self.det_w, self.det_h);
+        if (what == .crops and !try self.detectCrops(exec, frame)) what = .full;
+        if (what == .full) try self.detectIn(exec, frame, 0, 0, self.det_w, self.det_h);
         const t_det = t_convert + clock.lap();
         s.convert_ms += t_convert;
         s.detect_frames += 1;
@@ -949,8 +955,23 @@ pub const FaceTracker = struct {
 
     /// Runs the detector on the (x, y, w, h) window of the detector input
     /// and appends what it finds, in frame pixels.
-    fn detectIn(self: *FaceTracker, exec: visar.Exec, x: u32, y: u32, w: u32, h: u32) !void {
+    fn detectIn(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), x: u32, y: u32, w: u32, h: u32) !void {
         const det = try self.plan(w, h);
+        if (self.fused) |f| {
+            // The window of the frame, shrunk into the detector's input;
+            // results come back in window pixels.
+            const res = try det.detectFrame(exec, try frame.roi(x * f[0], y * f[1], w * f[0], h * f[1]));
+            const ox: f32 = @floatFromInt(x * f[0]);
+            const oy: f32 = @floatFromInt(y * f[1]);
+            for (res) |r| {
+                var g = r;
+                g.box[0] += ox;
+                g.box[1] += oy;
+                for (&g.landmarks) |*l| l.* = .{ l[0] + ox, l[1] + oy };
+                try self.found.append(self.gpa, g);
+            }
+            return;
+        }
         const view = try self.det_bgr.roi(x, y, w, h);
         const res = try det.detect(exec, view);
         const sx = @as(f32, @floatFromInt(self.frame_w)) / @as(f32, @floatFromInt(self.det_w));
@@ -968,7 +989,7 @@ pub const FaceTracker = struct {
     /// Level 2: detects in a square window around each tracked face, at the
     /// whole-frame detector's scale. Returns false (nothing done) when the
     /// windows would not be clearly cheaper than the whole frame.
-    fn detectCrops(self: *FaceTracker, exec: visar.Exec) !bool {
+    fn detectCrops(self: *FaceTracker, exec: visar.Exec, frame: Image(u8)) !bool {
         const sx = @as(f32, @floatFromInt(self.det_w)) / @as(f32, @floatFromInt(self.frame_w));
         const sy = @as(f32, @floatFromInt(self.det_h)) / @as(f32, @floatFromInt(self.frame_h));
         var wins: [64][3]u32 = undefined;
@@ -989,7 +1010,7 @@ pub const FaceTracker = struct {
         // Runs on crops covering most of the frame cost more than one run
         // on all of it.
         if (n == 0 or 10 * area > 6 * @as(u64, self.det_w) * self.det_h) return false;
-        for (wins[0..n]) |r| try self.detectIn(exec, r[0], r[1], r[2], r[2]);
+        for (wins[0..n]) |r| try self.detectIn(exec, frame, r[0], r[1], r[2], r[2]);
         self.stats.crops += n;
         // Overlapping crops can find a face twice: keep the best of each.
         const f = &self.found;

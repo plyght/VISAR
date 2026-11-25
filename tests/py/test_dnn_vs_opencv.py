@@ -120,6 +120,21 @@ def yunet_cases(path):
     got = det.detect(img)
     nw = 0 if want is None else len(want)
     record("setInputSize 320x240 -> 640x480", len(got) == nw and (nw == 0 or np.abs(got - want).max() < 2e-3), f"{len(got)} vs {nw}")
+    # detect_frame: a camera-native BGRA frame (4K, and a size with
+    # non-integer factors) against cvtColor + resize(INTER_AREA) + detect,
+    # boxes scaled back to the frame.
+    src = images[-1][1]
+    for (fw, fh), (w, h) in [((3840, 2160), (640, 360)), ((3840, 2160), (960, 540)), ((1920, 1080), (500, 290))]:
+        frame = cv2.cvtColor(cv2.resize(src, (fw, fh), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2BGRA)
+        ref = cv2.FaceDetectorYN.create(path, "", (w, h))
+        want = ref.detect(cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR), (w, h), interpolation=cv2.INTER_AREA))[1]
+        want = np.zeros((0, 15), np.float32) if want is None else want.copy()
+        want[:, 0:14:2] *= fw / w
+        want[:, 1:14:2] *= fh / h
+        det = vs.FaceDetector(model, (w, h))
+        got = det.detect_frame(frame)
+        ok = got.shape == want.shape and (len(got) == 0 or (np.abs(got[:, :14] - want[:, :14]).max() <= 2e-3 * fw / w and np.abs(got[:, 14] - want[:, 14]).max() <= 1e-4))
+        record(f"detect_frame BGRA {fw}x{fh} -> {w}x{h}", ok, f"{len(got)} faces vs {len(want)}")
 
 
 # ----------------------------------------------------------- object detection

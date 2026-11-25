@@ -97,4 +97,22 @@ pub fn build(b: *std.Build) void {
     bench.addArtifactArg(shared);
     bench.addPassthruArgs();
     b.step("bench", "Benchmark against OpenCV (use -Doptimize=ReleaseFast)").dependOn(&bench.step);
+
+    // The 4K face pipeline (needs VISAR_MODELS): one-shot stages against
+    // OpenCV through the C ABI, and the tracker's change-driven steady state.
+    const steady = b.addExecutable(.{ .name = "visar-face4k-steady", .root_module = b.createModule(.{
+        .root_source_file = b.path("bench/face4k_steady.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "visar", .module = visar },
+            .{ .name = "track_lib", .module = track_lib },
+        },
+    }) });
+    const face4k = b.addSystemCommand(&.{ "python3", "bench/face4k.py", "--lib" });
+    face4k.addArtifactArg(shared);
+    face4k.addArg("--steady");
+    face4k.addArtifactArg(steady);
+    face4k.addPassthruArgs();
+    b.step("face4k", "Benchmark the 4K face pipeline against OpenCV (use -Doptimize=ReleaseFast)").dependOn(&face4k.step);
 }

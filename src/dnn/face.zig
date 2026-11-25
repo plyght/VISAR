@@ -2,7 +2,7 @@
 //! (objdetect/src/face_detect.cpp) with the same preprocessing, decoding and
 //! NMS, so results match `cv2.FaceDetectorYN` on the same model.
 //!
-//! The image (BGR, u8) is zero-padded on the right and bottom to multiples
+//! The image (BGR or BGRA, u8) is zero-padded on the right and bottom to multiples
 //! of 32 and fed as raw 0..255 floats (blobFromImage with no mean or
 //! scale). The network has score, objectness, box and landmark heads at
 //! strides 8, 16 and 32; each anchor's score is sqrt(cls * obj), boxes are
@@ -10,7 +10,9 @@
 
 const std = @import("std");
 const core = @import("../core/core.zig");
+const imgproc = @import("../imgproc/imgproc.zig");
 const net_mod = @import("net.zig");
+const prep = @import("prep.zig");
 const Allocator = std.mem.Allocator;
 const Exec = core.Exec;
 const Image = core.Image;
@@ -48,6 +50,10 @@ pub const FaceDetector = struct {
     candidates: std.ArrayList(Face) = .empty,
     order: std.ArrayList(u32) = .empty,
     result: std.ArrayList(Face) = .empty,
+    /// Frame pixels per detector-input pixel of the last `prepare`.
+    frame_scale: [2]f32 = .{ 1, 1 },
+    /// The resized frame, for sizes `prepare` cannot shrink in one pass.
+    scratch: ?Image(u8) = null,
 
     /// Loads a YuNet ONNX model (`model` must outlive the detector) and
     /// plans it for `opts.width` x `opts.height` images.
@@ -67,6 +73,7 @@ pub const FaceDetector = struct {
         d.candidates.deinit(d.gpa);
         d.order.deinit(d.gpa);
         d.result.deinit(d.gpa);
+        if (d.scratch) |*s| s.deinit(d.gpa);
         d.net.deinit();
         d.* = undefined;
     }
@@ -76,6 +83,8 @@ pub const FaceDetector = struct {
         if (width == 0 or height == 0) return error.InvalidSize;
         d.opts.width = width;
         d.opts.height = height;
+        if (d.scratch) |*s| s.deinit(d.gpa);
+        d.scratch = null;
         d.pad_w = ((width - 1) / divisor + 1) * divisor;
         d.pad_h = ((height - 1) / divisor + 1) * divisor;
         try d.net.plan(&.{&.{ 1, 3, d.pad_h, d.pad_w }});
@@ -93,51 +102,70 @@ pub const FaceDetector = struct {
         return d.net.device().?;
     }
 
-    const PrepCtx = struct { img: Image(u8), blob: []f32, pw: usize, ph: usize };
-
-    /// Detects faces in a BGR image of the configured size. The result is
-    /// owned by the detector and valid until the next call.
+    /// Detects faces in a BGR or BGRA image of the configured size. The
+    /// result is owned by the detector and valid until the next call.
     pub fn detect(d: *FaceDetector, exec: Exec, img: Image(u8)) ![]const Face {
         if (img.width != d.opts.width or img.height != d.opts.height) return error.SizeMismatch;
-        if (img.channels != 3) return error.UnsupportedChannels;
-        const blob = d.net.input(0);
-        exec.parallelFor(d.pad_h, 16, PrepCtx{ .img = img, .blob = blob, .pw = d.pad_w, .ph = d.pad_h }, struct {
-            fn f(c: PrepCtx, s: usize, e: usize) void {
-                const plane = c.pw * c.ph;
-                for (s..e) |y| {
-                    const rows = [3][]f32{ c.blob[y * c.pw ..][0..c.pw], c.blob[plane + y * c.pw ..][0..c.pw], c.blob[2 * plane + y * c.pw ..][0..c.pw] };
-                    if (y >= c.img.height) {
-                        for (rows) |r| @memset(r, 0);
-                        continue;
-                    }
-                    const src = c.img.data[y * c.img.stride ..][0 .. @as(usize, c.img.width) * 3];
-                    const w = c.img.width;
-                    var x: usize = 0;
-                    // 16 pixels at a time: deinterleave B, G, R and widen.
-                    while (x + 16 <= w) : (x += 16) {
-                        const v: @Vector(48, u8) = src[x * 3 ..][0..48].*;
-                        inline for (0..3) |ch| {
-                            const idx = comptime blk: {
-                                var m: [16]i32 = undefined;
-                                for (&m, 0..) |*q, i| q.* = @intCast(i * 3 + ch);
-                                break :blk m;
-                            };
-                            const p: @Vector(16, u8) = @shuffle(u8, v, undefined, idx);
-                            rows[ch][x..][0..16].* = @as(@Vector(16, f32), @floatFromInt(p));
-                        }
-                    }
-                    for (x..w) |xx| {
-                        inline for (0..3) |ch| rows[ch][xx] = @floatFromInt(src[xx * 3 + ch]);
-                    }
-                    for (rows) |r| @memset(r[w..], 0);
-                }
-            }
-        }.f);
-        try d.net.tryRun(exec);
-        return d.postProcess();
+        return d.detectFrame(exec, img);
     }
 
-    fn postProcess(d: *FaceDetector) ![]const Face {
+    /// Detects faces in a BGR or BGRA frame of any size: the frame is
+    /// shrunk to the configured size with INTER_AREA (as cv2.resize, so
+    /// the result is that of resize + detect) and the boxes and landmarks
+    /// are mapped back to frame pixels. `prepare`, `infer` and `decode`
+    /// are its three stages.
+    pub fn detectFrame(d: *FaceDetector, exec: Exec, frame: Image(u8)) ![]const Face {
+        try d.prepare(exec, frame);
+        try d.infer(exec);
+        return d.decode();
+    }
+
+    /// Stage 1: the frame, shrunk to the detector size, into the network
+    /// input. Integer factors (3840x2160 to 640x360 or 960x540, ...) take
+    /// one fused pass from the frame to the planar f32 tensor; other sizes
+    /// are resized into a scratch image first.
+    pub fn prepare(d: *FaceDetector, exec: Exec, frame: Image(u8)) !void {
+        if (frame.channels != 3 and frame.channels != 4) return error.UnsupportedChannels;
+        const w = d.opts.width;
+        const h = d.opts.height;
+        const t: prep.Target = .{ .planes = d.net.input(0), .pw = d.pad_w, .ph = d.pad_h, .w = w, .h = h };
+        if (prep.factors(frame, w, h)) |f| {
+            prep.fill(exec, frame, t, f);
+        } else {
+            // Any other size: INTER_AREA shrinks, bilinear enlarges (as
+            // OpenCV's INTER_AREA does).
+            if (d.scratch) |s| if (s.channels != frame.channels) {
+                d.scratch.?.deinit(d.gpa);
+                d.scratch = null;
+            };
+            if (d.scratch == null) d.scratch = try Image(u8).init(d.gpa, w, h, frame.channels);
+            try imgproc.resize(exec, d.gpa, frame, d.scratch.?, .area);
+            prep.fill(exec, d.scratch.?, t, .{ 1, 1 });
+        }
+        d.frame_scale = .{
+            @as(f32, @floatFromInt(frame.width)) / @as(f32, @floatFromInt(w)),
+            @as(f32, @floatFromInt(frame.height)) / @as(f32, @floatFromInt(h)),
+        };
+    }
+
+    /// Stage 2: the network.
+    pub fn infer(d: *FaceDetector, exec: Exec) !void {
+        try d.net.tryRun(exec);
+    }
+
+    /// Stage 3: decoding, NMS, and the faces mapped to the prepared
+    /// frame's pixels. Owned by the detector, valid until the next call.
+    pub fn decode(d: *FaceDetector) ![]const Face {
+        const faces = try d.postProcess();
+        const sx, const sy = d.frame_scale;
+        if (sx != 1 or sy != 1) for (faces) |*f| {
+            f.box = .{ f.box[0] * sx, f.box[1] * sy, f.box[2] * sx, f.box[3] * sy };
+            for (&f.landmarks) |*l| l.* = .{ l[0] * sx, l[1] * sy };
+        };
+        return faces;
+    }
+
+    fn postProcess(d: *FaceDetector) ![]Face {
         d.candidates.clearRetainingCapacity();
         for (strides, 0..) |stride, i| {
             const cols = d.pad_w / stride;
