@@ -450,9 +450,9 @@ pub fn findHomography(gpa: Allocator, src_in: []const Point2f, dst_in: []const P
             h.?[0..8].* = x;
         }
     }
-    if (h != null and o.method != .lmeds) {
-        // OpenCV 5 reports the inliers of the refined matrix (RANSAC and
-        // all-points); LMeDS keeps its own sigma-based mask.
+    if (h != null) {
+        // OpenCV 5 reports the inliers of the refined matrix at the
+        // reprojection threshold, whatever the method (LMeDS included).
         homographyErrors(src_in, dst_in, h.?, err);
         const t: f32 = @floatCast(thr * thr);
         for (err, best_mask) |e, *k| k.* = @intFromBool(e <= t);
