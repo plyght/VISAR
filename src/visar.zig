@@ -12,6 +12,7 @@ pub const video = @import("video/video.zig");
 pub const videoio = @import("videoio/videoio.zig");
 pub const ui = @import("ui/ui.zig");
 pub const dnn = @import("dnn/dnn.zig");
+pub const features2d = @import("features2d/features2d.zig");
 
 pub const Image = core.Image;
 pub const AnyImage = core.AnyImage;
@@ -28,4 +29,5 @@ test {
     _ = videoio;
     _ = ui;
     _ = dnn;
+    _ = features2d;
 }
