@@ -1,6 +1,6 @@
 //! Linear filtering: a separable engine plus box, Gaussian, Sobel and
-//! Scharr filters. 8-bit Gaussian blur uses OpenCV's bit-exact fixed point
-//! (8 fractional bits per tap) so results match cv2.
+//! Scharr filters. 8-bit and 16-bit Gaussian blur use OpenCV's bit-exact
+//! fixed point (8 and 16 fractional bits per tap) so results match cv2.
 
 const std = @import("std");
 const core = @import("../core/core.zig");
@@ -77,7 +77,7 @@ const FinishShift = struct {
         // Rounding constant 2^(s-1), or 0 when s = 0: no per-vector select.
         const half: E = @truncate((@as(u64, 1) << s) >> 1);
         const r = (v +| @as(@Vector(N, E), @splat(half))) >> @splat(s);
-        return @intCast(@min(r, @as(@Vector(N, E), @splat(255))));
+        return @intCast(@min(r, @as(@Vector(N, E), @splat(std.math.maxInt(D)))));
     }
 };
 
@@ -88,19 +88,19 @@ fn FinishShiftC(comptime s: u5) type {
         inline fn apply(comptime D: type, comptime N: usize, v: anytype, _: f64) @Vector(N, D) {
             const E = @typeInfo(@TypeOf(v)).vector.child;
             const r = (v +| @as(@Vector(N, E), @splat(1 << (s - 1)))) >> @splat(s);
-            return @intCast(@min(r, @as(@Vector(N, E), @splat(255))));
+            return @intCast(@min(r, @as(@Vector(N, E), @splat(std.math.maxInt(D)))));
         }
     };
 }
 
 /// Divides out the largest power of two common to all taps (in place;
 /// callers pass a copy).
-fn reduce(k: []u16) struct { shift: u5, sum: u32 } {
-    var tz: u5 = 15;
+fn reduce(k: anytype) struct { shift: u5, sum: u64 } {
+    var tz: u5 = @bitSizeOf(@TypeOf(k[0])) - 1;
     for (k) |v| if (v != 0) {
         tz = @min(tz, @as(u5, @intCast(@ctz(v))));
     };
-    var sum: u32 = 0;
+    var sum: u64 = 0;
     for (k) |*v| {
         v.* >>= @intCast(tz);
         sum += v.*;
@@ -342,29 +342,104 @@ inline fn floatOf(comptime A: type, v: anytype) A {
 
 // ---------------------------------------------------------------- Gaussian
 
-/// OpenCV's getGaussianKernel. With sigma <= 0 and ksize <= 7, the fixed
-/// small tables are used; otherwise sigma = 0.3*((ksize-1)*0.5 - 1) + 0.8.
-pub fn gaussianKernel(out: []f64, sigma_in: f64) void {
+/// OpenCV's softfloat exp (f64_exp in core/src/softfloat.cpp): a 64-entry
+/// 2^(i/64) table times a degree-5 polynomial, every step an IEEE double
+/// operation, so ordinary f64 arithmetic reproduces it bit for bit. It is
+/// not correctly rounded, so std.math.exp differs from it in the last bit
+/// for many arguments, which can move a quantised Gaussian tap.
+fn cvExp(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    if (std.math.isInf(x)) return if (x > 0) x else 0;
+    const tab = comptime blk: {
+        const raw = [64]u64{
+            0x3ff0000000000000, 0x3ff02c9a3e778061, 0x3ff059b0d3158574, 0x3ff0874518759bc8,
+            0x3ff0b5586cf9890f, 0x3ff0e3ec32d3d1a2, 0x3ff11301d0125b51, 0x3ff1429aaea92de0,
+            0x3ff172b83c7d517b, 0x3ff1a35beb6fcb75, 0x3ff1d4873168b9aa, 0x3ff2063b88628cd6,
+            0x3ff2387a6e756238, 0x3ff26b4565e27cdd, 0x3ff29e9df51fdee1, 0x3ff2d285a6e4030b,
+            0x3ff306fe0a31b715, 0x3ff33c08b26416ff, 0x3ff371a7373aa9cb, 0x3ff3a7db34e59ff7,
+            0x3ff3dea64c123422, 0x3ff4160a21f72e2a, 0x3ff44e086061892d, 0x3ff486a2b5c13cd0,
+            0x3ff4bfdad5362a27, 0x3ff4f9b2769d2ca7, 0x3ff5342b569d4f82, 0x3ff56f4736b527da,
+            0x3ff5ab07dd485429, 0x3ff5e76f15ad2148, 0x3ff6247eb03a5585, 0x3ff6623882552225,
+            0x3ff6a09e667f3bcd, 0x3ff6dfb23c651a2f, 0x3ff71f75e8ec5f74, 0x3ff75feb564267c9,
+            0x3ff7a11473eb0187, 0x3ff7e2f336cf4e62, 0x3ff82589994cce13, 0x3ff868d99b4492ed,
+            0x3ff8ace5422aa0db, 0x3ff8f1ae99157736, 0x3ff93737b0cdc5e5, 0x3ff97d829fde4e50,
+            0x3ff9c49182a3f090, 0x3ffa0c667b5de565, 0x3ffa5503b23e255d, 0x3ffa9e6b5579fdbf,
+            0x3ffae89f995ad3ad, 0x3ffb33a2b84f15fb, 0x3ffb7f76f2fb5e47, 0x3ffbcc1e904bc1d2,
+            0x3ffc199bdd85529c, 0x3ffc67f12e57d14b, 0x3ffcb720dcef9069, 0x3ffd072d4a07897c,
+            0x3ffd5818dcfba487, 0x3ffda9e603db3285, 0x3ffdfc97337b9b5f, 0x3ffe502ee78b3ff6,
+            0x3ffea4afa2a490da, 0x3ffefa1bee615a27, 0x3fff50765b6e4540, 0x3fffa7c1819e90d8,
+        };
+        var t: [64]f64 = undefined;
+        for (&t, raw) |*d, r| d.* = @bitCast(r);
+        break :blk t;
+    };
+    const f = struct {
+        fn h(comptime r: u64) f64 {
+            return @bitCast(r);
+        }
+    }.h;
+    const a0: f64 = comptime f(0x3f83ce0f3e46f431);
+    const p5: f64 = comptime 1.0 / a0;
+    const p4: f64 = comptime f(0x3fe62e42fefa39f1) / a0;
+    const p3: f64 = comptime f(0x3fcebfbdff82a45a) / a0;
+    const p2: f64 = comptime f(0x3fac6b08d81fec75) / a0;
+    const p1: f64 = comptime f(0x3f83b2a72b4f3cd3) / a0;
+    const p0: f64 = comptime f(0x3f55e7aa1566c2a4) / a0;
+    const prescale: f64 = comptime f(0x3ff71547652b82fe) * 64.0;
+    const max_val: f64 = 3000.0 * 64.0;
+    const bits: u64 = @bitCast(x);
+    var x0: f64 = if (((bits >> 52) & 0x7ff) > 1023 + 10) (if (x < 0) -max_val else max_val) else x * prescale;
+    const r = sat.rint(x0);
+    const v: i32 = @intFromFloat(r);
+    const t: u64 = @intCast(std.math.clamp((v >> 6) + 1023, 0, 2047));
+    const buf: f64 = @bitCast(t << 52);
+    x0 = (x0 - r) * (1.0 / 64.0);
+    const poly = ((((p0 * x0 + p1) * x0 + p2) * x0 + p3) * x0 + p4) * x0 + p5;
+    return buf * a0 * tab[@intCast(v & 63)] * poly;
+}
+
+/// OpenCV's getGaussianKernelBitExact (the kernel behind getGaussianKernel
+/// and every GaussianBlur): fixed binomial tables for sigma <= 0 and
+/// ksize <= 9, otherwise sigma = 0.15*ksize + 0.35 (one fused multiply-add)
+/// and exp(-x^2 / (2 sigma^2)) over the half kernel, normalised by the
+/// reciprocal of the sum. Matches cv2.getGaussianKernel(n, sigma, CV_64F)
+/// bit for bit.
+pub fn gaussianKernel(out: []f64, sigma: f64) void {
     const n = out.len;
     const small = [_][]const f64{
         &.{1.0},
         &.{ 0.25, 0.5, 0.25 },
         &.{ 0.0625, 0.25, 0.375, 0.25, 0.0625 },
         &.{ 0.03125, 0.109375, 0.21875, 0.28125, 0.21875, 0.109375, 0.03125 },
+        &.{ 4.0 / 256.0, 13.0 / 256.0, 30.0 / 256.0, 51.0 / 256.0, 60.0 / 256.0, 51.0 / 256.0, 30.0 / 256.0, 13.0 / 256.0, 4.0 / 256.0 },
     };
-    if (n % 2 == 1 and n <= 7 and sigma_in <= 0) {
+    if (n % 2 == 1 and n <= 9 and sigma <= 0) {
         @memcpy(out, small[n / 2]);
         return;
     }
-    const sigma = if (sigma_in > 0) sigma_in else ((@as(f64, @floatFromInt(n)) - 1) * 0.5 - 1) * 0.3 + 0.8;
-    const scale2x = -0.5 / (sigma * sigma);
+    // Taps from the edge inwards with x = 1-n, 3-n, ... (twice the offset,
+    // hence -1/8 rather than -1/2), centre tap exp(0) = 1.
+    const nf: f64 = @floatFromInt(n);
+    const sx = if (sigma > 0) sigma else @mulAdd(f64, nf, 0.15, 0.35);
+    const scale2x = -0.125 / (sx * sx);
+    const half = (n - 1) / 2;
     var sum: f64 = 0;
-    for (out, 0..) |*v, i| {
-        const x = @as(f64, @floatFromInt(i)) - @as(f64, @floatFromInt(n - 1)) * 0.5;
-        v.* = @exp(scale2x * x * x);
-        sum += v.*;
+    var x: i64 = 1 - @as(i64, @intCast(n));
+    for (0..half) |i| {
+        const t = cvExp(@as(f64, @floatFromInt(x * x)) * scale2x);
+        out[i] = t;
+        sum += t;
+        x += 2;
     }
-    for (out) |*v| v.* /= sum;
+    sum = sum * 2 + 1;
+    if (n % 2 == 0) sum += 1;
+    const mul1 = 1.0 / sum;
+    for (0..half) |i| {
+        out[i] *= mul1;
+        out[n - 1 - i] = out[i];
+    }
+    out[half] = mul1;
+    if (n % 2 == 0) out[half + 1] = mul1;
 }
 
 /// OpenCV's automatic kernel size for a sigma (8-bit images: 3 sigma each
@@ -375,40 +450,37 @@ pub fn gaussianKsize(sigma: f64, depth_is_u8: bool) u32 {
     return r | 1;
 }
 
-/// 8-bit kernel in 8.8 fixed point, OpenCV's getGaussianKernelBitExact:
-/// taps are rounded independently (they need not sum to exactly 256).
-fn gaussianKernelFixed(out: []u16, sigma: f64) void {
+/// The fixed-point kernel of OpenCV's bit-exact GaussianBlur
+/// (getGaussianKernelFixedPoint_ED): the half kernel is quantised to
+/// `bits` fractional bits from the edge inwards with error diffusion
+/// (each rounding error carried into the next tap, half to even), and the
+/// centre tap takes whatever makes the taps sum to exactly 2^bits.
+fn gaussianKernelFixed(comptime K: type, out: []K, sigma: f64, comptime bits: u5) void {
     const n = out.len;
     var tmp: [128]f64 = undefined;
     const k = tmp[0..n];
-    if (n % 2 == 1 and n <= 7 and sigma <= 0) {
-        gaussianKernel(k, sigma);
-    } else {
-        // Same arithmetic order as OpenCV (softdouble): taps from the edge
-        // inwards with x = 1-n, 3-n, ..., centre tap exp(0) = 1.
-        const sx = if (sigma > 0) sigma else @as(f64, @floatFromInt(n)) * 0.15 + 0.35;
-        const scale2x = -0.125 / (sx * sx);
-        const half = (n - 1) / 2;
-        var sum: f64 = 0;
-        var x: i64 = 1 - @as(i64, @intCast(n));
-        for (0..half) |i| {
-            const t = @exp(@as(f64, @floatFromInt(x * x)) * scale2x);
-            k[i] = t;
-            sum += t;
-            x += 2;
-        }
-        sum = sum * 2 + 1;
-        if (n % 2 == 0) sum += 1;
-        const mul1 = 1.0 / sum;
-        for (0..half) |i| {
-            k[i] *= mul1;
-            k[n - 1 - i] = k[i];
-        }
-        k[half] = mul1;
-        if (n % 2 == 0) k[half + 1] = mul1;
+    gaussianKernel(k, sigma);
+    const m: f64 = @floatFromInt(@as(u64, 1) << bits);
+    var err: f64 = 0;
+    var sum: u64 = 0;
+    for (0..n / 2) |i| {
+        const a = k[i] * m + err;
+        const v = sat.rint(a);
+        err = a - v;
+        const q: u64 = @intFromFloat(@max(v, 0));
+        out[i] = @intCast(q);
+        out[n - 1 - i] = @intCast(q);
+        sum += q;
     }
-    for (out, k) |*o, v| o.* = @intCast(std.math.clamp(@as(i64, @intFromFloat(sat.rint(v * 256.0))), 0, 65535));
+    out[n / 2] = @intCast((@as(u64, 1) << bits) - 2 * sum);
 }
+
+const FinishU16Fixed = struct {
+    inline fn apply(comptime D: type, comptime N: usize, v: anytype, _: f64) @Vector(N, D) {
+        const r = (v +| @as(@Vector(N, u64), @splat(1 << 31))) >> @splat(32);
+        return @intCast(@min(r, @as(@Vector(N, u64), @splat(65535))));
+    }
+};
 
 pub const GaussianOptions = struct {
     /// Kernel width/height; 0 = derive from sigma.
@@ -420,18 +492,27 @@ pub const GaussianOptions = struct {
     border: Border = .default,
 };
 
-/// Gaussian blur. Supports u8 (bit-exact fixed point), u16, i16 and f32.
+/// Gaussian blur, following cv2.GaussianBlur: u8 and u16 use OpenCV's
+/// bit-exact fixed point (8 and 16 fractional bits per tap, exact integer
+/// sums, one rounding at the end), i16 and f32 the f32 kernel.
 pub fn gaussianBlur(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src), o: GaussianOptions) Error!void {
     const T = @TypeOf(src).Elem;
     const sy_in = if (o.sigma_y > 0) o.sigma_y else o.sigma_x;
-    const kw = if (o.kw > 0) o.kw else gaussianKsize(o.sigma_x, T == u8);
-    const kh = if (o.kh > 0) o.kh else gaussianKsize(sy_in, T == u8);
+    var kw = if (o.kw > 0) o.kw else gaussianKsize(o.sigma_x, T == u8);
+    var kh = if (o.kh > 0) o.kh else gaussianKsize(sy_in, T == u8);
     if (kw % 2 == 0 or kh % 2 == 0 or kw > 127 or kh > 127) return error.InvalidKernel;
+    if (!src.sameShape(dst)) return error.SizeMismatch;
+    // Like OpenCV, a one-pixel-wide (or -high) image is not filtered
+    // along that axis unless the border is constant.
+    if (o.border != .constant) {
+        if (src.width == 1) kw = 1;
+        if (src.height == 1) kh = 1;
+    }
     if (T == u8) {
         var kx: [127]u16 = undefined;
         var ky: [127]u16 = undefined;
-        gaussianKernelFixed(kx[0..kw], o.sigma_x);
-        gaussianKernelFixed(ky[0..kh], sy_in);
+        gaussianKernelFixed(u16, kx[0..kw], o.sigma_x, 8);
+        gaussianKernelFixed(u16, ky[0..kh], sy_in, 8);
         // When every tap shares a power-of-two factor (OpenCV's small fixed
         // kernels do: [1 4 6 4 1] * 16), divide it out. If the reduced 2-D
         // sum fits 16 bits the whole filter runs in u16 lanes, twice as
@@ -442,7 +523,7 @@ pub fn gaussianBlur(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src),
         @memcpy(kyr[0..kh], ky[0..kh]);
         const rx = reduce(kxr[0..kw]);
         const ry = reduce(kyr[0..kh]);
-        if (255 * @as(u64, rx.sum) * ry.sum <= std.math.maxInt(u16)) {
+        if (255 * rx.sum * ry.sum <= std.math.maxInt(u16)) {
             @memcpy(kx[0..kw], kxr[0..kw]);
             @memcpy(ky[0..kh], kyr[0..kh]);
             const shift: u5 = 16 - (rx.shift + ry.shift);
@@ -463,6 +544,40 @@ pub fn gaussianBlur(exec: Exec, gpa: Allocator, src: anytype, dst: @TypeOf(src),
             return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, @floatFromInt(shift));
         }
         const P = Spec(u8, u16, u32, u8, u16, FinishU8Fixed);
+        return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, 1);
+    } else if (T == u16) {
+        // Taps sum to exactly 2^16, so the vertical sums fit u32 and the
+        // horizontal ones u64 without saturating.
+        var kx: [127]u32 = undefined;
+        var ky: [127]u32 = undefined;
+        gaussianKernelFixed(u32, kx[0..kw], o.sigma_x, 16);
+        gaussianKernelFixed(u32, ky[0..kh], sy_in, 16);
+        // Binomial kernels (sigma 0, ksize <= 9) share a power-of-two
+        // factor; divided out, the whole 2-D sum fits u32 lanes.
+        var kxr: [127]u32 = undefined;
+        var kyr: [127]u32 = undefined;
+        @memcpy(kxr[0..kw], kx[0..kw]);
+        @memcpy(kyr[0..kh], ky[0..kh]);
+        const rx = reduce(kxr[0..kw]);
+        const ry = reduce(kyr[0..kh]);
+        if (65535 * rx.sum * ry.sum <= std.math.maxInt(u32)) {
+            const shift: u6 = 32 - (@as(u6, rx.shift) + ry.shift);
+            const k3 = [_]u32{ 1, 2, 1 };
+            const k5 = [_]u32{ 1, 4, 6, 4, 1 };
+            if (kw == kh and std.mem.eql(u32, kxr[0..kw], kyr[0..kh])) {
+                if (kw == 3 and shift == 4 and std.mem.eql(u32, kxr[0..3], &k3)) {
+                    const P = SpecK(u16, u32, u32, u16, u32, FinishShiftC(4), &k3, &k3);
+                    return separable(P, exec, gpa, src, dst, kxr[0..kw], kyr[0..kh], o.border, 0, @floatFromInt(shift));
+                }
+                if (kw == 5 and shift == 8 and std.mem.eql(u32, kxr[0..5], &k5)) {
+                    const P = SpecK(u16, u32, u32, u16, u32, FinishShiftC(8), &k5, &k5);
+                    return separable(P, exec, gpa, src, dst, kxr[0..kw], kyr[0..kh], o.border, 0, @floatFromInt(shift));
+                }
+            }
+            const P = Spec(u16, u32, u32, u16, u32, FinishShift);
+            return separable(P, exec, gpa, src, dst, kxr[0..kw], kyr[0..kh], o.border, 0, @floatFromInt(shift));
+        }
+        const P = Spec(u16, u32, u64, u16, u32, FinishU16Fixed);
         return separable(P, exec, gpa, src, dst, kx[0..kw], ky[0..kh], o.border, 0, 1);
     } else {
         var kxd: [127]f64 = undefined;
@@ -810,6 +925,25 @@ test "gaussian 3x3 matches hand computation" {
     try std.testing.expectEqual(@as(u8, 64), dst.at(2, 2, 0));
     try std.testing.expectEqual(@as(u8, 32), dst.at(1, 2, 0));
     try std.testing.expectEqual(@as(u8, 16), dst.at(1, 1, 0));
+}
+
+test "gaussian kernels match OpenCV bit for bit" {
+    // cv2.getGaussianKernel(3, 0.9, CV_64F): softfloat exp, not libm's.
+    var k3: [3]f64 = undefined;
+    gaussianKernel(&k3, 0.9);
+    try std.testing.expectEqual(@as(u64, 0x3fd09b4b1dc450d8), @as(u64, @bitCast(k3[0])));
+    try std.testing.expectEqual(@as(u64, 0x3fdec969c4775e50), @as(u64, @bitCast(k3[1])));
+    // Fixed point with error diffusion: taps sum to exactly 2^bits
+    // (rounding each tap alone gives 1 4 10 19 31 41 45 ..., summing to 257).
+    var f8: [13]u16 = undefined;
+    gaussianKernelFixed(u16, &f8, 0, 8);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 5, 10, 19, 30, 41, 44, 41, 30, 19, 10, 5, 1 }, &f8);
+    var w16: [13]u32 = undefined;
+    gaussianKernelFixed(u32, &w16, 0, 16);
+    try std.testing.expectEqualSlices(u32, &.{ 380, 1075, 2516, 4877, 7823, 10388, 11418, 10388, 7823, 4877, 2516, 1075, 380 }, &w16);
+    var f9: [9]u16 = undefined;
+    gaussianKernelFixed(u16, &f9, 0, 8);
+    try std.testing.expectEqualSlices(u16, &.{ 4, 13, 30, 51, 60, 51, 30, 13, 4 }, &f9);
 }
 
 test "sobel kernels" {
