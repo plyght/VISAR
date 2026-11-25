@@ -170,3 +170,33 @@ def remap(img, mapx, mapy, value=0, dst=None):
     _check(lib.visar_remap(ctypes.byref(vs.desc(img)), ctypes.byref(vs.desc(dst)), ctypes.byref(vs.desc(mapx)),
                            ctypes.byref(vs.desc(mapy)), c_double(value)))
     return dst
+
+
+def corner_sub_pix(img, corners, win, zero_zone=(-1, -1), criteria=(3, 30, 0.001)):
+    c = np.ascontiguousarray(np.asarray(corners, np.float32).reshape(-1, 2).copy())
+    _check(lib.visar_corner_sub_pix(ctypes.byref(vs.desc(img)), _p(c), c_size_t(len(c)), win[0], win[1], zero_zone[0],
+                                    zero_zone[1], criteria[0], criteria[1], c_double(criteria[2])))
+    return c
+
+
+def find_chessboard_corners(img, pattern, flags=3):
+    w, h = pattern
+    c = np.zeros((w * h, 2), np.float32)
+    found = c_int(0)
+    _check(lib.visar_find_chessboard_corners(ctypes.byref(vs.desc(img)), w, h, _p(c), flags, ctypes.byref(found)))
+    return bool(found.value), (c.reshape(-1, 1, 2) if found.value else None)
+
+
+def calibrate_camera(obj_list, img_list, size, K=None, dist=None, flags=0):
+    counts = np.array([len(np.asarray(o).reshape(-1, 3)) for o in obj_list], np.int32)
+    obj = np.ascontiguousarray(np.concatenate([np.asarray(o, np.float64).reshape(-1, 3) for o in obj_list]))
+    img = np.ascontiguousarray(np.concatenate([np.asarray(i, np.float64).reshape(-1, 2) for i in img_list]))
+    k = np.zeros(9) if K is None else _f64(K).ravel().copy()
+    d = np.zeros(5) if dist is None else _f64(dist).ravel()[:5].copy()
+    n = len(counts)
+    rv = np.zeros((n, 3))
+    tv = np.zeros((n, 3))
+    rms = c_double(0)
+    _check(lib.visar_calibrate_camera(_p(obj), _p(img), _p(counts), c_size_t(n), size[0], size[1], _p(k), _p(d), flags,
+                                      _p(rv), _p(tv), ctypes.byref(rms)))
+    return rms.value, k.reshape(3, 3), d.reshape(1, 5), [r.reshape(3, 1) for r in rv], [t.reshape(3, 1) for t in tv]

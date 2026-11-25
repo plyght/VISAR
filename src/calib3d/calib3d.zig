@@ -10,6 +10,8 @@ pub const homography = @import("homography.zig");
 pub const camera = @import("camera.zig");
 pub const pose = @import("pose.zig");
 pub const undistort_mod = @import("undistort.zig");
+pub const chessboard = @import("chessboard.zig");
+pub const calibrate = @import("calibrate.zig");
 
 pub const Point2f = homography.Point2f;
 pub const Method = homography.Method;
@@ -30,6 +32,9 @@ pub const solvePnPRansac = pose.solvePnPRansac;
 pub const undistort = undistort_mod.undistort;
 pub const initUndistortRectifyMap = undistort_mod.initUndistortRectifyMap;
 pub const remap = undistort_mod.remap;
+
+pub const findChessboardCorners = chessboard.findChessboardCorners;
+pub const calibrateCamera = calibrate.calibrateCamera;
 
 test {
     std.testing.refAllDecls(@This());

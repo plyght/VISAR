@@ -17,6 +17,7 @@ pub const polygon = @import("polygon.zig");
 pub const shape = @import("shape.zig");
 pub const pyramid = @import("pyramid.zig");
 pub const corner = @import("corner.zig");
+pub const subpix = @import("subpix.zig");
 
 pub const Border = border.Border;
 
@@ -65,6 +66,7 @@ pub const Point2f = corner.Point2f;
 pub const cornerMinEigenVal = corner.cornerMinEigenVal;
 pub const cornerHarris = corner.cornerHarris;
 pub const goodFeaturesToTrack = corner.goodFeaturesToTrack;
+pub const cornerSubPix = subpix.cornerSubPix;
 
 pub const connectedComponentsWithStats = components.connectedComponentsWithStats;
 

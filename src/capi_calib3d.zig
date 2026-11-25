@@ -211,3 +211,99 @@ export fn visar_remap(src: *const capi.CImage, dst: *const capi.CImage, mapx: *c
     c3.remap(capi.exec(), s, d, mx, my, @splat(v)) catch |e| return fail(e);
     return 0;
 }
+
+// --------------------------------------------------------- calibration
+
+/// cornerSubPix on a one-channel VISAR_8U or VISAR_32F image: refines n
+/// (x, y) float corners in place. Half window (win_w, win_h), dead zone
+/// (zero_w, zero_h; -1 = none), and TermCriteria (`criteria_type` 1 =
+/// COUNT, 2 = EPS, 3 = both).
+export fn visar_corner_sub_pix(img: *const capi.CImage, corners: [*]f32, n: usize, win_w: c_int, win_h: c_int, zero_w: c_int, zero_h: c_int, criteria_type: c_int, max_count: c_int, epsilon: f64) c_int {
+    if (win_w <= 0 or win_h <= 0) return fail(error.InvalidArgument);
+    const o: visar.imgproc.subpix.SubPixOptions = .{
+        .win_w = @intCast(win_w),
+        .win_h = @intCast(win_h),
+        .zero_w = zero_w,
+        .zero_h = zero_h,
+        .max_iters = if (criteria_type & 1 != 0) @intCast(@max(max_count, 0)) else 0,
+        .epsilon = if (criteria_type & 2 != 0) epsilon else -1,
+    };
+    const pts = @as([*]Point2f, @ptrCast(@alignCast(corners)))[0..n];
+    switch (img.depth) {
+        inline 0, 5 => |dep| {
+            const T = if (dep == 0) u8 else f32;
+            const s = capi.typed(T, img) catch |e| return fail(e);
+            visar.imgproc.cornerSubPix(gpa, s, pts, o) catch |e| return fail(e);
+        },
+        else => return fail(error.Unsupported),
+    }
+    return 0;
+}
+
+/// findChessboardCorners on a VISAR_8U image (1 channel, or 3/4 channel
+/// BGR(A), converted to gray). `corners` receives pattern_w * pattern_h
+/// (x, y) floats; `found` is 1 when the board was found. `flags` uses
+/// OpenCV's CALIB_CB_* bits (ADAPTIVE_THRESH 1, NORMALIZE_IMAGE 2,
+/// FILTER_QUADS 4, FAST_CHECK 8).
+export fn visar_find_chessboard_corners(img: *const capi.CImage, pattern_w: c_int, pattern_h: c_int, corners: [*]f32, flags: c_int, found: *c_int) c_int {
+    found.* = 0;
+    if (pattern_w < 2 or pattern_h < 2) return fail(error.InvalidArgument);
+    const s = capi.typed(u8, img) catch |e| return fail(e);
+    var gray = s;
+    var owned = false;
+    if (s.channels == 3 or s.channels == 4) {
+        gray = visar.core.Image(u8).init(gpa, s.width, s.height, 1) catch |e| return fail(e);
+        owned = true;
+        visar.imgproc.cvtColor(capi.exec(), s, gray, if (s.channels == 3) .bgr2gray else .bgra2gray) catch |e| {
+            gray.deinit(gpa);
+            return fail(e);
+        };
+    } else if (s.channels != 1) return fail(error.Unsupported);
+    defer if (owned) gray.deinit(gpa);
+    const n: usize = @intCast(pattern_w * pattern_h);
+    const out = @as([*]Point2f, @ptrCast(@alignCast(corners)))[0..n];
+    const ok = c3.findChessboardCorners(capi.exec(), gpa, gray, @intCast(pattern_w), @intCast(pattern_h), out, .{
+        .adaptive_thresh = flags & 1 != 0,
+        .normalize_image = flags & 2 != 0,
+        .filter_quads = flags & 4 != 0,
+        .fast_check = flags & 8 != 0,
+    }) catch |e| return fail(e);
+    found.* = @intFromBool(ok);
+    return 0;
+}
+
+/// calibrateCamera over `nviews` views of a planar target: view i has
+/// counts[i] points, all views' (x, y, z) object points and (u, v) image
+/// points stored back to back. `k` (3x3) and `dist` (5: k1 k2 p1 p2 k3)
+/// are outputs (and the initial guess with CALIB_USE_INTRINSIC_GUESS).
+/// Supported flags: USE_INTRINSIC_GUESS 1, FIX_PRINCIPAL_POINT 4,
+/// ZERO_TANGENT_DIST 8, FIX_FOCAL_LENGTH 16, FIX_K1 32, FIX_K2 64,
+/// FIX_K3 128. `rvecs`/`tvecs` (3 doubles per view) may be null; `rms`
+/// receives the RMS reprojection error.
+export fn visar_calibrate_camera(obj: [*]const f64, img: [*]const f64, counts: [*]const c_int, nviews: usize, width: c_int, height: c_int, k: *[9]f64, dist: *[5]f64, flags: c_int, rvecs: ?[*]f64, tvecs: ?[*]f64, rms: *f64) c_int {
+    if (nviews == 0 or width <= 0 or height <= 0 or flags < 0) return fail(error.InvalidArgument);
+    const f = c3.calibrate.Flags.fromBits(@intCast(flags)) catch |e| return fail(e);
+    const views = gpa.alloc(c3.calibrate.View, nviews) catch |e| return fail(e);
+    defer gpa.free(views);
+    const rv = gpa.alloc([3]f64, 2 * nviews) catch |e| return fail(e);
+    defer gpa.free(rv);
+    var off: usize = 0;
+    for (views, 0..) |*v, i| {
+        if (counts[i] < 0) return fail(error.InvalidArgument);
+        const n: usize = @intCast(counts[i]);
+        v.* = .{
+            .obj = @as([*]const [3]f64, @ptrCast(obj))[off..][0..n],
+            .img = @as([*]const [2]f64, @ptrCast(img))[off..][0..n],
+        };
+        off += n;
+    }
+    const r = c3.calibrateCamera(gpa, views, @intCast(width), @intCast(height), k.*, dist.*, f, rv[0..nviews], rv[nviews..]) catch |e| return fail(e);
+    k.* = r.K;
+    dist.* = r.dist;
+    rms.* = r.rms;
+    for (0..nviews) |i| {
+        if (rvecs) |o| o[3 * i ..][0..3].* = rv[i];
+        if (tvecs) |o| o[3 * i ..][0..3].* = rv[nviews + i];
+    }
+    return 0;
+}
