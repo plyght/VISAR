@@ -10,7 +10,7 @@
 //! BT.709) and the nearest chroma sample, as the AVI and YUV4MPEG2 readers
 //! do: the same picture whichever backend reads it. Frame n is the frame
 //! presented at first_pts + n / fps; seeking starts a new AVAssetReader a
-//! little before that time (the decoder starts from the keyframe before it
+//! quarter frame into it (the decoder starts from the keyframe before it
 //! and the frames before the target are skipped). The track's
 //! preferredTransform (rotation metadata) is not applied.
 //!
@@ -262,9 +262,10 @@ pub const Reader = struct {
         defer pool.pop();
         const fps = if (self.fps > 0) self.fps else 30;
         const t = self.first_pts + @as(f64, @floatFromInt(n)) / fps;
-        // Start a little early: the range is in presentation time and the
-        // frame's own time may be rounded.
-        try self.start(@max(0, t - 0.5 / fps));
+        // The reader's first sample is the frame on screen at the range's
+        // start (re-stamped to that time): start a quarter frame into frame
+        // n, so rounding cannot land in frame n - 1.
+        try self.start(t + 0.25 / fps);
         self.skip_before = t - 0.5 / fps;
         self.pos = n;
     }
