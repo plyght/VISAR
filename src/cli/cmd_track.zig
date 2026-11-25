@@ -55,7 +55,7 @@ pub const opts = [_]args.Opt{
     .{ .long = "face-width", .value = "N", .help = "Width the face detector works at (default 320)" },
     .{ .long = "detect-every", .value = "N", .help = "Run the face detector every N frames, MOSSE in between (default 4)" },
     .{ .long = "change-level", .value = "N", .help = "0 off, 1 skip unchanged frames, 2 also detect around faces only (default)" },
-    .{ .long = "full-gray", .help = "Face tracking: the whole gray tracking image every frame (default: only around the faces between whole-frame detections)" },
+    .{ .long = "full-gray", .help = "Whole gray tracking image every frame (default: only around faces)" },
     .{ .long = "list-cameras", .help = "List the cameras, their sizes and frame rates, and exit" },
 };
 

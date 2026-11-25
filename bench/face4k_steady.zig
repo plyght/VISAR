@@ -23,7 +23,9 @@
 //! Tracking quality: "followed" frames with a track at IoU >= 0.5 to the
 //! face moved with the image, "mean_iou" and "mean_err_px" (centre error
 //! at 4K) of the best track; "gray_read" is the share of the tracking
-//! image computed (so of the frame read for it).
+//! image computed (so of the frame read for it). "gray_ms" times
+//! trackingImage only: the parts of a partial image the step computes count
+//! in "track_ms".
 //!   --profile: instead, the CPU program of YuNet step by step at 1 and
 //!       --threads threads (each step timed alone).
 
