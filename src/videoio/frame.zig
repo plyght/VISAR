@@ -20,6 +20,7 @@ const Image = core.Image;
 const Exec = core.Exec;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const is_arm = core.vec.is_arm;
 
 pub const none: u8 = 0xff;
 
@@ -196,6 +197,10 @@ fn Kernel(comptime cn: usize) type {
             for (y0..y1) |oy| {
                 const out_row = c.dst.row(oy);
                 var x0: usize = 0; // source pixels
+                if (comptime is_arm) switch (k) {
+                    inline 3, 4, 6, 8 => |kk| x0 = planar(kk, c.src, oy, out_row) * kk,
+                    else => {},
+                };
                 while (x0 < dw * k) {
                     const npx = @min(dw * k - x0, per_chunk);
                     const acc = acc_buf[0 .. npx * cn];
@@ -205,6 +210,54 @@ fn Kernel(comptime cn: usize) type {
                     x0 += npx;
                 }
             }
+        }
+
+        /// AArch64, common factors: per colour column sums of 16-pixel
+        /// deinterleaving loads (ld3/ld4; alpha never added), each output's
+        /// `k` lanes summed through constant shuffles, then the luma as in
+        /// `blocks`, 8 or 16 outputs at a time. Returns the outputs done.
+        fn planar(comptime k: usize, src: Image(u8), oy: usize, out: []u8) usize {
+            const P = if (k % 3 == 0) 48 else 32;
+            const O = P / k;
+            const G = P / 16;
+            const H = @Vector(16, u16);
+            const U = @Vector(O, u32);
+            const masks = comptime blk: {
+                var m: [k][O]i32 = undefined;
+                for (0..k) |t| for (0..O) |j| {
+                    m[t][j] = @intCast(j * k + t);
+                };
+                break :blk m;
+            };
+            const inv: @Vector(O, f32) = @splat(1.0 / @as(f32, @floatFromInt(k * k * (1 << 14))));
+            const wts = [3]U{ @splat(wb), @splat(wg), @splat(wr) };
+            var x: usize = 0;
+            while (x + O <= out.len) : (x += O) {
+                var acc: [3][G]H = undefined;
+                inline for (0..3) |ch| inline for (0..G) |g| {
+                    acc[ch][g] = @splat(0);
+                };
+                for (0..k) |dy| {
+                    const p = src.row(oy * k + dy).ptr + x * k * cn;
+                    inline for (0..G) |g| {
+                        const v = core.vec.load(cn, p + g * 16 * cn);
+                        inline for (0..3) |ch| acc[ch][g] += @as(H, v[ch]);
+                    }
+                }
+                var l: U = @splat(0);
+                inline for (0..3) |ch| {
+                    var lanes: [P]u16 = undefined;
+                    inline for (0..G) |g| lanes[g * 16 ..][0..16].* = acc[ch][g];
+                    const all: @Vector(P, u16) = lanes;
+                    var sum: @Vector(O, u16) = @shuffle(u16, all, undefined, masks[0]);
+                    inline for (1..k) |t| sum += @shuffle(u16, all, undefined, masks[t]);
+                    l += @as(U, sum) * wts[ch];
+                }
+                const f = @min(@as(@Vector(O, f32), @floatFromInt(l)) * inv + @as(@Vector(O, f32), @splat(0.5)), @as(@Vector(O, f32), @splat(255)));
+                const q: @Vector(O, u32) = @intFromFloat(f);
+                out[x..][0..O].* = @as(@Vector(O, u8), @truncate(q));
+            }
+            return x;
         }
 
         fn sumRows(src: Image(u8), y: usize, k: usize, off: usize, acc: []u16) void {
@@ -318,7 +371,7 @@ test "ring store crops, pads and converts channel counts" {
 test "grayDownsample matches cvtColor + area resize" {
     const gpa = std.testing.allocator;
     const imgproc = @import("../imgproc/imgproc.zig");
-    inline for (.{ 4, 3 }) |cn| for ([_]u32{ 1, 2, 3 }) |k| {
+    inline for (.{ 4, 3 }) |cn| for ([_]u32{ 1, 2, 3, 4, 6, 8 }) |k| {
         const W = 70 * k + 1;
         const H = 9 * k;
         var src = try Image(u8).init(gpa, W, H, cn);
@@ -346,5 +399,27 @@ test "grayDownsample matches cvtColor + area resize" {
             try imgproc.cvtColor(.serial, src, ref, if (cn == 4) .bgra2gray else .bgr2gray);
             for (ref.slice(), dst.slice()) |r, d| try std.testing.expect(@abs(@as(i32, r) - d) <= 1);
         }
+    };
+}
+
+test "grayDownsample planar rows equal the block sums" {
+    const gpa = std.testing.allocator;
+    inline for (.{ 4, 3 }) |cn| inline for (.{ 3, 4, 6, 8 }) |k| {
+        const W = 50 * k;
+        var src = try Image(u8).init(gpa, W, k, cn);
+        defer src.deinit(gpa);
+        var prng = std.Random.DefaultPrng.init(k + cn);
+        prng.random().bytes(src.slice());
+        var want = try Image(u8).init(gpa, 50, 1, 1);
+        defer want.deinit(gpa);
+        // The generic path (x86) or the planar one (AArch64)...
+        try grayDownsample(.serial, src, want, k);
+        // ...against the planar rows plus the generic tail.
+        var got: [50]u8 = undefined;
+        const done = Kernel(cn).planar(k, src, 0, &got);
+        var acc: [50 * 8 * cn]u16 = undefined;
+        Kernel(cn).sumRows(src, 0, k, done * k * cn, acc[0 .. (50 - done) * k * cn]);
+        Kernel(cn).blocks(acc[0 .. (50 - done) * k * cn], got[done..], k);
+        try std.testing.expectEqualSlices(u8, want.row(0), &got);
     };
 }
