@@ -154,6 +154,14 @@ fn profileNet(gpa: std.mem.Allocator, io: Io, exec: visar.Exec, model: []const u
     const fh = fw * H / W;
     var det = try visar.dnn.FaceDetector.create(gpa, model, .{ .width = fw, .height = fh, .backend = .cpu });
     defer det.deinit();
+    try profileProgram(io, exec, &det);
+    // Again without streaming: every step alone (the chains' layers).
+    det.net.opts.stream = false;
+    try det.setInputSize(fw, fh);
+    try profileProgram(io, exec, &det);
+}
+
+fn profileProgram(io: Io, exec: visar.Exec, det: *visar.dnn.FaceDetector) !void {
     const c = &det.net.compiled.?;
     const base: [*]f32 = @ptrCast(c.buf.ptr);
     var ob: [4096]u8 = undefined;
