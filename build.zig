@@ -88,6 +88,20 @@ pub fn build(b: *std.Build) void {
     const track_tests = b.addTest(.{ .root_module = track_lib, .filters = test_filters, .use_llvm = use_llvm });
     test_step.dependOn(&b.addRunArtifact(track_tests).step);
 
+    // The public header must compile as C99 and as C++17.
+    if (!target.result.cpu.arch.isWasm()) {
+        for ([_][]const u8{ "c", "cpp" }, [_][]const []const u8{
+            &.{ "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic" },
+            &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+        }) |ext, flags| {
+            const mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+            mod.addIncludePath(b.path("include"));
+            mod.addCSourceFile(.{ .file = b.path(b.fmt("tests/c/header_check.{s}", .{ext})), .flags = flags });
+            const obj = b.addObject(.{ .name = b.fmt("header_check_{s}", .{ext}), .root_module = mod });
+            test_step.dependOn(&obj.step);
+        }
+    }
+
     // Differential tests against OpenCV (needs python3 with numpy and cv2).
     const difftest = b.addSystemCommand(&.{ "python3", "tests/py/run_all.py", "--lib" });
     difftest.addArtifactArg(shared);

@@ -107,11 +107,11 @@ typedef struct visar_moments {
     double m00, m10, m01, m20, m11, m02, m30, m21, m12, m03;
     double mu20, mu11, mu02, mu30, mu21, mu12, mu03;
     double nu20, nu11, nu02, nu30, nu21, nu12, nu03;
-} visar_moments;
+} visar_moments_t;
 typedef struct visar_rotated_rect { float cx, cy, width, height, angle; } visar_rotated_rect;
-int visar_moments(const visar_image *img /* 1 channel: 8U, 16U, 16S, 32F */, int binary, visar_moments *out);
-int visar_contour_moments(const void *pts, size_t n, int depth, visar_moments *out);
-void visar_hu_moments(const visar_moments *m, double hu[7]);
+int visar_moments(const visar_image *img /* 1 channel: 8U, 16U, 16S, 32F */, int binary, visar_moments_t *out);
+int visar_contour_moments(const void *pts, size_t n, int depth, visar_moments_t *out);
+void visar_hu_moments(const visar_moments_t *m, double hu[7]);
 int visar_contour_area(const void *pts, size_t n, int depth, int oriented, double *out);
 int visar_arc_length(const void *pts, size_t n, int depth, int closed, double *out);
 int visar_bounding_rect(const void *pts, size_t n, int depth, int32_t rect[4] /* x, y, w, h */);
