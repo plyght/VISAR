@@ -12,7 +12,6 @@
 const std = @import("std");
 const core = @import("../core/core.zig");
 const simd = core.simd;
-const vec = core.vec;
 const Exec = core.Exec;
 const Image = core.Image;
 
@@ -73,10 +72,7 @@ pub fn fill(exec: Exec, src: Image(u8), t: Target, f: [2]u32) void {
                     inline 3, 4 => |cn| if (c.fx == 1 and c.fy == 1)
                         copyRow(cn, c.src.row(y), rows, w)
                     else
-                        shrinkRow(cn, c.src, y, c.fx, c.fy, rows, w, if (comptime vec.is_arm) switch (c.fx) {
-                            inline 2, 3, 4, 6, 8 => |fx| shrinkPlanar(cn, fx, c.src, y, c.fy, rows, w),
-                            else => 0,
-                        } else 0),
+                        shrinkRow(cn, c.src, y, c.fx, c.fy, rows, w),
                     else => unreachable,
                 }
                 for (rows) |r| @memset(r[w..], 0);
@@ -106,55 +102,6 @@ fn copyRow(comptime cn: usize, src: []const u8, rows: [3][]f32, w: usize) void {
     }
 }
 
-/// AArch64, common factors (`fx` of 2, 3, 4, 6, 8), channel-planar: 16-pixel
-/// deinterleaving loads (ld3/ld4 on AArch64), column sums per colour
-/// (alpha is never added), then each output's `fx` lanes summed through
-/// constant shuffles and written as 8 or 16 floats per plane. Returns the
-/// output pixels done (a whole number of chunks; `shrinkRow` does the
-/// rest). Slower than `shrinkRow` on x86, whose 4-channel deinterleave
-/// takes several byte shuffles per 16 pixels.
-fn shrinkPlanar(comptime cn: usize, comptime fx: usize, src: Image(u8), y: usize, fy: u32, rows: [3][]f32, w: usize) usize {
-    const P = if (fx % 3 == 0) 48 else 32; // source pixels per chunk
-    const O = P / fx;
-    const G = P / 16;
-    const H = @Vector(16, u16);
-    var srows: [max_factor][*]const u8 = undefined;
-    for (0..fy) |k| srows[k] = src.row(y * fy + k).ptr;
-    const scale: @Vector(O, f32) = @splat(1.0 / @as(f32, @floatFromInt(fx * fy)));
-    const top: @Vector(O, f32) = @splat(255);
-    const masks = comptime blk: {
-        var m: [fx][O]i32 = undefined;
-        for (0..fx) |t| for (0..O) |j| {
-            m[t][j] = @intCast(j * fx + t);
-        };
-        break :blk m;
-    };
-    var x: usize = 0;
-    while (x + O <= w) : (x += O) {
-        var acc: [3][G]H = undefined;
-        inline for (0..3) |c| inline for (0..G) |g| {
-            acc[c][g] = @splat(0);
-        };
-        for (srows[0..fy]) |r| {
-            const p = r + x * fx * cn;
-            inline for (0..G) |g| {
-                const v = vec.load(cn, p + g * 16 * cn);
-                inline for (0..3) |c| acc[c][g] += @as(H, v[c]);
-            }
-        }
-        inline for (0..3) |c| {
-            var lanes: [P]u16 = undefined;
-            inline for (0..G) |g| lanes[g * 16 ..][0..16].* = acc[c][g];
-            const all: @Vector(P, u16) = lanes;
-            var sum: @Vector(O, u16) = @shuffle(u16, all, undefined, masks[0]);
-            inline for (1..fx) |t| sum += @shuffle(u16, all, undefined, masks[t]);
-            const f = simd.toF32(O, sum) * scale;
-            rows[c][x..][0..O].* = @min(simd.rintSmall(f), top);
-        }
-    }
-    return x;
-}
-
 /// Output pixels per segment: the segment's column sums (at most
 /// seg * max_factor pixels) stay on the stack, in L1.
 const seg = 32;
@@ -166,7 +113,7 @@ const vn = 32;
 /// then each output pixel's sum over `fx` columns (all four lanes of a
 /// pixel at once), then the scale, rounding and deinterleave into the
 /// three planes, 8 pixels at a time.
-fn shrinkRow(comptime cn: usize, src: Image(u8), y: usize, fx: u32, fy: u32, rows: [3][]f32, w: usize, start: usize) void {
+fn shrinkRow(comptime cn: usize, src: Image(u8), y: usize, fx: u32, fy: u32, rows: [3][]f32, w: usize) void {
     const U = @Vector(vn, u16);
     var vs: [seg * max_factor * cn + vn]u16 = undefined;
     var hs: [seg * 4]u16 align(16) = undefined;
@@ -175,7 +122,7 @@ fn shrinkRow(comptime cn: usize, src: Image(u8), y: usize, fx: u32, fy: u32, row
     const scale: f32 = 1.0 / @as(f32, @floatFromInt(fx * fy));
     const sv: @Vector(8, f32) = @splat(scale);
     const top: @Vector(8, f32) = @splat(255);
-    var x0: usize = start;
+    var x0: usize = 0;
     while (x0 < w) : (x0 += seg) {
         const n = @min(seg, w - x0);
         const len = n * fx * cn;
@@ -267,24 +214,4 @@ test "factors" {
     try testing.expectEqual([2]u32{ 4, 4 }, factors(img, 960, 540).?);
     try testing.expectEqual(@as(?[2]u32, null), factors(img, 700, 360));
     try testing.expectEqual(@as(?[2]u32, null), factors(img, 120, 90));
-}
-
-test "planar shrink equals the segment shrink" {
-    const gpa = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(5);
-    const rnd = prng.random();
-    inline for (.{ 2, 3, 4, 6, 8 }) |fx| inline for (.{ 3, 4 }) |cn| {
-        const w = 45;
-        const fy = 5;
-        var src = try Image(u8).init(gpa, w * fx, fy, cn);
-        defer src.deinit(gpa);
-        for (src.slice()) |*v| v.* = rnd.int(u8);
-        var a: [3][w]f32 = undefined;
-        var b: [3][w]f32 = undefined;
-        shrinkRow(cn, src, 0, fx, fy, .{ &a[0], &a[1], &a[2] }, w, 0);
-        const done = shrinkPlanar(cn, fx, src, 0, fy, .{ &b[0], &b[1], &b[2] }, w);
-        try testing.expect(done > 0);
-        shrinkRow(cn, src, 0, fx, fy, .{ &b[0], &b[1], &b[2] }, w, done);
-        try testing.expectEqual(a, b);
-    };
 }
