@@ -15,7 +15,7 @@
 //!   visar-face4k-steady [--models DIR] [--threads N] [--face-width N]
 //!       [--level L] [--detect-every N] [--frames N] [--size WxH]
 //!       [--backend auto|cpu|metal] [--separate] [--full-gray]
-//!       [--still-stride N]
+//!       [--still-stride N] [--slices N]
 //!   --separate: the tracking image always on its own (grayDownsample).
 //!   --full-gray: the whole tracking image every frame (FaceOptions
 //!       .partial_gray off; by default frames without a whole-frame
@@ -29,9 +29,11 @@
 //! Per-frame latency: every timed frame is timed alone; "p50_ms" ..
 //! "max_ms" are nearest-rank percentiles over all frames, and "by_step"
 //! splits the frames by what the step did: whole-frame detections
-//! ("full"), crop-only detections ("crops") and frames without a detection
-//! ("tracked", postponed ones included), each with the count, mean, p50,
-//! p95, p99 and max ms of the whole frame (gray image + step).
+//! ("full"), crop-only detections ("crops"), the frames of amortised
+//! whole-frame detections ("slice", FaceOptions.detect_slices; --slices 1
+//! detects on one frame) and frames without a detection ("tracked",
+//! postponed ones included), each with the count, mean, p50, p95, p99 and
+//! max ms of the whole frame (gray image + step).
 //!   --profile: instead, the CPU program of YuNet step by step at 1 and
 //!       --threads threads (each step timed alone).
 
@@ -82,6 +84,8 @@ pub fn main(init: std.process.Init) !void {
             opts.level = try std.fmt.parseInt(u8, v, 10);
         } else if (std.mem.eql(u8, a, "--detect-every")) {
             opts.detect_every = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, a, "--slices")) {
+            opts.detect_slices = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--still-stride")) {
             opts.still_stride = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--frames")) {
@@ -147,8 +151,8 @@ pub fn main(init: std.process.Init) !void {
     }
     const s = ft.stats;
     // Per kind of step (before `times` is sorted).
-    var by: [3]Dist = undefined;
-    const groups = [3][]const track.FaceStep{ &.{.full}, &.{.crops}, &.{ .tracked, .postponed } };
+    var by: [4]Dist = undefined;
+    const groups = [4][]const track.FaceStep{ &.{.full}, &.{.crops}, &.{.slice}, &.{ .tracked, .postponed } };
     const scratch = try gpa.alloc(f64, frames);
     defer gpa.free(scratch);
     for (groups, &by) |g, *d| {
@@ -165,20 +169,21 @@ pub fn main(init: std.process.Init) !void {
     var ow = Io.File.Writer.initStreaming(.stdout(), io, &ob);
     const w = &ow.interface;
     try w.print(
-        \\{{"size":"{d}x{d}","detector":"{d}x{d}","threads":{d},"level":{d},"detect_every":{d},"frames":{d},
+        \\{{"size":"{d}x{d}","detector":"{d}x{d}","threads":{d},"level":{d},"detect_every":{d},"slices":{d},"frames":{d},
         \\"mean_ms":{d:.3},"p50_ms":{d:.3},"p95_ms":{d:.3},"p99_ms":{d:.3},"max_ms":{d:.3},"fps":{d:.1},
-        \\"by_step":{{"full":{f},"crops":{f},"tracked":{f}}},
+        \\"by_step":{{"full":{f},"crops":{f},"slice":{f},"tracked":{f}}},
         \\
     , .{
         W,                 H,
         ft.det_w,          ft.det_h,
         exec.threads(),    opts.level,
-        opts.detect_every, frames,
-        mean,              all.p50,
-        all.p95,           all.p99,
-        all.max,           1000 / mean,
-        by[0],             by[1],
-        by[2],
+        opts.detect_every, opts.detect_slices,
+        frames,            mean,
+        all.p50,           all.p95,
+        all.p99,           all.max,
+        1000 / mean,       by[0],
+        by[1],             by[2],
+        by[3],
     });
     try w.print(
         \\"full_runs":{d},"crop_rounds":{d},"crops":{d},"postponed":{d},"mean_full_ms":{d:.3},"mean_crop_ms":{d:.3},
@@ -274,7 +279,7 @@ fn profileProgram(io: Io, exec: visar.Exec, det: *visar.dnn.FaceDetector) !void 
     var ow = Io.File.Writer.initStreaming(.stdout(), io, &ob);
     const w = &ow.interface;
     const macs = visar.dnn.metal.encode.convMacs(&c.plan);
-    try w.print("YuNet {d}x{d} ({d:.1} M conv MACs): item, steps, 1T ms, {d}T ms, scaling\n", .{ det.pad_w, det.pad_h, @as(f64, @floatFromInt(macs)) / 1e6, exec.threads() });
+    try w.print("YuNet {d}x{d} ({d:.1} M conv MACs): item, steps, 1T ms, {d}T ms, scaling, estimated cost (Net.partCost, for amortised detection)\n", .{ det.pad_w, det.pad_h, @as(f64, @floatFromInt(macs)) / 1e6, exec.threads() });
     var tot = [2]f64{ 0, 0 };
     var whole = [2]f64{ 0, 0 };
     for (0..2) |e| {
@@ -314,7 +319,7 @@ fn profileProgram(io: Io, exec: visar.Exec, det: *visar.dnn.FaceDetector) !void 
             .chain => "chain",
         };
         if (ms[0] > 0.02) {
-            try w.print("{d:>3} {s:<12} {d:>2} {d:>7.3} {d:>7.3} {d:>5.2}x  ", .{ n, name, it.steps(), ms[0], ms[1], ms[0] / ms[1] });
+            try w.print("{d:>3} {s:<12} {d:>2} {d:>7.3} {d:>7.3} {d:>5.2}x {d:>6.2}M  ", .{ n, name, it.steps(), ms[0], ms[1], ms[0] / ms[1], @as(f64, @floatFromInt(det.net.partCost(n))) / 1e6 });
             for (c.plan.steps[step..][0..it.steps()]) |st| {
                 const o = c.plan.tensors[st.outputs[0]].shape;
                 const x = c.plan.tensors[st.inputs[0]].shape;

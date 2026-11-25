@@ -682,6 +682,21 @@ pub const FaceOptions = struct {
     /// whole image's: the same tracks, without reading most of the frame.
     /// false = the whole tracking image every frame.
     partial_gray: bool = true,
+    /// Amortised whole-frame detection: each whole-frame detection is
+    /// spread over this many frames (1-8) so that no frame carries all of
+    /// it. The first frame prepares the detector input from the frame (the
+    /// snapshot), the others each run a part of the network of about equal
+    /// cost; the last also decodes and matches. Meanwhile MOSSE carries the
+    /// tracks, and the detections, which are of the snapshot frame, are
+    /// moved by the motion of the track they match there since. New faces
+    /// thus start up to `detect_slices` - 1 frames late. The schedule is
+    /// counted from the snapshot, and nothing else is detected while one is
+    /// in flight; at most `detect_every` frames are used. 1 = the whole
+    /// detection on one frame (the results of earlier versions). The Metal
+    /// backend runs the network on one frame (the second).
+    detect_slices: u32 = 4,
+
+    pub const max_detect_slices = 8;
 };
 
 /// One tracked face. Boxes and landmarks are in frame pixels.
@@ -713,7 +728,8 @@ pub const FaceTrack = struct {
 /// Counters of a face-tracking run. Times are sums in milliseconds.
 pub const FaceStats = struct {
     frames: u64 = 0,
-    /// Frames on which the detector ran (on the whole frame or on crops).
+    /// Detections run (on the whole frame or on crops; one spread over
+    /// several frames, `detect_slices`, counts once).
     detect_frames: u64 = 0,
     full_runs: u64 = 0,
     /// Detections that ran only on crops (level 2), and the crops.
@@ -769,8 +785,11 @@ pub const FaceStats = struct {
     }
 };
 
-/// What a `FaceTracker.step` did.
-pub const FaceStep = enum { tracked, postponed, full, crops };
+/// What a `FaceTracker.step` did: no detection (`tracked`, or
+/// `postponed` while unchanged), a whole-frame or crop-only detection, or
+/// a part of an amortised whole-frame detection (`slice`, see
+/// `FaceOptions.detect_slices`; the last part matches the faces).
+pub const FaceStep = enum { tracked, postponed, full, crops, slice };
 
 pub const FaceTracker = struct {
     gpa: std.mem.Allocator,
@@ -823,7 +842,21 @@ pub const FaceTracker = struct {
     rects: std.ArrayList([4]u32) = .empty,
     runs: std.ArrayList([3]u32) = .empty,
     found_at: std.ArrayList(visar.video.mosse.Mosse.Found) = .empty,
+    /// The amortised whole-frame detection in flight (`detect_slices` > 1).
+    pending: ?Pending = null,
+    /// The track boxes at its snapshot frame.
+    snap: std.ArrayList(Snap) = .empty,
+    /// The network's pieces each frame after the snapshot runs: frame i
+    /// (1-based) runs `slice_bounds[i - 1]..slice_bounds[i]`.
+    slice_bounds: [FaceOptions.max_detect_slices]usize = undefined,
 
+    const Pending = struct {
+        /// Frames of it done (the snapshot frame is 1).
+        done: u32,
+        /// Detector time so far.
+        ms: f64,
+    };
+    const Snap = struct { id: u32, box: Box };
     const Plan = struct { w: u32, h: u32, det: visar.dnn.FaceDetector, used: u64 };
     const tile_w = 32;
     const tile_h = 8;
@@ -871,8 +904,22 @@ pub const FaceTracker = struct {
             for (self.plans.items) |*p| p.det.deinit();
             self.plans.deinit(gpa);
         }
-        _ = try self.plan(dw, dh);
+        const whole = try self.plan(dw, dh);
+        const n = self.slices();
+        if (n > 1) {
+            // Equal parts of the network on the frames after the snapshot,
+            // a smaller one on the last (it also decodes and matches).
+            var weights: [FaceOptions.max_detect_slices - 1]u32 = @splat(4);
+            weights[n - 2] = 3;
+            whole.splitInfer(self.slice_bounds[0..n], weights[0 .. n - 1]);
+        }
         return self;
+    }
+
+    /// The frames a whole-frame detection is spread over: `detect_slices`,
+    /// at most `detect_every`.
+    pub fn slices(self: *const FaceTracker) u32 {
+        return std.math.clamp(self.opts.detect_slices, 1, @min(FaceOptions.max_detect_slices, @max(1, self.opts.detect_every)));
     }
 
     pub fn deinit(self: *FaceTracker) void {
@@ -889,6 +936,7 @@ pub const FaceTracker = struct {
         self.rects.deinit(gpa);
         self.runs.deinit(gpa);
         self.found_at.deinit(gpa);
+        self.snap.deinit(gpa);
         gpa.free(self.model);
         self.* = undefined;
     }
@@ -898,6 +946,7 @@ pub const FaceTracker = struct {
         for (self.tracks.items) |*t| t.mosse.deinit();
         self.tracks.clearRetainingCapacity();
         self.ref_valid = false;
+        self.pending = null;
     }
 
     /// The detector planned for `w` x `h` inputs (planned on first use; the
@@ -970,6 +1019,8 @@ pub const FaceTracker = struct {
     /// schedule of `step` with the tracks' health unknown; whether a still
     /// frame postpones the detection is guessed from the last step).
     fn fullLikely(self: *const FaceTracker) bool {
+        // An amortised detection in flight: its input is in use.
+        if (self.pending != null) return false;
         if (self.tracks.items.len == 0) return true;
         const since = self.since + 1;
         if (since < @max(1, self.opts.detect_every)) return false;
@@ -1001,6 +1052,12 @@ pub const FaceTracker = struct {
 
         // ---- every face follows its MOSSE filter
         try self.updateFilters(exec, frame, small);
+        if (self.pending != null) {
+            s.track_ms += clock.lap();
+            try self.continueSliced(exec, &clock, frame, small);
+            self.last = .slice;
+            return .slice;
+        }
 
         // ---- is a detection due, and of what kind?
         var weak = false;
@@ -1030,6 +1087,11 @@ pub const FaceTracker = struct {
         const t_convert = clock.lap();
         self.found.clearRetainingCapacity();
         if (what == .crops and !try self.detectCrops(exec, frame)) what = .full;
+        if (what == .full and self.slices() > 1) {
+            try self.beginSliced(exec, &clock, frame, t_convert);
+            self.last = .slice;
+            return .slice;
+        }
         if (what == .full) {
             // New faces start tracks anywhere: the whole tracking image
             // (with the detector input when it can come from the same pass).
@@ -1051,19 +1113,106 @@ pub const FaceTracker = struct {
         self.last = what;
         self.last_detect_ms = t_det;
 
-        // ---- correct the tracks, start new ones, drop lost ones
+        try self.correct(exec, &clock, frame, small, what == .full);
+        self.since = 0;
+        return what;
+    }
+
+    /// After a detection (`found`): corrects the tracks, starts new ones
+    /// (with `full`), drops lost ones, and takes the change reference.
+    fn correct(self: *FaceTracker, exec: visar.Exec, clock: *Clock, frame: Image(u8), small: Image(u8), full: bool) !void {
+        const s = &self.stats;
         if (self.partial) {
             self.rects.clearRetainingCapacity();
             for (self.found.items) |f| try self.rects.append(self.gpa, visar.video.Mosse.initBounds(self.toSmall(self.clampBox(faceBox(f))), .{}, small.width, small.height));
             try self.ensure(exec, frame, small, self.rects.items);
         }
-        try self.match(small, what == .full);
-        self.since = 0;
+        try self.match(small, full);
         try self.grayRows(exec, frame, small, self.stillStride());
         self.snapshot(small);
         s.track_ms += clock.lap();
         s.max_faces = @max(s.max_faces, @as(u32, @intCast(self.tracks.items.len)));
-        return what;
+    }
+
+    /// The first frame of an amortised whole-frame detection: the
+    /// detector input from this frame (unless `trackingImage` wrote it
+    /// already), and the tracks' boxes now. `t_convert`: the time of the
+    /// conversion `step` did (without fusion).
+    fn beginSliced(self: *FaceTracker, exec: visar.Exec, clock: *Clock, frame: Image(u8), t_convert: f64) !void {
+        const det = &self.plans.items[0].det;
+        if (self.fused != null) {
+            if (!self.prepared) try det.prepare(exec, frame);
+        } else try det.prepare(exec, try self.det_bgr.roi(0, 0, self.det_w, self.det_h));
+        self.prepared = false;
+        self.snap.clearRetainingCapacity();
+        for (self.tracks.items) |t| try self.snap.append(self.gpa, .{ .id = t.id, .box = t.box });
+        self.stats.convert_ms += t_convert;
+        self.pending = .{ .done = 1, .ms = t_convert + clock.lap() };
+    }
+
+    /// The next frame of the amortised detection in flight: its part of
+    /// the network; on the last frame, decoding and the faces moved from
+    /// the snapshot to this frame, then matching as after any detection.
+    fn continueSliced(self: *FaceTracker, exec: visar.Exec, clock: *Clock, frame: Image(u8), small: Image(u8)) !void {
+        const p = &self.pending.?;
+        const n = self.slices();
+        const det = &self.plans.items[0].det;
+        try det.inferPart(exec, self.slice_bounds[p.done - 1], self.slice_bounds[p.done]);
+        p.done += 1;
+        if (p.done < n) {
+            p.ms += clock.lap();
+            return;
+        }
+        self.found.clearRetainingCapacity();
+        const res = try det.decode();
+        if (self.fused != null) {
+            try self.found.appendSlice(self.gpa, res);
+        } else {
+            const sx = @as(f32, @floatFromInt(self.frame_w)) / @as(f32, @floatFromInt(self.det_w));
+            const sy = @as(f32, @floatFromInt(self.frame_h)) / @as(f32, @floatFromInt(self.det_h));
+            for (res) |f| {
+                var g = f;
+                g.box = .{ f.box[0] * sx, f.box[1] * sy, f.box[2] * sx, f.box[3] * sy };
+                for (&g.landmarks, f.landmarks) |*l, m| l.* = .{ m[0] * sx, m[1] * sy };
+                try self.found.append(self.gpa, g);
+            }
+        }
+        self.reconcile();
+        const s = &self.stats;
+        const t_det = p.ms + clock.lap();
+        s.detect_frames += 1;
+        s.full_runs += 1;
+        s.full_ms += t_det;
+        self.crops_in_row = 0;
+        self.last_detect_ms = t_det;
+        self.pending = null;
+        try self.correct(exec, clock, frame, small, true);
+        // The schedule runs from the snapshot frame.
+        self.since = n - 1;
+    }
+
+    /// Moves `found` (faces of the snapshot frame) to the current frame:
+    /// each by the motion since the snapshot of the track it matches best
+    /// there (IoU >= `match_iou`); faces matching no track, or one whose
+    /// filter has lost confidence (its motion is suspect), stay put.
+    fn reconcile(self: *FaceTracker) void {
+        for (self.found.items) |*f| {
+            const fb = faceBox(f.*);
+            var best: f32 = self.opts.match_iou;
+            var d: ?[2]f32 = null;
+            for (self.snap.items) |sn| {
+                const v = iou(sn.box, fb);
+                if (v < best) continue;
+                for (self.tracks.items) |t| if (t.id == sn.id) {
+                    best = v;
+                    d = if (t.ok) .{ t.box.cx() - sn.box.cx(), t.box.cy() - sn.box.cy() } else null;
+                };
+            }
+            const dv = d orelse continue;
+            f.box[0] += dv[0];
+            f.box[1] += dv[1];
+            for (&f.landmarks) |*l| l.* = .{ l[0] + dv[0], l[1] + dv[1] };
+        }
     }
 
     /// The frame, area-downscaled to the detector input, as BGR.
@@ -1619,6 +1768,16 @@ fn readModelFile(gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
 test "face tracking follows a moving selfie with few detector runs" {
     // Needs VISAR_MODELS with face_detection_yunet_2023mar.onnx and
     // largest_selfie.jpg (the OpenCV Model Zoo files); skipped otherwise.
+    try followSelfie(1);
+}
+
+test "face tracking with whole-frame detections spread over frames" {
+    try followSelfie(4);
+}
+
+/// The face tracking test, whole-frame detections spread over `slices`
+/// frames.
+fn followSelfie(slices: u32) !void {
     const gpa = std.testing.allocator;
     const model = try readModelFile(gpa, "face_detection_yunet_2023mar.onnx") orelse return error.SkipZigTest;
     defer gpa.free(model);
@@ -1637,9 +1796,9 @@ test "face tracking follows a moving selfie with few detector runs" {
     defer scene.deinit();
     // `ft` computes the tracking image only where it reads it; `whole`
     // computes all of it every frame. Both must track the same.
-    var ft = try FaceTracker.create(gpa, model, W, H, k, .{ .face_width = 640 });
+    var ft = try FaceTracker.create(gpa, model, W, H, k, .{ .face_width = 640, .detect_slices = slices });
     defer ft.deinit();
-    var whole = try FaceTracker.create(gpa, model, W, H, k, .{ .face_width = 640, .partial_gray = false });
+    var whole = try FaceTracker.create(gpa, model, W, H, k, .{ .face_width = 640, .partial_gray = false, .detect_slices = slices });
     defer whole.deinit();
     var frame = try Image(u8).init(gpa, W, H, 4);
     defer frame.deinit(gpa);
@@ -1651,6 +1810,7 @@ test "face tracking follows a moving selfie with few detector runs" {
     defer ref.deinit(gpa);
     var truth: StillTruth = .{};
     const n = StillScene.period + 60;
+    var kinds: std.EnumArray(FaceStep, u32) = .initFill(0);
     for (0..n) |i| {
         const off = scene.render(frame);
         // Whatever the partial image does not compute must not matter.
@@ -1662,6 +1822,7 @@ test "face tracking follows a moving selfie with few detector runs" {
         try std.testing.expectEqualSlices(u8, ref.slice(), small_whole.slice());
         const what = try ft.step(exec, std.testing.io, frame, small);
         try std.testing.expectEqual(what, try whole.step(exec, std.testing.io, frame, small_whole));
+        kinds.getPtr(what).* += 1;
         try std.testing.expectEqual(whole.faces().len, ft.faces().len);
         for (ft.faces(), whole.faces()) |a, b| {
             try std.testing.expectEqual(b.box, a.box);
@@ -1676,12 +1837,18 @@ test "face tracking follows a moving selfie with few detector runs" {
     try std.testing.expect(s.fused_preps > s.fused_unused);
     try std.testing.expect(s.partial_frames > n / 2);
     try std.testing.expect(truth.n >= 1);
-    // Every frame has a face that moved with the image.
-    try std.testing.expectEqual(@as(u64, n), truth.frames);
+    // Every frame from the first detection's (which takes `slices` frames)
+    // has a face that moved with the image.
+    try std.testing.expectEqual(@as(u64, n - (slices - 1)), truth.frames);
     try std.testing.expectEqual(truth.frames, truth.followed);
     try std.testing.expect(truth.err_sum / @as(f64, @floatFromInt(truth.frames)) < 6);
     // The detector ran on far fewer frames than there were.
     try std.testing.expect(s.detect_frames * 3 < n);
     try std.testing.expect(s.crop_rounds > 0);
     try std.testing.expect(s.postponed > 0);
+    // Spread over frames, a whole-frame detection never runs on one.
+    if (slices > 1) {
+        try std.testing.expectEqual(@as(u32, 0), kinds.get(.full));
+        try std.testing.expectEqual(s.full_runs * slices, kinds.get(.slice));
+    } else try std.testing.expectEqual(@as(u32, 0), kinds.get(.slice));
 }

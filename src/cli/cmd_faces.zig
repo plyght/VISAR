@@ -32,6 +32,7 @@ pub const opts = [_]args.Opt{
     .{ .long = "detect-every", .value = "N", .help = "Video: detector every N frames, MOSSE in between (default 4)" },
     .{ .long = "change-level", .value = "N", .help = "Video: 0 off, 1 skip unchanged frames, 2 also detect near faces only" },
     .{ .long = "full-gray", .help = "Video: whole gray tracking image every frame" },
+    .{ .long = "detect-slices", .value = "N", .help = "Video: spread each whole-frame detection over N frames, 1-8 (default 4)" },
     .{ .long = "frames", .short = 'n', .value = "N", .help = "Video: stop after N frames" },
 };
 
@@ -64,6 +65,7 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     if (p.value("detect-every")) |v| cfg.face.detect_every = try args.int(u32, ctx.diag, "--detect-every", v, 1, 1000);
     if (p.value("change-level")) |v| cfg.face.level = try args.int(u8, ctx.diag, "--change-level", v, 0, 2);
     if (p.flag("full-gray")) cfg.face.partial_gray = false;
+    if (p.value("detect-slices")) |v| cfg.face.detect_slices = try args.int(u32, ctx.diag, "--detect-slices", v, 1, track.FaceOptions.max_detect_slices);
     if (p.value("frames")) |v| cfg.frame_limit = try args.int(u64, ctx.diag, "--frames", v, 1, std.math.maxInt(u32));
     cfg.face.score_threshold = cfg.score;
 
@@ -72,7 +74,7 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     for (paths) |path| if (std.mem.eql(u8, path, "-") and paths.len > 1) return ctx.usage("'-' (stdin) reads one image or video, not a frame of several", .{});
 
     const video = paths.len > 1 or isY4mPath(paths[0]);
-    if (!video) for ([_][]const u8{ "detect-every", "change-level", "frames" }) |o| {
+    if (!video) for ([_][]const u8{ "detect-every", "change-level", "frames", "detect-slices" }) |o| {
         if (p.value(o) != null) ctx.warn("--{s} applies to videos; ignored for an image", .{o});
     };
     if (!video and p.flag("full-gray")) ctx.warn("--full-gray applies to videos; ignored for an image", .{});
@@ -469,7 +471,9 @@ const ImageReport = struct {
 const JsonFrame = struct {
     frame: u64,
     /// What the tracker did: full (whole-frame detection), crops (detection
-    /// around the tracked faces), tracked (MOSSE only), postponed.
+    /// around the tracked faces), slice (a part of a whole-frame detection
+    /// spread over several frames, --detect-slices), tracked (MOSSE only),
+    /// postponed.
     step: []const u8,
     ms: f64,
     faces: []const JsonFace,

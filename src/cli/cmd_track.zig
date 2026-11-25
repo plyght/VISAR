@@ -56,6 +56,7 @@ pub const opts = [_]args.Opt{
     .{ .long = "detect-every", .value = "N", .help = "Run the face detector every N frames, MOSSE in between (default 4)" },
     .{ .long = "change-level", .value = "N", .help = "0 off, 1 skip unchanged frames, 2 also detect around faces only (default)" },
     .{ .long = "full-gray", .help = "Whole gray tracking image every frame (default: only around faces)" },
+    .{ .long = "detect-slices", .value = "N", .help = "Spread each whole-frame detection over N frames, 1-8 (default 4; 1 = on one frame)" },
     .{ .long = "list-cameras", .help = "List the cameras, their sizes and frame rates, and exit" },
 };
 
@@ -137,7 +138,8 @@ pub fn run(ctx: *Ctx, p: *args.Parsed) !void {
     if (p.value("detect-every")) |v| cfg.face.detect_every = try args.int(u32, ctx.diag, "--detect-every", v, 1, 1000);
     if (p.value("change-level")) |v| cfg.face.level = try args.int(u8, ctx.diag, "--change-level", v, 0, 2);
     if (p.flag("full-gray")) cfg.face.partial_gray = false;
-    if (cfg.faces_path == null) for ([_][]const u8{ "face-width", "detect-every", "change-level" }) |o| {
+    if (p.value("detect-slices")) |v| cfg.face.detect_slices = try args.int(u32, ctx.diag, "--detect-slices", v, 1, track.FaceOptions.max_detect_slices);
+    if (cfg.faces_path == null) for ([_][]const u8{ "face-width", "detect-every", "change-level", "detect-slices" }) |o| {
         if (p.value(o) != null) ctx.warn("--{s} applies to face tracking (--faces MODEL); ignored", .{o});
     };
     if (cfg.faces_path != null) cfg.mode = .faces;
@@ -485,8 +487,9 @@ fn processOne(live: *Live, i: u8) !void {
     _ = clock.lap();
     var t_faces: f64 = 0;
     if (mode == .faces) if (live.faces) |*ft| {
-        const what = try ft.step(live.exec, live.io, frame, live.small);
-        if (what == .full or what == .crops) _ = live.det_runs.fetchAdd(1, .monotonic);
+        const runs = ft.stats.detect_frames;
+        _ = try ft.step(live.exec, live.io, frame, live.small);
+        if (ft.stats.detect_frames != runs) _ = live.det_runs.fetchAdd(1, .monotonic);
         t_faces = clock.lap();
         if (live.still != null) live.still_truth.score(ft.faces(), live.still_off[i]);
     };
@@ -1324,11 +1327,14 @@ const FaceSummary = struct {
     input_height: u32,
     detect_every: u32,
     change_level: u8,
+    /// Frames a whole-frame detection is spread over (1: on one frame).
+    detect_slices: u32,
     frames: u64,
     faces_now: usize,
     max_faces: u32,
     tracks_started: u64,
-    /// Frames the detector ran on, and that as a fraction of all frames.
+    /// Detections (whole-frame or crop-only), and that as a fraction of
+    /// all frames.
     detect_frames: u64,
     detect_fraction: f64,
     detections_per_second: f64,
@@ -1380,6 +1386,7 @@ fn faceSummary(live: *Live, f: track.FaceTracker, cfg: Config, st: Summary) Face
         .input_height = f.det_h,
         .detect_every = f.opts.detect_every,
         .change_level = f.opts.level,
+        .detect_slices = f.slices(),
         .frames = s.frames,
         .faces_now = f.tracks.items.len,
         .max_faces = s.max_faces,
@@ -1479,8 +1486,8 @@ fn report(ctx: *Ctx, s: Summary, record_out: ?imageio.Output) !void {
 fn writeFaces(w: *Io.Writer, st: term.Style, f: FaceSummary) !void {
     try w.writeAll("\n  ");
     try st.paint(w, .bold, "faces");
-    try st.print(w, .dim, " {s} at {d}x{d}, every {d} frames, change level {d}\n", .{ f.model, f.input_width, f.input_height, f.detect_every, f.change_level });
-    try w.print("  detector ran on {d} of {d} frames ({d:.1}%, {d:.1}/s): {d} whole-frame ({d:.2} ms), {d} crop-only ({d} crops, {d:.2} ms); {d} skipped as unchanged\n", .{
+    try st.print(w, .dim, " {s} at {d}x{d}, every {d} frames, change level {d}, whole frame over {d} frame{s}\n", .{ f.model, f.input_width, f.input_height, f.detect_every, f.change_level, f.detect_slices, if (f.detect_slices == 1) "" else "s" });
+    try w.print("  detector ran {d} times in {d} frames ({d:.1}%, {d:.1}/s): {d} whole-frame ({d:.2} ms), {d} crop-only ({d} crops, {d:.2} ms); {d} skipped as unchanged\n", .{
         f.detect_frames, f.frames, 100 * f.detect_fraction, f.detections_per_second, f.full_frame_runs, f.full_frame_ms_mean, f.crop_only_runs, f.crops, f.crop_only_ms_mean, f.skipped_unchanged,
     });
     try w.print("  detector {d:.2} ms per run, {d:.1}% of processing time; crop-only runs saved {d:.0} ms ({d:.0}% of detector time); MOSSE and matching {d:.3} ms per frame\n", .{
