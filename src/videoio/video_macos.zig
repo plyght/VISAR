@@ -4,10 +4,14 @@
 //! whatever else the system decodes, in .mp4, .mov and .m4v files, on
 //! VideoToolbox's hardware decoder where the machine has one.
 //!
-//! Frames come out as 32BGRA CVPixelBuffers and are copied into the
-//! caller's BGR, BGRA or gray image. Seeking starts a new AVAssetReader at
-//! the frame's time (the decoder starts from the keyframe before it and
-//! the frames before the target are skipped). The track's
+//! Frames come out as the decoder's own 4:2:0 ('420v', bi-planar, video
+//! range) and are converted to the caller's BGR, BGRA or gray image by
+//! VISAR, with the matrix the buffer is tagged with (BT.601 unless it says
+//! BT.709) and the nearest chroma sample, as the AVI and YUV4MPEG2 readers
+//! do: the same picture whichever backend reads it. Frame n is the frame
+//! presented at first_pts + n / fps; seeking starts a new AVAssetReader a
+//! little before that time (the decoder starts from the keyframe before it
+//! and the frames before the target are skipped). The track's
 //! preferredTransform (rotation metadata) is not applied.
 //!
 //! Only compiled for macOS (see capture.zig).
@@ -23,6 +27,10 @@ pub const Error = error{ RuntimeUnavailable, InvalidData, Unsupported, ReadFaile
 
 /// kCVPixelFormatType_32BGRA ('BGRA').
 const pixel_format_bgra: u32 = 0x42475241;
+/// kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ('420v') and its full
+/// range sibling ('420f').
+const pixel_format_420v: u32 = 0x34323076;
+const pixel_format_420f: u32 = 0x34323066;
 const lock_read_only: u64 = 1;
 
 const CMTimeRange = extern struct { start: objc.CMTime, duration: objc.CMTime };
@@ -37,7 +45,14 @@ const Api = struct {
     CVPixelBufferGetWidth: *const fn (?*anyopaque) callconv(.c) usize,
     CVPixelBufferGetHeight: *const fn (?*anyopaque) callconv(.c) usize,
     CVPixelBufferGetPixelFormatType: *const fn (?*anyopaque) callconv(.c) u32,
+    CVPixelBufferGetBaseAddressOfPlane: *const fn (?*anyopaque, usize) callconv(.c) ?[*]u8,
+    CVPixelBufferGetBytesPerRowOfPlane: *const fn (?*anyopaque, usize) callconv(.c) usize,
+    CVPixelBufferGetHeightOfPlane: *const fn (?*anyopaque, usize) callconv(.c) usize,
+    CVBufferGetAttachment: *const fn (?*anyopaque, id, ?*u32) callconv(.c) id,
     CFRelease: *const fn (?*anyopaque) callconv(.c) void,
+    CFEqual: *const fn (id, id) callconv(.c) u8,
+    kCVImageBufferYCbCrMatrixKey: id,
+    kCVImageBufferYCbCrMatrix_ITU_R_709_2: id,
     kCVPixelBufferPixelFormatTypeKey: id,
     AVMediaTypeVideo: id,
 };
@@ -79,7 +94,14 @@ fn loadApi() objc.Error!Api {
         .CVPixelBufferGetWidth = try objc.func(fn (?*anyopaque) callconv(.c) usize, .corevideo, "CVPixelBufferGetWidth"),
         .CVPixelBufferGetHeight = try objc.func(fn (?*anyopaque) callconv(.c) usize, .corevideo, "CVPixelBufferGetHeight"),
         .CVPixelBufferGetPixelFormatType = try objc.func(fn (?*anyopaque) callconv(.c) u32, .corevideo, "CVPixelBufferGetPixelFormatType"),
+        .CVPixelBufferGetBaseAddressOfPlane = try objc.func(fn (?*anyopaque, usize) callconv(.c) ?[*]u8, .corevideo, "CVPixelBufferGetBaseAddressOfPlane"),
+        .CVPixelBufferGetBytesPerRowOfPlane = try objc.func(fn (?*anyopaque, usize) callconv(.c) usize, .corevideo, "CVPixelBufferGetBytesPerRowOfPlane"),
+        .CVPixelBufferGetHeightOfPlane = try objc.func(fn (?*anyopaque, usize) callconv(.c) usize, .corevideo, "CVPixelBufferGetHeightOfPlane"),
+        .CVBufferGetAttachment = try objc.func(fn (?*anyopaque, id, ?*u32) callconv(.c) id, .corevideo, "CVBufferGetAttachment"),
         .CFRelease = try objc.func(fn (?*anyopaque) callconv(.c) void, .corefoundation, "CFRelease"),
+        .CFEqual = try objc.func(fn (id, id) callconv(.c) u8, .corefoundation, "CFEqual"),
+        .kCVImageBufferYCbCrMatrixKey = try objc.constant(id, .corevideo, "kCVImageBufferYCbCrMatrixKey"),
+        .kCVImageBufferYCbCrMatrix_ITU_R_709_2 = try objc.constant(id, .corevideo, "kCVImageBufferYCbCrMatrix_ITU_R_709_2"),
         .kCVPixelBufferPixelFormatTypeKey = try objc.constant(id, .corevideo, "kCVPixelBufferPixelFormatTypeKey"),
         .AVMediaTypeVideo = try objc.constant(id, .avfoundation, "AVMediaTypeVideo"),
     };
@@ -110,6 +132,10 @@ pub const Reader = struct {
     pos: u64 = 0,
     /// After a seek: frames earlier than this time are skipped.
     skip_before: f64 = -1,
+    /// The first frame's presentation time (frame n is at first_pts + n/fps).
+    first_pts: f64 = 0,
+    /// A sample read ahead (the first, to learn first_pts), owned (+1).
+    pending: ?*anyopaque = null,
     /// The codec's FourCC ('avc1', 'hvc1', ...).
     fourcc: [4]u8 = .{ '?', '?', '?', '?' },
 
@@ -154,6 +180,11 @@ pub const Reader = struct {
             if (sub) |f| _ = objc.fourcc(f(objc.at(descs, 0)), &self.fourcc);
         }
         try self.start(0);
+        self.pending = send(?*anyopaque, self.output, "copyNextSampleBuffer", .{});
+        if (self.pending) |sb| {
+            const t = a.CMSampleBufferGetPresentationTimeStamp(sb);
+            if (t.flags & objc.CMTime.flag_valid != 0) self.first_pts = t.seconds();
+        }
         return self;
     }
 
@@ -178,7 +209,7 @@ pub const Reader = struct {
         }
         const number = try cls("NSNumber");
         var keys = [_]id{a.kCVPixelBufferPixelFormatTypeKey};
-        var values = [_]id{send(id, number, "numberWithUnsignedInt:", .{pixel_format_bgra})};
+        var values = [_]id{send(id, number, "numberWithUnsignedInt:", .{pixel_format_420v})};
         const settings = send(id, try cls("NSDictionary"), "dictionaryWithObjects:forKeys:count:", .{ @as([*]const id, &values), @as([*]const id, &keys), @as(objc.NSUInteger, 1) });
         self.output = send(id, send(id, try cls("AVAssetReaderTrackOutput"), "alloc", .{}), "initWithTrack:outputSettings:", .{ self.track, settings });
         if (self.output == null) {
@@ -198,6 +229,8 @@ pub const Reader = struct {
     }
 
     fn stopReader(self: *Reader) void {
+        if (self.pending) |sb| self.api.CFRelease(sb);
+        self.pending = null;
         if (self.reader != null) {
             // Status 1: reading.
             if (send(objc.NSInteger, self.reader, "status", .{}) == 1) send(void, self.reader, "cancelReading", .{});
@@ -228,11 +261,11 @@ pub const Reader = struct {
         const pool = objc.Pool.push();
         defer pool.pop();
         const fps = if (self.fps > 0) self.fps else 30;
-        const t = @as(f64, @floatFromInt(n)) / fps;
+        const t = self.first_pts + @as(f64, @floatFromInt(n)) / fps;
         // Start a little early: the range is in presentation time and the
         // frame's own time may be rounded.
         try self.start(@max(0, t - 0.5 / fps));
-        self.skip_before = if (n == 0) -1 else t - 0.5 / fps;
+        self.skip_before = t - 0.5 / fps;
         self.pos = n;
     }
 
@@ -246,7 +279,9 @@ pub const Reader = struct {
         defer pool.pop();
         if (self.output == null) return false;
         while (true) {
-            const sb = send(?*anyopaque, self.output, "copyNextSampleBuffer", .{}) orelse {
+            const pending = self.pending;
+            self.pending = null;
+            const sb = pending orelse send(?*anyopaque, self.output, "copyNextSampleBuffer", .{}) orelse {
                 // Status 3: failed.
                 if (send(objc.NSInteger, self.reader, "status", .{}) == 3) {
                     setDetail("{s}", .{objc.errorText(send(id, self.reader, "error", .{}))});
@@ -261,20 +296,72 @@ pub const Reader = struct {
                 if (pts < self.skip_before) continue;
                 self.skip_before = -1;
             }
-            if (a.CVPixelBufferGetPixelFormatType(pb) != pixel_format_bgra) return error.Unsupported;
+            const format = a.CVPixelBufferGetPixelFormatType(pb);
             if (a.CVPixelBufferLockBaseAddress(pb, lock_read_only) != 0) return error.ReadFailed;
             defer _ = a.CVPixelBufferUnlockBaseAddress(pb, lock_read_only);
-            const base = a.CVPixelBufferGetBaseAddress(pb) orelse return error.ReadFailed;
             const w = @min(a.CVPixelBufferGetWidth(pb), dst.width);
             const h = @min(a.CVPixelBufferGetHeight(pb), dst.height);
-            const bpr = a.CVPixelBufferGetBytesPerRow(pb);
-            if (bpr < w * 4) return error.ReadFailed;
-            copyBgra(base, bpr, w, h, dst);
+            switch (format) {
+                pixel_format_bgra => {
+                    const base = a.CVPixelBufferGetBaseAddress(pb) orelse return error.ReadFailed;
+                    const bpr = a.CVPixelBufferGetBytesPerRow(pb);
+                    if (bpr < w * 4) return error.ReadFailed;
+                    copyBgra(base, bpr, w, h, dst);
+                },
+                pixel_format_420v, pixel_format_420f => {
+                    const yp = a.CVPixelBufferGetBaseAddressOfPlane(pb, 0) orelse return error.ReadFailed;
+                    const uv = a.CVPixelBufferGetBaseAddressOfPlane(pb, 1) orelse return error.ReadFailed;
+                    const ybpr = a.CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+                    const cbpr = a.CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+                    if (ybpr < w or cbpr < (w + 1) / 2 * 2 or a.CVPixelBufferGetHeightOfPlane(pb, 1) < (h + 1) / 2) return error.ReadFailed;
+                    const m = a.CVBufferGetAttachment(pb, a.kCVImageBufferYCbCrMatrixKey, null);
+                    const bt709 = m != null and a.CFEqual(m, a.kCVImageBufferYCbCrMatrix_ITU_R_709_2) != 0;
+                    nv12ToBgr(yp, ybpr, uv, cbpr, w, h, format == pixel_format_420f, bt709, dst);
+                },
+                else => return error.Unsupported,
+            }
             self.pos += 1;
             return true;
         }
     }
 };
+
+/// Bi-planar 4:2:0 (Y plane, interleaved CbCr plane) to BGR, BGRA or gray,
+/// fixed point with 8 fractional bits like y4m.yuvToBgr, nearest chroma.
+fn nv12ToBgr(yp: [*]const u8, ybpr: usize, uv: [*]const u8, cbpr: usize, w: usize, h: usize, full: bool, bt709: bool, dst: Image(u8)) void {
+    const ky: i32 = if (full) 256 else 298;
+    const y0: i32 = if (full) 0 else 16;
+    // [B from U, G from U, G from V, R from V]
+    const k: [4]i32 = if (bt709)
+        (if (full) .{ 475, 48, 120, 403 } else .{ 541, 55, 136, 459 })
+    else
+        (if (full) .{ 454, 88, 183, 359 } else .{ 516, 100, 208, 409 });
+    const ch: usize = dst.channels;
+    for (0..dst.height) |y| {
+        const o = dst.row(y);
+        if (y >= h) {
+            @memset(o, 0);
+            continue;
+        }
+        const yr = yp + y * ybpr;
+        const cr = uv + (y / 2) * cbpr;
+        if (ch == 1) {
+            // Gray: from the luma, as BGR->gray would give it.
+            for (0..w) |x| o[x] = clamp((((@as(i32, yr[x]) - y0) * ky) + 128) >> 8);
+        } else for (0..w) |x| {
+            const l: i32 = (@as(i32, yr[x]) - y0) * ky;
+            const u: i32 = @as(i32, cr[(x / 2) * 2]) - 128;
+            const v: i32 = @as(i32, cr[(x / 2) * 2 + 1]) - 128;
+            o[x * ch ..][0..3].* = .{ clamp((l + k[0] * u + 128) >> 8), clamp((l - k[1] * u - k[2] * v + 128) >> 8), clamp((l + k[3] * v + 128) >> 8) };
+            if (ch == 4) o[x * 4 + 3] = 255;
+        }
+        if (w < dst.width) @memset(o[w * ch ..], 0);
+    }
+}
+
+fn clamp(v: i32) u8 {
+    return @intCast(std.math.clamp(v, 0, 255));
+}
 
 /// BGRA rows into a BGR, BGRA or gray image (the part `w` x `h` covers;
 /// the rest, if the decoder's buffer is smaller, is cleared).
