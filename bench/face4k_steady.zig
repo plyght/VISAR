@@ -180,6 +180,7 @@ fn profileNet(gpa: std.mem.Allocator, io: Io, exec: visar.Exec, model: []const u
         per_item = @min(per_item, @as(f64, @floatFromInt(Io.Clock.awake.now(io).nanoseconds - t0.nanoseconds)) / 1e6);
     }
     try w.print("items as separate pool jobs: {d:.3} ms\n", .{per_item});
+    var step: usize = 0;
     for (c.program.items, 0..) |*it, n| {
         var ms: [2]f64 = undefined;
         for (0..2) |e| {
@@ -197,7 +198,19 @@ fn profileNet(gpa: std.mem.Allocator, io: Io, exec: visar.Exec, model: []const u
             .kernel => |k| @tagName(k.*),
             .chain => "chain",
         };
-        if (ms[0] > 0.02) try w.print("{d:>3} {s:<12} {d:>2} {d:>7.3} {d:>7.3} {d:>5.2}x\n", .{ n, name, it.steps(), ms[0], ms[1], ms[0] / ms[1] });
+        if (ms[0] > 0.02) {
+            try w.print("{d:>3} {s:<12} {d:>2} {d:>7.3} {d:>7.3} {d:>5.2}x  ", .{ n, name, it.steps(), ms[0], ms[1], ms[0] / ms[1] });
+            for (c.plan.steps[step..][0..it.steps()]) |st| {
+                const o = c.plan.tensors[st.outputs[0]].shape;
+                const x = c.plan.tensors[st.inputs[0]].shape;
+                switch (st.op) {
+                    .conv => |cv| try w.print("conv{d}x{d}s{d}g{d} {d}->{d}@{d}x{d}; ", .{ cv.kernel[0], cv.kernel[1], cv.stride[0], cv.group, x.d[1], o.d[1], o.d[2], o.d[3] }),
+                    else => try w.print("{s} {d}@{d}x{d}; ", .{ @tagName(st.op), o.d[1], o.d[2], o.d[3] }),
+                }
+            }
+            try w.print("\n", .{});
+        }
+        step += it.steps();
     }
     try w.print("sum of items {d:.3} / {d:.3} ms; whole program (team run) {d:.3} / {d:.3} ms, {d:.2}x\n", .{ tot[0], tot[1], whole[0], whole[1], whole[0] / whole[1] });
     try w.flush();

@@ -661,6 +661,10 @@ pub const FaceOptions = struct {
     /// A detection and a track overlapping by at least this IoU are the
     /// same face.
     match_iou: f32 = 0.3,
+    /// A matched track overlapping its detection by at least this IoU
+    /// keeps its filter (moved to the detection and adapted); below it the
+    /// filter is trained afresh.
+    retrain_iou: f32 = 0.6,
     /// A track missed by this many detections in a row is dropped.
     drop_after: u32 = 2,
 };
@@ -1060,9 +1064,16 @@ pub const FaceTracker = struct {
             const t = &self.tracks.items[p.t];
             const f = self.found.items[p.d];
             const box = self.clampBox(faceBox(f));
-            const m = try visar.video.Mosse.init(gpa, small, self.toSmall(box), .{});
-            t.mosse.deinit();
-            t.mosse = m;
+            if (p.v >= self.opts.retrain_iou) {
+                // Close to where the filter has it: move it there and
+                // adapt (cheap). Further off: the filter may have learnt
+                // the wrong patch, so train a fresh one.
+                try t.mosse.correct(small, self.toSmall(box));
+            } else {
+                const m = try visar.video.Mosse.init(gpa, small, self.toSmall(box), .{});
+                t.mosse.deinit();
+                t.mosse = m;
+            }
             t.box = box;
             t.rel = relLandmarks(f, box);
             t.score = f.score;

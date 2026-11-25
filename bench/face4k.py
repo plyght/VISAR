@@ -179,15 +179,15 @@ def main():
                  "Per frame: gray tracking image + FaceTracker.step (MOSSE on every face, YuNet when scheduled). "
                  "Level 0 = whole-frame detection on schedule; level 2 = change-driven (postponed while still, "
                  "crops around tracked faces, whole frame every 4th detection).\n",
-                 f"| Level, detect every | 1T ms/frame (fps) | {n}T ms/frame (fps) | {n}T p95 ms | {n}T detector runs: full / crop rounds / postponed | {n}T ms/frame: gray / tracking / detection | faces | followed |",
-                 "| --- | ---: | ---: | ---: | --- | --- | ---: | ---: |"]
+                 f"| Level, detect every | 1T ms/frame (fps) | {n}T ms/frame (fps) | {n}T p95 ms | {n}T detector runs: full / crop rounds / postponed | 1T ms/frame: gray / tracking / detection | {n}T ms/frame: gray / tracking / detection | faces | followed |",
+                 "| --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: |"]
         for level, every in modes:
             a = steady(args.steady, 1, level, every, fw, args.frames)
             b = steady(args.steady, n, level, every, fw, args.frames)
             lines.append(f"| {level}, {every} | {a['mean_ms']:.2f} ({a['fps']:.0f}) | {b['mean_ms']:.2f} ({b['fps']:.0f}) | "
                          f"{b['p95_ms']:.2f} | {b['full_runs']} / {b['crop_rounds']} / {b['postponed']} of {b['frames']} "
                          f"(full {b['mean_full_ms']:.2f} ms, crops {b['mean_crop_ms']:.2f} ms) | "
-                         f"{b['gray_ms']:.2f} / {b['track_ms']:.2f} / {b['detect_ms']:.2f} | {b['faces']} | {b['followed']}/{b['truth_frames']} |")
+                         f"{a['gray_ms']:.2f} / {a['track_ms']:.2f} / {a['detect_ms']:.2f} | {b['gray_ms']:.2f} / {b['track_ms']:.2f} / {b['detect_ms']:.2f} | {b['faces']} | {b['followed']}/{b['truth_frames']} |")
             print(lines[-1], flush=True)
         text = "\n".join(lines) + "\n"
         print(text)

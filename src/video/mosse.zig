@@ -161,6 +161,19 @@ pub const Mosse = struct {
         return .{ .box = self.box(), .psr = best.psr, .ok = ok };
     }
 
+    /// Moves the target to `b` (an outside detection: drift correction)
+    /// and adapts the filter to the patch there at the learning rate, one
+    /// FFT instead of the eight of a fresh `init`.
+    pub fn correct(self: *Mosse, frame: Image(u8), b: Box) !void {
+        if (frame.channels != 1) return error.UnsupportedChannels;
+        self.cx = b.cx();
+        self.cy = b.cy();
+        self.w = @max(b.w, 4);
+        self.h = @max(b.h, 4);
+        self.patch(frame, self.cx, self.cy, 1.0, 0, 1);
+        self.accumulate(self.o.rate);
+    }
+
     /// Adds the current patch (in `buf`, spatial) to the running filter
     /// with weight `rate`.
     fn accumulate(self: *Mosse, rate: f32) void {

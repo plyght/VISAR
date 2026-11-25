@@ -255,16 +255,17 @@ fn Kernel(comptime cn: usize) type {
             // (the result is at most 255, the error below 1e-4).
             const inv: f32 = 1.0 / @as(f32, @floatFromInt(k * k * (1 << 14)));
             for (out, 0..) |*o, x| {
-                var b: u32 = 0;
-                var g: u32 = 0;
-                var r: u32 = 0;
-                for (acc[x * k * cn ..][0 .. k * cn], 0..) |v, j| switch (j % cn) {
-                    0 => b += v,
-                    1 => g += v,
-                    2 => r += v,
-                    else => {},
+                const base = x * k * cn;
+                // Per pixel all channels at once (a 4-lane read; BGR's
+                // last pixel would read past the end, so it sums lane by
+                // lane). Channel sums are at most 256 * 255: u16.
+                var s: @Vector(4, u16) = @splat(0);
+                if (cn == 4 or x + 1 < out.len) {
+                    for (0..k) |j| s += @as(@Vector(4, u16), acc[base + j * cn ..][0..4].*);
+                } else for (0..k) |j| inline for (0..3) |ch| {
+                    s[ch] += acc[base + j * cn + ch];
                 };
-                const l: f32 = @floatFromInt(b * wb + g * wg + r * wr);
+                const l: f32 = @floatFromInt(@as(u32, s[0]) * wb + @as(u32, s[1]) * wg + @as(u32, s[2]) * wr);
                 o.* = @intFromFloat(@min(255, l * inv + 0.5));
             }
         }
