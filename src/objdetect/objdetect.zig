@@ -33,6 +33,5 @@ pub const detectMarkers = aruco.detectMarkers;
 pub const drawDetectedMarkers = aruco.drawDetectedMarkers;
 
 test {
-    _ = @import("dbg_test.zig");
     std.testing.refAllDecls(@This());
 }
