@@ -12,6 +12,7 @@ pub const pose = @import("pose.zig");
 pub const undistort_mod = @import("undistort.zig");
 pub const chessboard = @import("chessboard.zig");
 pub const calibrate = @import("calibrate.zig");
+pub const fundamental = @import("fundamental.zig");
 
 pub const Point2f = homography.Point2f;
 pub const Method = homography.Method;
@@ -35,6 +36,8 @@ pub const remap = undistort_mod.remap;
 
 pub const findChessboardCorners = chessboard.findChessboardCorners;
 pub const calibrateCamera = calibrate.calibrateCamera;
+pub const findFundamentalMat = fundamental.findFundamentalMat;
+pub const solveCubic = fundamental.solveCubic;
 
 test {
     std.testing.refAllDecls(@This());

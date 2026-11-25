@@ -200,3 +200,23 @@ def calibrate_camera(obj_list, img_list, size, K=None, dist=None, flags=0):
     _check(lib.visar_calibrate_camera(_p(obj), _p(img), _p(counts), c_size_t(n), size[0], size[1], _p(k), _p(d), flags,
                                       _p(rv), _p(tv), ctypes.byref(rms)))
     return rms.value, k.reshape(3, 3), d.reshape(1, 5), [r.reshape(3, 1) for r in rv], [t.reshape(3, 1) for t in tv]
+
+
+def find_fundamental_mat(p1, p2, method=8, thr=3.0, confidence=0.99, max_iters=1000):
+    a, b = _f32(p1), _f32(p2)
+    n = len(a)
+    mask = np.zeros(n, np.uint8)
+    f = np.zeros(27)
+    count = c_int(0)
+    _check(lib.visar_find_fundamental_mat(_p(a), _p(b), c_size_t(n), method, c_double(thr), c_double(confidence), max_iters,
+                                          _p(mask), _p(f), ctypes.byref(count)))
+    if count.value == 0:
+        return None, mask.reshape(-1, 1)
+    return f[:9 * count.value].reshape(-1, 3), mask.reshape(-1, 1)
+
+
+def solve_cubic(coeffs):
+    c = _f64(coeffs).ravel()
+    roots = np.zeros(3)
+    n = lib.visar_solve_cubic(_p(c), _p(roots))
+    return n, roots

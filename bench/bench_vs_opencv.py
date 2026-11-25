@@ -130,6 +130,9 @@ def calib3d_cases():
     a_src, a_dst = homography_scene(500, 0.3, 0.5, 2)
     a_dst = (a_src @ np.float32([[0.9, -0.2], [0.2, 0.9]]).T + [5, -7]).astype(np.float32)
     yield "estimateAffine2D RANSAC 500pt", lambda: vc.estimate_affine_2d(a_src, a_dst), lambda: cv2.estimateAffine2D(a_src, a_dst)
+    from test_calib3d_vs_opencv import two_views
+    f1, f2, _ = two_views(300, 0.3, 0.3, 5)
+    yield "findFundamentalMat RANSAC 300pt 30% out", lambda: vc.find_fundamental_mat(f1, f2, 8), lambda: cv2.findFundamentalMat(f1, f2, cv2.FM_RANSAC)
     r = np.random.default_rng(3)
     K = np.array([[900.0, 0, 640], [0, 900, 360], [0, 0, 1]])
     d = np.array([-0.28, 0.09, 0.001, -0.0005, -0.01])

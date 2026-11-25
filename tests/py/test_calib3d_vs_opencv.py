@@ -108,6 +108,54 @@ def affines():
                 run(tag + " M", lambda: (av, ac), 1e-4)
 
 
+def two_views(n, outliers, noise, seed):
+    r = np.random.default_rng(seed)
+    Kc = np.array([[800.0, 0, 640], [0, 800, 360], [0, 0, 1]])
+    X = np.c_[r.uniform(-2, 2, (n, 2)), r.uniform(4, 8, n)]
+    a = cv2.projectPoints(X, np.zeros(3), np.zeros(3), Kc, None)[0].reshape(-1, 2)
+    b = cv2.projectPoints(X, r.normal(0, 0.1, 3), np.array([-0.6, 0.1, 0.05]), Kc, None)[0].reshape(-1, 2)
+    a = (a + r.normal(0, noise, a.shape)).astype(np.float32)
+    b = (b + r.normal(0, noise, b.shape)).astype(np.float32)
+    out = r.random(n) < outliers
+    b[out] = r.uniform(0, [1280, 720], (int(out.sum()), 2))
+    return a, b, out
+
+
+def fundamentals():
+    for seed in range(6):
+        a, b, out = two_views(300, 0.3, 0.3, 700 + seed)
+        for method, nm in ((cv2.FM_8POINT, "8POINT"), (cv2.FM_RANSAC, "RANSAC"), (cv2.FM_LMEDS, "LMEDS")):
+            fv, mv = vc.find_fundamental_mat(a, b, method)
+            fc, mc = cv2.findFundamentalMat(a, b, method)
+            tag = f"findFundamentalMat {nm} s={seed}"
+            check(tag + " found", (fv is None) == (fc is None))
+            if fv is None or fc is None:
+                continue
+            run(tag + " mask", lambda: (mv, mc), 1, 1.0)
+            run(tag + " F", lambda: (fv, fc), 1e-9)
+        a7, b7 = a[~out][:7], b[~out][:7]
+        fv, _ = vc.find_fundamental_mat(a7, b7, cv2.FM_7POINT)
+        fc, _ = cv2.findFundamentalMat(a7, b7, cv2.FM_7POINT)
+        if fv is None or fc is None:
+            check(f"findFundamentalMat 7POINT s={seed} found", (fv is None) == (fc is None))
+            continue
+        # Up to three solutions; VISAR may list them in another order.
+        key = lambda m: tuple(np.round(m.reshape(-1, 9)[:, 0], 9))  # noqa: E731
+        fvs = sorted(fv.reshape(-1, 9).tolist(), key=lambda r: r[0])
+        fcs = sorted(fc.reshape(-1, 9).tolist(), key=lambda r: r[0])
+        check(f"findFundamentalMat 7POINT s={seed} count", len(fvs) == len(fcs), f"{len(fvs)} vs {len(fcs)}")
+        if len(fvs) == len(fcs):
+            run(f"findFundamentalMat 7POINT s={seed} F", lambda: (np.array(fvs), np.array(fcs)), 1e-6)
+        _ = key
+    rr = np.array([[1, 2, -3, 1], [2, -4, -1, 4], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [1, -6, 11, -6]], np.float64)
+    for i, c in enumerate(rr):
+        n1, r1 = vc.solve_cubic(c)
+        n2, r2 = cv2.solveCubic(c)
+        check(f"solveCubic {i} count", n1 == n2, f"{n1} vs {n2}")
+        if n1 == n2 and n1 > 0:
+            run(f"solveCubic {i}", lambda: (np.sort(r1[:n1]), np.sort(np.asarray(r2).ravel()[:n2])), 1e-9)
+
+
 def camera_models():
     for i in range(5):
         r = rng.normal(0, 1.2, 3)
@@ -322,6 +370,7 @@ def main():
     print(f"VISAR {vs.version()} ({vs.lib.visar_build_info().decode()}) vs OpenCV {cv2.__version__}")
     homographies()
     affines()
+    fundamentals()
     camera_models()
     pnp()
     undistortion()

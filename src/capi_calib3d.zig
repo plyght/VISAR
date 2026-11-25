@@ -307,3 +307,35 @@ export fn visar_calibrate_camera(obj: [*]const f64, img: [*]const f64, counts: [
     }
     return 0;
 }
+
+/// findFundamentalMat: `method` 1 (FM_7POINT), 2 (FM_8POINT), 4 (FM_LMEDS)
+/// or 8 (FM_RANSAC). `f` receives up to 3 matrices (several only for
+/// FM_7POINT with 7 points); `count` the number (0: not found). `mask`
+/// (n bytes) may be null.
+export fn visar_find_fundamental_mat(p1: [*]const f32, p2: [*]const f32, n: usize, meth: c_int, ransac_threshold: f64, confidence: f64, max_iters: c_int, mask: ?[*]u8, f: *[27]f64, count: *c_int) c_int {
+    count.* = 0;
+    const m: c3.fundamental.Method = switch (meth) {
+        1 => .seven_point,
+        2 => .eight_point,
+        4 => .lmeds,
+        8 => .ransac,
+        else => return fail(error.Unsupported),
+    };
+    if (max_iters < 0) return fail(error.InvalidArgument);
+    var out: [3][9]f64 = undefined;
+    const k = c3.findFundamentalMat(gpa, pts2(p1, n), pts2(p2, n), if (mask) |mm| mm[0..n] else null, &out, .{
+        .method = m,
+        .ransac_threshold = ransac_threshold,
+        .confidence = confidence,
+        .max_iters = @intCast(max_iters),
+    }) catch |e| return fail(e);
+    for (0..k) |i| f[i * 9 ..][0..9].* = out[i];
+    count.* = @intCast(k);
+    return 0;
+}
+
+/// solveCubic: real roots of c0 x^3 + c1 x^2 + c2 x + c3 (returns their
+/// number, -1 when every x is a root).
+export fn visar_solve_cubic(c: *const [4]f64, roots: *[3]f64) c_int {
+    return c3.solveCubic(c.*, roots);
+}
