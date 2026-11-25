@@ -120,6 +120,7 @@ def cases(h, w):
     yield from features2d_cases()
     yield from calib3d_cases()
     yield from photo_cases()
+    yield from objdetect_cases()
 
 
 def photo_cases():
@@ -151,6 +152,34 @@ def photo_cases():
             out = np.empty_like(img)
             yield f"bilateralFilter d9 s75 {kind} {w}x{h}", (lambda img=img: ph.bilateral_filter(img, 9, 75, 75)), \
                 (lambda img=img, out=out: cv2.bilateralFilter(img, 9, 75, 75, dst=out))
+
+
+def objdetect_cases():
+    """QR codes and ArUco at fixed sizes (independent of --size)."""
+    if not hasattr(vs.lib, "visar_qr_detect"):
+        return
+    import objdetect_ctypes as od
+    from test_objdetect_vs_opencv import aruco_scene, background, cv_encode, render
+    rng = np.random.default_rng(2)
+    det = cv2.QRCodeDetector()
+    text = "https://example.com/visar/objdetect?q=0123456789"
+    sym = cv2.copyMakeBorder(cv_encode(text, level=1).encode(text), 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=255)
+    for (w, h) in [(640, 480), (1280, 720)]:
+        img = render(sym, 5.0, rng, (h, w), perspective=0.04, blur=0.7, noise=3, angle=17, bg=background(rng, h, w))
+        yield f"QR detect+decode {w}x{h}", (lambda g=img: od.qr_detect_and_decode(g)), (lambda g=img: det.detectAndDecode(g))
+    p = cv2.QRCodeEncoder_Params()
+    p.version = 10
+    enc = cv2.QRCodeEncoder.create(p)
+    t10 = "VISAR " * 30
+    yield "QR encode v10", lambda: od.qr_encode(t10, 10), lambda: enc.encode(t10)
+    d = cv2.aruco.DICT_6X6_250
+    scene = aruco_scene(d, 11, h=720, w=1280, count=20)
+    adet = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(d), cv2.aruco.DetectorParameters())
+    yield "ArUco detect 20 markers 1280x720", lambda: od.aruco_detect(scene, d), lambda: adet.detectMarkers(scene)
+    pr = cv2.aruco.DetectorParameters()
+    pr.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    sdet = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(d), pr)
+    yield "ArUco detect SUBPIX 1280x720", lambda: od.aruco_detect(scene, d, cornerRefinementMethod=1), lambda: sdet.detectMarkers(scene)
 
 
 def feature_image(h, w, seed=0):

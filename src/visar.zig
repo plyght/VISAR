@@ -15,6 +15,7 @@ pub const dnn = @import("dnn/dnn.zig");
 pub const features2d = @import("features2d/features2d.zig");
 pub const calib3d = @import("calib3d/calib3d.zig");
 pub const photo = @import("photo/photo.zig");
+pub const objdetect = @import("objdetect/objdetect.zig");
 
 pub const Image = core.Image;
 pub const AnyImage = core.AnyImage;
@@ -34,4 +35,5 @@ test {
     _ = features2d;
     _ = calib3d;
     _ = photo;
+    _ = objdetect;
 }

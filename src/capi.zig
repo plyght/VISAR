@@ -26,6 +26,11 @@ comptime {
     _ = @import("capi_photo.zig");
 }
 
+// objdetect's entry points (QR codes, ArUco) live in their own file.
+comptime {
+    _ = @import("capi_objdetect.zig");
+}
+
 /// The system allocator where libc is linked: it reuses freed blocks, where
 /// smp_allocator maps fresh pages (and page faults) for every large image.
 pub const gpa = if (builtin.cpu.arch.isWasm()) std.heap.wasm_allocator else if (builtin.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
@@ -314,6 +319,21 @@ export fn visar_threshold(src: *const CImage, dst: *const CImage, thresh: f64, m
     }.f));
     if (used) |u| u.* = t;
     return r;
+}
+
+/// adaptiveThreshold on 8U one-channel images. method: 0 MEAN_C,
+/// 1 GAUSSIAN_C; type: 0 BINARY, 1 BINARY_INV.
+export fn visar_adaptive_threshold(src: *const CImage, dst: *const CImage, maxval: f64, method: c_int, kind: c_int, block: c_int, delta: f64) c_int {
+    const m = std.enums.fromInt(ip.AdaptiveMethod, method) orelse return fail(error.InvalidArgument);
+    const k: ip.ThresholdType = switch (kind) {
+        0 => .binary,
+        1 => .binary_inv,
+        else => return fail(error.InvalidArgument),
+    };
+    if (block < 3) return fail(error.InvalidArgument);
+    const s = typed(u8, src) catch |e| return fail(e);
+    const d = typed(u8, dst) catch |e| return fail(e);
+    return run(ip.adaptiveThreshold(exec(), gpa, s, d, maxval, m, k, @intCast(block), delta));
 }
 
 export fn visar_morphology(src: *const CImage, dst: *const CImage, op: c_int, shape: c_int, kw: c_int, kh: c_int, iterations: c_int) c_int {

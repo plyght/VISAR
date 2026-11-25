@@ -66,6 +66,9 @@ int visar_good_features_to_track(const visar_image *src, float *corners, size_t 
                                  double quality_level, double min_distance, const visar_image *mask, int block_size,
                                  int gradient_size, int use_harris, double k);
 int visar_threshold(const visar_image *src, const visar_image *dst, double thresh, double maxval, int type, double *used);
+/* adaptiveThreshold (8U, one channel): method 0 MEAN_C, 1 GAUSSIAN_C; type 0 BINARY, 1 BINARY_INV. */
+int visar_adaptive_threshold(const visar_image *src, const visar_image *dst, double maxval, int method, int type,
+                             int block_size, double delta);
 int visar_morphology(const visar_image *src, const visar_image *dst, int op, int shape, int kw, int kh, int iterations);
 int visar_flip(const visar_image *src, const visar_image *dst, int code);
 int visar_rotate(const visar_image *src, const visar_image *dst, int code);
@@ -358,6 +361,51 @@ int visar_fast_nl_means_denoising_colored(const visar_image *src, const visar_im
                                           int template_window_size, int search_window_size);
 int visar_lab_linear(const visar_image *src, const visar_image *dst, int inverse);
 int visar_inpaint(const visar_image *src, const visar_image *mask, const visar_image *dst, double radius, int flags);
+/* objdetect: QR codes (QRCodeEncoder / QRCodeDetector) and ArUco markers. Enumerations use OpenCV's
+   numbering. visar_qr_encode returns a size x size 8U image (0 dark, 255 light, 2-module quiet zone),
+   bit-identical to cv2.QRCodeEncoder; free it with visar_free(out, size * size). level: 0 L, 1 M, 2 Q, 3 H;
+   mode: -1 auto, 1 numeric, 2 alphanumeric, 4 byte, 7 ECI (UTF-8), 8 kanji; version 0 = smallest. */
+int visar_qr_encode(const char *text, size_t len, int version, int level, int mode, uint8_t **out, uint32_t *size);
+/* n (2..16) symbols back to back in out (free with visar_free(out, sum of sizes[i]^2)). */
+int visar_qr_encode_structured_append(const char *text, size_t len, int version, int level, int n, uint8_t **out,
+                                      uint32_t sizes[16], uint32_t *count);
+typedef struct visar_qr_code {
+    float corners[8]; /* top-left, top-right, bottom-right, bottom-left of the symbol (x, y) */
+    uint32_t offset, length; /* the decoded text is text[offset .. offset + length] */
+    int32_t decoded, version;
+} visar_qr_code;
+/* detect (decode = 0), detectAndDecode (multi = 0) or detectAndDecodeMulti (multi = 1) on an 8U gray, BGR or
+   BGRA image; *count = 0 when nothing is found. Free with visar_qr_free. */
+int visar_qr_detect(const visar_image *src, int multi, int decode, visar_qr_code **codes, size_t *count, char **text,
+                    size_t *text_len);
+void visar_qr_free(visar_qr_code *codes, size_t count, char *text, size_t text_len);
+/* cv::aruco::DetectorParameters; corner_refinement_method 0 NONE or 1 SUBPIX. */
+typedef struct visar_aruco_params {
+    int adaptive_thresh_win_size_min, adaptive_thresh_win_size_max, adaptive_thresh_win_size_step;
+    double adaptive_thresh_constant, min_marker_perimeter_rate, max_marker_perimeter_rate,
+        polygonal_approx_accuracy_rate, min_corner_distance_rate;
+    int min_distance_to_border;
+    double min_marker_distance_rate;
+    float min_group_distance;
+    int corner_refinement_method, corner_refinement_win_size;
+    float relative_corner_refinement_win_size;
+    int corner_refinement_max_iterations;
+    double corner_refinement_min_accuracy;
+    int marker_border_bits, perspective_remove_pixel_per_cell;
+    double perspective_remove_ignored_margin_per_cell, max_erroneous_bits_in_border_rate, min_otsu_std_dev,
+        error_correction_rate;
+    float valid_bit_id_threshold;
+    int detect_inverted_marker;
+} visar_aruco_params;
+void visar_aruco_default_params(visar_aruco_params *p);
+/* dict: cv::aruco::PredefinedDictionaryType (DICT_4X4_50 = 0 ... DICT_ARUCO_MIP_36h12 = 21). */
+int visar_aruco_generate(int dict, int id, int side, int border_bits, const visar_image *dst);
+/* detectMarkers: corners (count * 8 floats), ids (count int32) and, when `rejected` is not NULL, rejected
+   candidates (nrejected * 8 floats); free each with visar_free(ptr, bytes). params may be NULL. */
+int visar_aruco_detect(const visar_image *src, int dict, const visar_aruco_params *params, uint8_t **corners,
+                       uint8_t **ids, size_t *count, uint8_t **rejected, size_t *nrejected);
+/* drawDetectedMarkers on 8U gray or BGR (in place); ids may be NULL; color is (B, G, R). */
+int visar_aruco_draw(const visar_image *img, const float *corners, const int32_t *ids, size_t n, const double color[3]);
 
 #ifdef __cplusplus
 }

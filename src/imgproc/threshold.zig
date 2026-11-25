@@ -297,3 +297,64 @@ test "threshold binary and otsu" {
     const t = try threshold(.serial, src, dst, 0, 255, .binary, .otsu);
     try std.testing.expect(t >= 30 and t < 200);
 }
+
+pub const AdaptiveMethod = enum(u8) { mean = 0, gaussian = 1 };
+
+/// OpenCV's adaptiveThreshold on an 8-bit one-channel image: each pixel
+/// against the mean (box or Gaussian, `block` x `block`, replicated
+/// border) of its neighbourhood minus `delta`. `kind` is .binary or
+/// .binary_inv. `dst` may alias `src`.
+pub fn adaptiveThreshold(exec: Exec, gpa: std.mem.Allocator, src: Image(u8), dst: Image(u8), maxval: f64, method: AdaptiveMethod, kind: Type, block: u32, delta: f64) (Error || std.mem.Allocator.Error || error{InvalidKernel})!void {
+    if (!src.sameShape(dst)) return error.SizeMismatch;
+    if (src.channels != 1) return error.UnsupportedChannels;
+    if (block % 2 != 1 or block <= 1) return error.InvalidKernel;
+    if (kind != .binary and kind != .binary_inv) return error.Unsupported;
+    const filter = @import("filter.zig");
+    var mean = try Image(u8).init(gpa, src.width, src.height, 1);
+    defer mean.deinit(gpa);
+    switch (method) {
+        .mean => try filter.boxFilter(exec, gpa, src, mean, .{ .kw = block, .kh = block, .border = .replicate }),
+        .gaussian => {
+            // OpenCV blurs a float copy, then rounds back to 8 bits.
+            var f = try Image(f32).init(gpa, src.width, src.height, 1);
+            defer f.deinit(gpa);
+            var fb = try Image(f32).init(gpa, src.width, src.height, 1);
+            defer fb.deinit(gpa);
+            for (0..src.height) |y| {
+                for (src.data[y * src.stride ..][0..src.width], f.data[y * f.stride ..][0..src.width]) |v, *o| o.* = @floatFromInt(v);
+            }
+            try filter.gaussianBlur(exec, gpa, f, fb, .{ .kw = block, .kh = block, .border = .replicate });
+            for (0..src.height) |y| {
+                for (fb.data[y * fb.stride ..][0..src.width], mean.data[y * mean.stride ..][0..src.width]) |v, *o| o.* = sat.cast(u8, v);
+            }
+        },
+    }
+    const imax = sat.cast(u8, maxval);
+    const idelta: i32 = @intFromFloat(if (kind == .binary) @ceil(delta) else @floor(delta));
+    // tab[src - mean + 255]
+    var tab: [768]u8 = undefined;
+    for (&tab, 0..) |*t, i_| {
+        const i: i32 = @as(i32, @intCast(i_)) - 255;
+        t.* = if (kind == .binary) (if (i > -idelta) imax else 0) else (if (i <= -idelta) imax else 0);
+    }
+    // tab[s - m + 255] is imax exactly when s + idelta > m (binary) or
+    // s + idelta <= m (binary_inv); vectors compare in i16.
+    const N = 16;
+    const V16 = @Vector(N, i16);
+    const dv: V16 = @splat(@intCast(std.math.clamp(idelta, -1024, 1024)));
+    const on: @Vector(N, u8) = @splat(imax);
+    const off: @Vector(N, u8) = @splat(0);
+    for (0..src.height) |y| {
+        const s = src.data[y * src.stride ..][0..src.width];
+        const m = mean.data[y * mean.stride ..][0..src.width];
+        const d = dst.data[y * dst.stride ..][0..src.width];
+        var x: usize = 0;
+        while (x + N <= s.len) : (x += N) {
+            const sv: V16 = @as(@Vector(N, u8), s[x..][0..N].*);
+            const mv: V16 = @as(@Vector(N, u8), m[x..][0..N].*);
+            const gt = sv + dv > mv;
+            d[x..][0..N].* = if (kind == .binary) @select(u8, gt, on, off) else @select(u8, gt, off, on);
+        }
+        while (x < s.len) : (x += 1) d[x] = tab[@as(usize, s[x]) + 255 - m[x]];
+    }
+}
