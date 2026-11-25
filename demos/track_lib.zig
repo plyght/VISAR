@@ -1814,7 +1814,7 @@ fn followSelfie(slices: u32) !void {
     for (0..n) |i| {
         const off = scene.render(frame);
         // Whatever the partial image does not compute must not matter.
-        small.fill(@intCast(i * 37 % 256));
+        small.fill(@intCast((i * 37) % 256));
         try ft.trackingImage(exec, frame, small);
         try whole.trackingImage(exec, frame, small_whole);
         // The same tracking image whether or not it came with the detector input.
