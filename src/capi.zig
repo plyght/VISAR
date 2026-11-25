@@ -150,6 +150,17 @@ export fn visar_cvt_color(src: *const CImage, dst: *const CImage, code: c_int) c
     }.f));
 }
 
+/// BT.601 gray of a BGR or BGRA VISAR_8U image shrunk by the integer factor
+/// k (1-16) with box averaging, in one pass (the tracking image of
+/// `visar track`); dst is (width / k) x (height / k), 1 channel.
+export fn visar_gray_downsample(src: *const CImage, dst: *const CImage, k: c_int) c_int {
+    if (k <= 0) return fail(error.InvalidArgument);
+    const s = typed(u8, src) catch |e| return fail(e);
+    const d = typed(u8, dst) catch |e| return fail(e);
+    visar.videoio.frame.grayDownsample(exec(), s, d, @intCast(k)) catch |e| return fail(e);
+    return 0;
+}
+
 export fn visar_resize(src: *const CImage, dst: *const CImage, interp: c_int) c_int {
     const m = std.enums.fromInt(ip.Interp, interp) orelse return fail(error.Unsupported);
     return run(dispatch(src, .{ dst, m }, struct {

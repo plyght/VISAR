@@ -99,6 +99,12 @@ def cvt_color(a, code, dst=None):
     return dst
 
 
+def gray_downsample(a, k, dst=None):
+    dst = _out((a.shape[0] // k, a.shape[1] // k), np.uint8) if dst is None else dst
+    _check(lib.visar_gray_downsample(ctypes.byref(desc(a)), ctypes.byref(desc(dst)), int(k)))
+    return dst
+
+
 def resize(a, size, interpolation=1, dst=None):
     dst = _out(_shape(a, w=size[0], h=size[1]), a.dtype) if dst is None else dst
     _check(lib.visar_resize(ctypes.byref(desc(a)), ctypes.byref(desc(dst)), interpolation))

@@ -150,6 +150,36 @@ def dnn_cases():
         ours = vs.FaceDetector(model, (w, h))
         theirs = cv2.FaceDetectorYN.create(path, "", (w, h))
         yield f"FaceDetectorYN {w}x{h}", (lambda o=ours, i=img: o.detect(i)), (lambda t=theirs, i=img: t.detect(i))
+    # The 4K face pipeline's stages (bench/face4k.py has the full table):
+    # a camera-native BGRA frame into the network input, the gray tracking
+    # image, and the whole detection (network on the CPU).
+    if not faces or not hasattr(vs.lib, "visar_face_detector_prepare"):
+        return
+    frame = cv2.cvtColor(cv2.resize(src, (3840, 2160), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2BGRA)
+    bgr4k = np.empty((2160, 3840, 3), np.uint8)
+    small = np.empty((360, 640, 3), np.uint8)
+    gray = np.empty((360, 640), np.uint8)
+    graybig = np.empty((2160, 3840), np.uint8)
+    # One detector per library (bench/ab.py swaps `vs` between two builds).
+    dets = {}
+
+    def ours():
+        d = dets.get(id(vs))
+        if d is None:
+            d = dets[id(vs)] = vs.FaceDetector(model, (640, 360), backend="cpu")
+        return d
+    theirs = cv2.FaceDetectorYN.create(path, "", (640, 360))
+
+    def cv_prep():
+        cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR, dst=bgr4k)
+        cv2.resize(bgr4k, (640, 360), dst=small, interpolation=cv2.INTER_AREA)
+
+    def cv_gray():
+        cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY, dst=graybig)
+        cv2.resize(graybig, (640, 360), dst=gray, interpolation=cv2.INTER_AREA)
+    yield "face prep 4K BGRA->640x360", (lambda: ours().prepare(frame)), cv_prep
+    yield "face gray 4K BGRA /6", (lambda: vs.gray_downsample(frame, 6, gray)), cv_gray
+    yield "face pipeline 4K->640x360", (lambda: ours().detect_frame(frame)), (lambda: (cv_prep(), theirs.detect(small)))
 
 
 def blob_mask(h, w, n=None, seed=7):

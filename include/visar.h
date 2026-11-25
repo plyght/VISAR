@@ -48,6 +48,9 @@ int visar_get_num_threads(void);
 
 /* imgproc */
 int visar_cvt_color(const visar_image *src, const visar_image *dst, int code);
+/* BT.601 gray of a BGR/BGRA 8U image shrunk by the integer factor k (1-16) with box averaging, in one
+   pass; dst is (width / k) x (height / k), 1 channel. */
+int visar_gray_downsample(const visar_image *src, const visar_image *dst, int k);
 int visar_resize(const visar_image *src, const visar_image *dst, int interpolation);
 int visar_gaussian_blur(const visar_image *src, const visar_image *dst, int kw, int kh, double sigma_x, double sigma_y, int border);
 int visar_box_filter(const visar_image *src, const visar_image *dst, int kw, int kh, int normalize, int border);
