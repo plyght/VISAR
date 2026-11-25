@@ -26,6 +26,12 @@
 //! image computed (so of the frame read for it). "gray_ms" times
 //! trackingImage only: the parts of a partial image the step computes count
 //! in "track_ms".
+//! Per-frame latency: every timed frame is timed alone; "p50_ms" ..
+//! "max_ms" are nearest-rank percentiles over all frames, and "by_step"
+//! splits the frames by what the step did: whole-frame detections
+//! ("full"), crop-only detections ("crops") and frames without a detection
+//! ("tracked", postponed ones included), each with the count, mean, p50,
+//! p95, p99 and max ms of the whole frame (gray image + step).
 //!   --profile: instead, the CPU program of YuNet step by step at 1 and
 //!       --threads threads (each step timed alone).
 
@@ -125,53 +131,123 @@ pub fn main(init: std.process.Init) !void {
     const s0 = ft.stats;
     const times = try gpa.alloc(f64, frames);
     defer gpa.free(times);
+    const kinds = try gpa.alloc(track.FaceStep, frames);
+    defer gpa.free(kinds);
     var gray_ms: f64 = 0;
-    for (times) |*t| {
+    for (times, kinds) |*t, *kind| {
         const off = scene.render(frame);
         const t0 = Io.Clock.awake.now(io);
         if (separate) try visar.videoio.frame.grayDownsample(exec, frame, small, k) else try ft.trackingImage(exec, frame, small);
         const tg = Io.Clock.awake.now(io);
-        _ = try ft.step(exec, io, frame, small);
+        kind.* = try ft.step(exec, io, frame, small);
         const t1 = Io.Clock.awake.now(io);
         t.* = @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e6;
         gray_ms += @as(f64, @floatFromInt(tg.nanoseconds - t0.nanoseconds)) / 1e6;
         truth.score(ft.faces(), off);
     }
     const s = ft.stats;
-    var sum: f64 = 0;
-    for (times) |t| sum += t;
-    std.mem.sort(f64, times, {}, std.sort.asc(f64));
-    const mean = sum / @as(f64, @floatFromInt(frames));
-    var ob: [2048]u8 = undefined;
+    // Per kind of step (before `times` is sorted).
+    var by: [3]Dist = undefined;
+    const groups = [3][]const track.FaceStep{ &.{.full}, &.{.crops}, &.{ .tracked, .postponed } };
+    const scratch = try gpa.alloc(f64, frames);
+    defer gpa.free(scratch);
+    for (groups, &by) |g, *d| {
+        var n: usize = 0;
+        for (times, kinds) |t, kind| if (std.mem.indexOfScalar(track.FaceStep, g, kind) != null) {
+            scratch[n] = t;
+            n += 1;
+        };
+        d.* = .of(scratch[0..n]);
+    }
+    const all: Dist = .of(times);
+    const mean = all.mean;
+    var ob: [4096]u8 = undefined;
     var ow = Io.File.Writer.initStreaming(.stdout(), io, &ob);
     const w = &ow.interface;
     try w.print(
         \\{{"size":"{d}x{d}","detector":"{d}x{d}","threads":{d},"level":{d},"detect_every":{d},"frames":{d},
-        \\"mean_ms":{d:.3},"p50_ms":{d:.3},"p95_ms":{d:.3},"max_ms":{d:.3},"fps":{d:.1},
+        \\"mean_ms":{d:.3},"p50_ms":{d:.3},"p95_ms":{d:.3},"p99_ms":{d:.3},"max_ms":{d:.3},"fps":{d:.1},
+        \\"by_step":{{"full":{f},"crops":{f},"tracked":{f}}},
+        \\
+    , .{
+        W,                 H,
+        ft.det_w,          ft.det_h,
+        exec.threads(),    opts.level,
+        opts.detect_every, frames,
+        mean,              all.p50,
+        all.p95,           all.p99,
+        all.max,           1000 / mean,
+        by[0],             by[1],
+        by[2],
+    });
+    try w.print(
         \\"full_runs":{d},"crop_rounds":{d},"crops":{d},"postponed":{d},"mean_full_ms":{d:.3},"mean_crop_ms":{d:.3},
         \\"gray_ms":{d:.3},"track_ms":{d:.3},"detect_ms":{d:.3},
         \\"faces":{d},"followed":{d},"truth_frames":{d},"mean_iou":{d:.4},"mean_err_px":{d:.2},"fused_preps":{d},"fused_unused":{d},
         \\"partial_gray":{},"partial_frames":{d},"gray_read":{d:.4}}}
         \\
     , .{
-        W,                                                               H,
-        ft.det_w,                                                        ft.det_h,
-        exec.threads(),                                                  opts.level,
-        opts.detect_every,                                               frames,
-        mean,                                                            times[frames / 2],
-        times[frames * 95 / 100],                                        times[frames - 1],
-        1000 / mean,                                                     s.full_runs - s0.full_runs,
-        s.crop_rounds - s0.crop_rounds,                                  s.crops - s0.crops,
-        s.postponed - s0.postponed,                                      meanOr0(s.full_ms - s0.full_ms, s.full_runs - s0.full_runs),
-        meanOr0(s.crop_ms - s0.crop_ms, s.crop_rounds - s0.crop_rounds), gray_ms / @as(f64, @floatFromInt(frames)),
-        (s.track_ms - s0.track_ms) / @as(f64, @floatFromInt(frames)),    (s.detectMs() - s0.detectMs()) / @as(f64, @floatFromInt(frames)),
-        ft.faces().len,                                                  truth.followed,
-        truth.frames,                                                    truth.iou_sum / @max(1, @as(f64, @floatFromInt(truth.frames))),
-        truth.err_sum / @max(1, @as(f64, @floatFromInt(truth.frames))),  s.fused_preps - s0.fused_preps,
-        s.fused_unused - s0.fused_unused,                                opts.partial_gray,
-        s.partial_frames - s0.partial_frames,                            @as(f64, @floatFromInt(s.gray_px - s0.gray_px)) / (@as(f64, @floatFromInt(frames)) * @as(f64, @floatFromInt(@as(u64, small.width) * small.height))),
+        s.full_runs - s0.full_runs,
+        s.crop_rounds - s0.crop_rounds,
+        s.crops - s0.crops,
+        s.postponed - s0.postponed,
+        meanOr0(s.full_ms - s0.full_ms, s.full_runs - s0.full_runs),
+        meanOr0(s.crop_ms - s0.crop_ms, s.crop_rounds - s0.crop_rounds),
+        gray_ms / @as(f64, @floatFromInt(frames)),
+        (s.track_ms - s0.track_ms) / @as(f64, @floatFromInt(frames)),
+        (s.detectMs() - s0.detectMs()) / @as(f64, @floatFromInt(frames)),
+        ft.faces().len,
+        truth.followed,
+        truth.frames,
+        truth.iou_sum / @max(1, @as(f64, @floatFromInt(truth.frames))),
+        truth.err_sum / @max(1, @as(f64, @floatFromInt(truth.frames))),
+        s.fused_preps - s0.fused_preps,
+        s.fused_unused - s0.fused_unused,
+        opts.partial_gray,
+        s.partial_frames - s0.partial_frames,
+        @as(f64, @floatFromInt(s.gray_px - s0.gray_px)) / (@as(f64, @floatFromInt(frames)) * @as(f64, @floatFromInt(@as(u64, small.width) * small.height))),
     });
     try w.flush();
+}
+
+/// The distribution of per-frame times (ms): nearest-rank percentiles.
+const Dist = struct {
+    n: usize = 0,
+    mean: f64 = 0,
+    p50: f64 = 0,
+    p95: f64 = 0,
+    p99: f64 = 0,
+    max: f64 = 0,
+
+    /// Sorts `ts`.
+    fn of(ts: []f64) Dist {
+        if (ts.len == 0) return .{};
+        std.mem.sort(f64, ts, {}, std.sort.asc(f64));
+        var sum: f64 = 0;
+        for (ts) |t| sum += t;
+        return .{ .n = ts.len, .mean = sum / @as(f64, @floatFromInt(ts.len)), .p50 = rank(ts, 50), .p95 = rank(ts, 95), .p99 = rank(ts, 99), .max = ts[ts.len - 1] };
+    }
+
+    /// The smallest time with at least p% of the times at or below it.
+    fn rank(sorted: []const f64, p: usize) f64 {
+        const i = (sorted.len * p + 99) / 100; // ceil(n p / 100), 1-based
+        return sorted[@max(i, 1) - 1];
+    }
+
+    pub fn format(d: Dist, w: *Io.Writer) Io.Writer.Error!void {
+        try w.print("{{\"n\":{d},\"mean_ms\":{d:.3},\"p50_ms\":{d:.3},\"p95_ms\":{d:.3},\"p99_ms\":{d:.3},\"max_ms\":{d:.3}}}", .{ d.n, d.mean, d.p50, d.p95, d.p99, d.max });
+    }
+};
+
+test "nearest-rank percentiles" {
+    var ts: [100]f64 = undefined;
+    for (&ts, 0..) |*t, i| t.* = @floatFromInt(100 - i);
+    const d: Dist = .of(&ts);
+    try std.testing.expectEqual(@as(f64, 50), d.p50);
+    try std.testing.expectEqual(@as(f64, 95), d.p95);
+    try std.testing.expectEqual(@as(f64, 99), d.p99);
+    try std.testing.expectEqual(@as(f64, 100), d.max);
+    try std.testing.expectEqual(@as(f64, 50.5), d.mean);
 }
 
 fn meanOr0(sum: f64, n: u64) f64 {

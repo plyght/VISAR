@@ -14,7 +14,11 @@ blob itself) + the scaling. Every stage is timed alone, at 1 and N threads
 
 With --steady, the change-driven steady state of the face tracker
 (bench/face4k_steady.zig) on the selfie moving slowly over a 4K canvas is
-added: effective ms per frame of the whole per-frame work.
+added: effective ms per frame of the whole per-frame work, and its
+per-frame latency (p50/p95/p99/max over the frames, nearest rank; frames
+with a whole-frame detection are the spikes). For comparison, the end to end
+detection of every frame is also timed frame by frame (--frames runs, VISAR
+and OpenCV alike), as a latency distribution.
 """
 import argparse
 import json
@@ -48,11 +52,33 @@ def timeit(f, min_time=0.5, min_runs=15, max_runs=400):
     return statistics.median(ts) * 1e3, min(ts) * 1e3
 
 
+def rank(sorted_ts, p):
+    """Nearest-rank percentile of sorted times."""
+    return sorted_ts[max(1, -(-len(sorted_ts) * p // 100)) - 1]
+
+
+def dist(ts):
+    """{mean, p50, p95, p99, max} in ms of per-frame times in seconds."""
+    ts = sorted(t * 1e3 for t in ts)
+    return {"mean": sum(ts) / len(ts), "p50": rank(ts, 50), "p95": rank(ts, 95), "p99": rank(ts, 99), "max": ts[-1]}
+
+
+def per_frame(f, frames):
+    """Per-call times of `frames` calls of f (after one warm-up call)."""
+    f()
+    ts = []
+    for _ in range(frames):
+        t0 = time.perf_counter()
+        f()
+        ts.append(time.perf_counter() - t0)
+    return dist(ts)
+
+
 def fmt(t):
     return f"{t[0]:.2f} ({t[1]:.2f})" if t else "-"
 
 
-def one_shot(model_path, model, frame, w, h, threads):
+def one_shot(model_path, model, frame, w, h, threads, frames):
     """Per-stage times {stage: (visar, opencv)} at `threads`, and the faces."""
     vs.set_num_threads(threads)
     cv2.setNumThreads(threads)
@@ -113,6 +139,7 @@ def one_shot(model_path, model, frame, w, h, threads):
     r["all"] = (r["all"][0], timeit(cv_all))
     want = cv_all()
     want = np.zeros((0, 15), np.float32) if want is None else want
+    r["latency"] = (per_frame(lambda: det.detect_frame(frame), frames), per_frame(cv_all, frames))
     if vs.metal_available():
         gpu = vs.FaceDetector(model, (w, h), backend="metal")
         gpu.detect_frame(frame)
@@ -126,6 +153,15 @@ def steady(exe, threads, level, every, face_width, frames, extra=()):
                           "--face-width", str(face_width), "--frames", str(frames), *extra],
                          check=True, capture_output=True, text=True).stdout
     return json.loads(out)
+
+
+def tail(r):
+    return f"{r['p50_ms']:.2f} / {r['p95_ms']:.2f} / {r['p99_ms']:.2f} / {r['max_ms']:.2f}"
+
+
+def full(r):
+    f = r["by_step"]["full"]
+    return f"{f['mean_ms']:.2f} / {f['max_ms']:.2f}" if f["n"] else "-"
 
 
 def main():
@@ -155,7 +191,7 @@ def main():
         w, h = map(int, size.split("x"))
         res = {}
         for t in (1, n):
-            res[t], got, want = one_shot(model_path, model, frame, w, h, t)
+            res[t], got, want = one_shot(model_path, model, frame, w, h, t, args.frames)
         ok = got.shape == want.shape and (len(got) == 0 or np.abs(got[:, :14] - want[:, :14]).max() <= 0.02)
         minw = got[:, 2].min() if len(got) else 0
         gpu_note = f" GPU rows: Metal on {vs.metal_device()} (not representative of real Apple GPUs on a VM)." if vs.metal_available() else ""
@@ -179,6 +215,15 @@ def main():
             v, c = res[t]["all"]
             lines.append(f"| fps end to end, {t}T | {1000 / v[0]:.0f} | {1000 / c[0]:.0f} | | | | |" if t == 1 else
                          f"| fps end to end, {t}T | | | {1000 / v[0]:.0f} | {1000 / c[0]:.0f} | | |")
+        lines += ["", f"Per-frame latency of the end to end detection of every frame ({args.frames} frames one after another, "
+                      "ms; nearest-rank percentiles; ratio = OpenCV / VISAR, above 1 = VISAR faster):\n",
+                  "| Threads | | mean | p50 | p95 | p99 | max |", "| --- | --- | ---: | ---: | ---: | ---: | ---: |"]
+        for t in (1, n):
+            v, c = res[t]["latency"]
+            keys = ("mean", "p50", "p95", "p99", "max")
+            lines.append(f"| {t}T | VISAR | " + " | ".join(f"{v[k]:.2f}" for k in keys) + " |")
+            lines.append(f"| {t}T | OpenCV | " + " | ".join(f"{c[k]:.2f}" for k in keys) + " |")
+            lines.append(f"| {t}T | ratio | " + " | ".join(f"{c[k] / v[k]:.2f}x" for k in keys) + " |")
         text = "\n".join(lines) + "\n"
         print(text, flush=True)
         md.append(text)
@@ -191,9 +236,10 @@ def main():
                  "crops around tracked faces, whole frame every 4th detection). On frames that will probably run a whole-frame detection the gray image and the detector input come from one pass over the frame (FaceTracker.trackingImage); that pass counts as gray. "
                  "On the other frames only the parts of the gray image the tracker reads are computed (FaceOptions.partial_gray: MOSSE search windows, change-check rows, detection patches; bit-identical there), inside the tracking step; "
                  "'whole' rows compute all of it every frame (and check every 4th row for change), as before. Gray read = share of the frame read for the gray image. "
-                 "Followed = frames with a track at IoU >= 0.5 to the face moved with the image; IoU and error = mean IoU and centre error (4K px) of the best track.\n",
-                 f"| Level, detect every | 1T ms/frame (fps) | {n}T ms/frame (fps) | {n}T p95 ms | {n}T detector runs: full / crop rounds / postponed | 1T ms/frame: gray / tracking / detection | {n}T ms/frame: gray / tracking / detection | gray read | faces | followed | IoU, error |",
-                 "| --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | --- |"]
+                 "Followed = frames with a track at IoU >= 0.5 to the face moved with the image; IoU and error = mean IoU and centre error (4K px) of the best track. "
+                 "p50 / p95 / p99 / max: per-frame latency (each frame timed alone, nearest rank); 'full frames' = the frames with a whole-frame detection (mean / max), the spikes of the change-driven modes.\n",
+                 f"| Level, detect every | 1T ms/frame (fps) | {n}T ms/frame (fps) | 1T p50 / p95 / p99 / max ms | {n}T p50 / p95 / p99 / max ms | 1T / {n}T full frames: mean / max ms | {n}T detector runs: full / crop rounds / postponed | 1T ms/frame: gray / tracking / detection | {n}T ms/frame: gray / tracking / detection | gray read | faces | followed | IoU, error |",
+                 "| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | --- |"]
         for mode in modes:
             level, every = mode[0], mode[1]
             whole = len(mode) > 2 and mode[2] == "whole"
@@ -201,7 +247,7 @@ def main():
             a = steady(args.steady, 1, level, every, fw, args.frames, extra)
             b = steady(args.steady, n, level, every, fw, args.frames, extra)
             lines.append(f"| {level}, {every}{', whole' if whole else ''} | {a['mean_ms']:.2f} ({a['fps']:.0f}) | {b['mean_ms']:.2f} ({b['fps']:.0f}) | "
-                         f"{b['p95_ms']:.2f} | {b['full_runs']} / {b['crop_rounds']} / {b['postponed']} of {b['frames']} "
+                         f"{tail(a)} | {tail(b)} | {full(a)}; {full(b)} | {b['full_runs']} / {b['crop_rounds']} / {b['postponed']} of {b['frames']} "
                          f"(full {b['mean_full_ms']:.2f} ms, crops {b['mean_crop_ms']:.2f} ms) | "
                          f"{a['gray_ms']:.2f} / {a['track_ms']:.2f} / {a['detect_ms']:.2f} | {b['gray_ms']:.2f} / {b['track_ms']:.2f} / {b['detect_ms']:.2f} | {b['gray_read'] * 100:.0f}% | {b['faces']} | {b['followed']}/{b['truth_frames']} | {b['mean_iou']:.3f}, {b['mean_err_px']:.1f} |")
             print(lines[-1], flush=True)
