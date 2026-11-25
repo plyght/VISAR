@@ -115,4 +115,5 @@ pub fn build(b: *std.Build) void {
     face4k.addArtifactArg(steady);
     face4k.addPassthruArgs();
     b.step("face4k", "Benchmark the 4K face pipeline against OpenCV (use -Doptimize=ReleaseFast)").dependOn(&face4k.step);
+    b.step("face4k-steady", "Install the 4K face tracking bench (visar-face4k-steady; --profile times YuNet step by step)").dependOn(&b.addInstallArtifact(steady, .{}).step);
 }

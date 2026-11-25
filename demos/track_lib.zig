@@ -656,6 +656,8 @@ pub const FaceOptions = struct {
     /// Level 2: crop side relative to the larger side of the face box.
     crop_scale: f32 = 2.0,
     score_threshold: f32 = 0.9,
+    /// Which backend runs the detector (see `visar.dnn.Net.Options.backend`).
+    backend: visar.dnn.Backend = .auto,
     /// A detection and a track overlapping by at least this IoU are the
     /// same face.
     match_iou: f32 = 0.3,
@@ -855,7 +857,7 @@ pub const FaceTracker = struct {
             self.plans.items[lru].det.deinit();
             _ = self.plans.swapRemove(lru);
         }
-        var det = try visar.dnn.FaceDetector.create(self.gpa, self.model, .{ .width = w, .height = h, .score_threshold = self.opts.score_threshold });
+        var det = try visar.dnn.FaceDetector.create(self.gpa, self.model, .{ .width = w, .height = h, .score_threshold = self.opts.score_threshold, .backend = self.opts.backend });
         errdefer det.deinit();
         try self.plans.append(self.gpa, .{ .w = w, .h = h, .det = det, .used = self.use_clock });
         return &self.plans.items[self.plans.items.len - 1].det;

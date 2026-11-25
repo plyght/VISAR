@@ -57,7 +57,7 @@ def one_shot(model_path, model, frame, w, h, threads):
     vs.set_num_threads(threads)
     cv2.setNumThreads(threads)
     sx, sy = W4K / w, H4K / h
-    det = vs.FaceDetector(model, (w, h))
+    det = vs.FaceDetector(model, (w, h), backend="cpu")
     ref = cv2.FaceDetectorYN.create(model_path, "", (w, h))
     bgr4k = np.empty((H4K, W4K, 3), np.uint8)
     small = np.empty((h, w, 3), np.uint8)
@@ -105,11 +105,16 @@ def one_shot(model_path, model, frame, w, h, threads):
     r["all"] = (r["all"][0], timeit(cv_all))
     want = cv_all()
     want = np.zeros((0, 15), np.float32) if want is None else want
+    if vs.metal_available():
+        gpu = vs.FaceDetector(model, (w, h), backend="metal")
+        gpu.detect_frame(frame)
+        r["metal_net"] = (timeit(gpu.infer), None)
+        r["metal_all"] = (timeit(lambda: gpu.detect_frame(frame)), None)
     return r, got, want
 
 
 def steady(exe, threads, level, every, face_width, frames):
-    out = subprocess.run([exe, "--threads", str(threads), "--level", str(level), "--detect-every", str(every),
+    out = subprocess.run([exe, "--backend", "cpu", "--threads", str(threads), "--level", str(level), "--detect-every", str(every),
                           "--face-width", str(face_width), "--frames", str(frames)],
                          check=True, capture_output=True, text=True).stdout
     return json.loads(out)
@@ -144,8 +149,9 @@ def main():
             res[t], got, want = one_shot(model_path, model, frame, w, h, t)
         ok = got.shape == want.shape and (len(got) == 0 or np.abs(got[:, :14] - want[:, :14]).max() <= 0.02)
         minw = got[:, 2].min() if len(got) else 0
+        gpu_note = f" GPU rows: Metal on {vs.metal_device()} (not representative of real Apple GPUs on a VM)." if vs.metal_available() else ""
         head = (f"### 3840x2160 BGRA -> {w}x{h} YuNet -> 4K boxes\n\n{len(got)} faces (OpenCV {len(want)}, "
-                f"{'same boxes' if ok else 'DIFFERENT'}), smallest {minw:.0f} px wide at 4K\n")
+                f"{'same boxes' if ok else 'DIFFERENT'}), smallest {minw:.0f} px wide at 4K. Network on the CPU unless noted.{gpu_note}\n")
         rows = [("colour + downscale to the input", "prep", "fused into the f32 input", "cvtColor + resize AREA"),
                 ("network", "net", "", ""),
                 ("decode + NMS + map to 4K", "decode", "", ""),
@@ -154,6 +160,8 @@ def main():
                 ("end to end, VISAR as separate ops", "unfused", "resize + cvtColor + detect", "")]
         lines = [head, f"| Stage | VISAR 1T | OpenCV 1T | VISAR {n}T | OpenCV {n}T | VISAR | OpenCV |",
                  "| --- | ---: | ---: | ---: | ---: | --- | --- |"]
+        if "metal_net" in res[1]:
+            rows += [("network on the GPU (Metal)", "metal_net", "", ""), ("end to end, network on the GPU", "metal_all", "", "")]
         for label, key, vnote, cnote in rows:
             a, b = res[1][key], res[n][key]
             lines.append(f"| {label} | {fmt(a[0])} | {fmt(a[1])} | {fmt(b[0])} | {fmt(b[1])} | {vnote} | {cnote} |")
@@ -171,14 +179,15 @@ def main():
                  "Per frame: gray tracking image + FaceTracker.step (MOSSE on every face, YuNet when scheduled). "
                  "Level 0 = whole-frame detection on schedule; level 2 = change-driven (postponed while still, "
                  "crops around tracked faces, whole frame every 4th detection).\n",
-                 f"| Level, detect every | 1T ms/frame (fps) | {n}T ms/frame (fps) | {n}T p95 ms | {n}T detector runs: full / crop rounds / postponed | faces | followed |",
-                 "| --- | ---: | ---: | ---: | --- | ---: | ---: |"]
+                 f"| Level, detect every | 1T ms/frame (fps) | {n}T ms/frame (fps) | {n}T p95 ms | {n}T detector runs: full / crop rounds / postponed | {n}T ms/frame: gray / tracking / detection | faces | followed |",
+                 "| --- | ---: | ---: | ---: | --- | --- | ---: | ---: |"]
         for level, every in modes:
             a = steady(args.steady, 1, level, every, fw, args.frames)
             b = steady(args.steady, n, level, every, fw, args.frames)
             lines.append(f"| {level}, {every} | {a['mean_ms']:.2f} ({a['fps']:.0f}) | {b['mean_ms']:.2f} ({b['fps']:.0f}) | "
                          f"{b['p95_ms']:.2f} | {b['full_runs']} / {b['crop_rounds']} / {b['postponed']} of {b['frames']} "
-                         f"(full {b['mean_full_ms']:.2f} ms, crops {b['mean_crop_ms']:.2f} ms) | {b['faces']} | {b['followed']}/{b['truth_frames']} |")
+                         f"(full {b['mean_full_ms']:.2f} ms, crops {b['mean_crop_ms']:.2f} ms) | "
+                         f"{b['gray_ms']:.2f} / {b['track_ms']:.2f} / {b['detect_ms']:.2f} | {b['faces']} | {b['followed']}/{b['truth_frames']} |")
             print(lines[-1], flush=True)
         text = "\n".join(lines) + "\n"
         print(text)
