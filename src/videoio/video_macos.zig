@@ -293,6 +293,7 @@ pub const Reader = struct {
             const pb = a.CMSampleBufferGetImageBuffer(sb) orelse continue;
             if (self.skip_before >= 0) {
                 const pts = a.CMSampleBufferGetPresentationTimeStamp(sb).seconds();
+                std.debug.print("avf pts {d:.4} skip_before {d:.4} first {d:.4}\n", .{ pts, self.skip_before, self.first_pts });
                 if (pts < self.skip_before) continue;
                 self.skip_before = -1;
             }
