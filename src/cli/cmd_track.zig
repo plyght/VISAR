@@ -56,7 +56,7 @@ pub const opts = [_]args.Opt{
     .{ .long = "detect-every", .value = "N", .help = "Run the face detector every N frames, MOSSE in between (default 4)" },
     .{ .long = "change-level", .value = "N", .help = "0 off, 1 skip unchanged frames, 2 also detect around faces only (default)" },
     .{ .long = "full-gray", .help = "Whole gray tracking image every frame (default: only around faces)" },
-    .{ .long = "detect-slices", .value = "N", .help = "Spread each whole-frame detection over N frames, 1-8 (default 4; 1 = on one frame)" },
+    .{ .long = "detect-slices", .value = "N", .help = "Spread whole-frame detections over N frames, 1-8 (default 4)" },
     .{ .long = "list-cameras", .help = "List the cameras, their sizes and frame rates, and exit" },
 };
 

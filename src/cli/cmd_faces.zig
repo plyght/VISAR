@@ -32,7 +32,7 @@ pub const opts = [_]args.Opt{
     .{ .long = "detect-every", .value = "N", .help = "Video: detector every N frames, MOSSE in between (default 4)" },
     .{ .long = "change-level", .value = "N", .help = "Video: 0 off, 1 skip unchanged frames, 2 also detect near faces only" },
     .{ .long = "full-gray", .help = "Video: whole gray tracking image every frame" },
-    .{ .long = "detect-slices", .value = "N", .help = "Video: spread each whole-frame detection over N frames, 1-8 (default 4)" },
+    .{ .long = "detect-slices", .value = "N", .help = "Video: spread whole-frame detections over N frames (default 1)" },
     .{ .long = "frames", .short = 'n', .value = "N", .help = "Video: stop after N frames" },
 };
 
@@ -45,7 +45,9 @@ const gif_max_width = 960;
 const Config = struct {
     face_width: ?u32 = null,
     score: f32 = 0.9,
-    face: track.FaceOptions = .{},
+    /// A file has no frame deadline: whole-frame detections on one frame
+    /// unless --detect-slices asks otherwise (`visar track` spreads them).
+    face: track.FaceOptions = .{ .detect_slices = 1 },
     frame_limit: ?u64 = null,
 };
 
