@@ -1106,6 +1106,17 @@ export fn visar_face_detector_prepare(h: *CFaceDetector, img: *const CImage) c_i
     return 0;
 }
 
+export fn visar_face_detector_prepare_gray(h: *CFaceDetector, img: *const CImage, gray: *const CImage) c_int {
+    const src = typed(u8, img) catch |e| return fail(e);
+    const g = typed(u8, gray) catch |e| return fail(e);
+    const fused = h.det.prepareWithGray(exec(), src, g) catch |e| return failDnn(e);
+    if (fused) return 0;
+    if (g.width == 0) return fail(error.InvalidArgument);
+    h.det.prepare(exec(), src) catch |e| return failDnn(e);
+    visar.videoio.frame.grayDownsample(exec(), src, g, src.width / g.width) catch |e| return fail(e);
+    return 0;
+}
+
 export fn visar_face_detector_infer(h: *CFaceDetector) c_int {
     h.det.infer(exec()) catch |e| return failDnn(e);
     return 0;

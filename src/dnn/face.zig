@@ -148,6 +148,24 @@ pub const FaceDetector = struct {
         };
     }
 
+    /// `prepare` that also writes `gray`, the frame's gray tracking image
+    /// (videoio.frame.grayDownsample with k = the shrink factor), from the
+    /// same block sums in the same pass, bit-identical to it. Only when
+    /// the frame shrinks by the same integer factor k > 1 on both axes and
+    /// `gray` is 1 channel at the detector input size; returns false (and
+    /// does nothing) otherwise.
+    pub fn prepareWithGray(d: *FaceDetector, exec: Exec, frame: Image(u8), gray: Image(u8)) !bool {
+        if (frame.channels != 3 and frame.channels != 4) return error.UnsupportedChannels;
+        const w = d.opts.width;
+        const h = d.opts.height;
+        const t: prep.Target = .{ .planes = d.net.input(0), .pw = d.pad_w, .ph = d.pad_h, .w = w, .h = h };
+        const f = prep.factors(frame, w, h) orelse return false;
+        if (!prep.grayFits(t, f, gray)) return false;
+        prep.fillGray(exec, frame, t, f, gray);
+        d.frame_scale = .{ @floatFromInt(f[0]), @floatFromInt(f[1]) };
+        return true;
+    }
+
     /// Stage 2: the network.
     pub fn infer(d: *FaceDetector, exec: Exec) !void {
         try d.net.tryRun(exec);

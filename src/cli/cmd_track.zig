@@ -470,9 +470,14 @@ fn processOne(live: *Live, i: u8) !void {
 
     var clock: track.Clock = .{ .io = live.io };
     _ = clock.lap();
-    try videoio.frame.grayDownsample(live.exec, frame, live.small, live.factor);
-    const t_convert = clock.lap();
     const mode: Mode = @fromBackingInt(@intCast(live.mode.load(.monotonic)));
+    // Face tracking: with the whole-frame detector input in the same pass
+    // when a whole-frame detection is due.
+    if (mode == .faces and live.faces != null and live.faces.?.k == live.factor)
+        try live.faces.?.trackingImage(live.exec, frame, live.small)
+    else
+        try videoio.frame.grayDownsample(live.exec, frame, live.small, live.factor);
+    const t_convert = clock.lap();
     var st: track.StageTimes = .{};
     if (mode == .both or mode == .motion) try live.det.detect(live.exec, live.small, .{ .io = live.io, .times = &st });
     _ = clock.lap();

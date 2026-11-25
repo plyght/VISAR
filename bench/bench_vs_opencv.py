@@ -179,6 +179,14 @@ def dnn_cases():
         cv2.resize(graybig, (640, 360), dst=gray, interpolation=cv2.INTER_AREA)
     yield "face prep 4K BGRA->640x360", (lambda: ours().prepare(frame)), cv_prep
     yield "face gray 4K BGRA /6", (lambda: vs.gray_downsample(frame, 6, gray)), cv_gray
+    def ours_prep_gray():
+        # One pass where the library has it (bench/ab.py may run an older one).
+        if hasattr(vs.lib, "visar_face_detector_prepare_gray"):
+            ours().prepare_gray(frame, gray)
+        else:
+            ours().prepare(frame)
+            vs.gray_downsample(frame, 6, gray)
+    yield "face prep+gray 4K BGRA", ours_prep_gray, (lambda: (cv_prep(), cv_gray()))
     yield "face pipeline 4K->640x360", (lambda: ours().detect_frame(frame)), (lambda: (cv_prep(), theirs.detect(small)))
 
 

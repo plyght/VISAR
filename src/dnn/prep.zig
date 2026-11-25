@@ -50,11 +50,29 @@ pub fn factorsOf(sw: u32, sh: u32, w: u32, h: u32) ?[2]u32 {
 /// Writes `src` (3 or 4 channels; B, G, R first), shrunk by `f` (from
 /// `factors`), into `t`.
 pub fn fill(exec: Exec, src: Image(u8), t: Target, f: [2]u32) void {
+    fillImpl(exec, src, t, f, null);
+}
+
+/// Whether `fillGray` can write `gray` next to `t` from `src` (shrunk by
+/// `f`): square factors, and `gray` (1 channel) the size of the image.
+pub fn grayFits(t: Target, f: [2]u32, gray: Image(u8)) bool {
+    return f[0] == f[1] and f[0] > 1 and gray.channels == 1 and gray.width == t.w and gray.height == t.h;
+}
+
+/// `fill`, and in the same pass the gray tracking image of the frame
+/// (videoio.frame.grayDownsample with k = the factor) from the same block
+/// sums, bit-identical to it. Requires `grayFits`.
+pub fn fillGray(exec: Exec, src: Image(u8), t: Target, f: [2]u32, gray: Image(u8)) void {
+    std.debug.assert(grayFits(t, f, gray));
+    fillImpl(exec, src, t, f, gray);
+}
+
+fn fillImpl(exec: Exec, src: Image(u8), t: Target, f: [2]u32, gray: ?Image(u8)) void {
     std.debug.assert(src.channels == 3 or src.channels == 4);
     std.debug.assert(src.width == f[0] * t.w and src.height == f[1] * t.h);
-    const Ctx = struct { src: Image(u8), t: Target, fx: u32, fy: u32 };
+    const Ctx = struct { src: Image(u8), t: Target, fx: u32, fy: u32, gray: ?Image(u8) };
     // Each output row reads `fy` source rows: a few rows per chunk.
-    exec.parallelFor(t.ph, 8, Ctx{ .src = src, .t = t, .fx = f[0], .fy = f[1] }, struct {
+    exec.parallelFor(t.ph, 8, Ctx{ .src = src, .t = t, .fx = f[0], .fy = f[1], .gray = gray }, struct {
         fn run(c: Ctx, y0: usize, y1: usize) void {
             const plane = c.t.pw * c.t.ph;
             for (y0..y1) |y| {
@@ -72,7 +90,7 @@ pub fn fill(exec: Exec, src: Image(u8), t: Target, f: [2]u32) void {
                     inline 3, 4 => |cn| if (c.fx == 1 and c.fy == 1)
                         copyRow(cn, c.src.row(y), rows, w)
                     else
-                        shrinkRow(cn, c.src, y, c.fx, c.fy, rows, w),
+                        shrinkRow(cn, c.src, y, c.fx, c.fy, rows, w, if (c.gray) |g| g.row(y)[0..w] else null),
                     else => unreachable,
                 }
                 for (rows) |r| @memset(r[w..], 0);
@@ -113,7 +131,7 @@ const vn = 32;
 /// then each output pixel's sum over `fx` columns (all four lanes of a
 /// pixel at once), then the scale, rounding and deinterleave into the
 /// three planes, 8 pixels at a time.
-fn shrinkRow(comptime cn: usize, src: Image(u8), y: usize, fx: u32, fy: u32, rows: [3][]f32, w: usize) void {
+fn shrinkRow(comptime cn: usize, src: Image(u8), y: usize, fx: u32, fy: u32, rows: [3][]f32, w: usize, gray: ?[]u8) void {
     const U = @Vector(vn, u16);
     var vs: [seg * max_factor * cn + vn]u16 = undefined;
     var hs: [seg * 4]u16 align(16) = undefined;
@@ -124,7 +142,8 @@ fn shrinkRow(comptime cn: usize, src: Image(u8), y: usize, fx: u32, fy: u32, row
     const top: @Vector(8, f32) = @splat(255);
     var x0: usize = 0;
     while (x0 < w) : (x0 += seg) {
-        const n = @min(seg, w - x0);
+        // (usize: @min with a constant narrows the type, to u6 here.)
+        const n: usize = @min(seg, w - x0);
         const len = n * fx * cn;
         const base = x0 * fx * cn;
         // Column sums.
@@ -169,6 +188,55 @@ fn shrinkRow(comptime cn: usize, src: Image(u8), y: usize, fx: u32, fy: u32, row
                 rows[ch][x0 + p] = @min((fv + 12582912.0) - 12582912.0, 255);
             }
         }
+        if (gray) |g| grayBlocks(hs[0 .. n * 4], g[x0..][0..n], fx);
+    }
+}
+
+/// BT.601 luma weights in 14-bit fixed point (OpenCV's; those of
+/// videoio.frame.grayDownsample), for B, G and R.
+const wb = 1868;
+const wg = 9617;
+const wr = 4899;
+
+/// The gray tracking image's pixels from the block sums (`hs`: B, G, R
+/// and one unused lane per pixel) of `k` x `k` blocks, as
+/// videoio.frame.grayDownsample rounds them: the weighted sum shifted by
+/// 16 with rounding for k = 2, else times 1 / (k * k * 2^14) in f32 plus
+/// 0.5, truncated.
+fn grayBlocks(hs: []const u16, out: []u8, k: u32) void {
+    const U = @Vector(8, u32);
+    const F = @Vector(8, f32);
+    const inv: f32 = 1.0 / @as(f32, @floatFromInt(k * k * (1 << 14)));
+    var p: usize = 0;
+    while (p + 8 <= out.len) : (p += 8) {
+        const v: @Vector(32, u16) = hs[p * 4 ..][0..32].*;
+        var l: U = @splat(0);
+        inline for (0..3, .{ wb, wg, wr }) |ch, wt| {
+            const idx = comptime blk: {
+                var m: [8]i32 = undefined;
+                for (&m, 0..) |*q, j| q.* = @intCast(j * 4 + ch);
+                break :blk m;
+            };
+            const s: @Vector(8, u16) = @shuffle(u16, v, undefined, idx);
+            l += @as(U, s) * @as(U, @splat(wt));
+        }
+        if (k == 2) {
+            out[p..][0..8].* = simd.narrow(u8, (l + @as(U, @splat(1 << 15))) >> @splat(16));
+        } else {
+            const f = @min(@as(F, @floatFromInt(l)) * @as(F, @splat(inv)) + @as(F, @splat(0.5)), @as(F, @splat(255)));
+            const q: U = @intFromFloat(f);
+            out[p..][0..8].* = @as(@Vector(8, u8), @truncate(q));
+        }
+    }
+    while (p < out.len) : (p += 1) {
+        const s = hs[p * 4 ..][0..3];
+        const l = @as(u32, s[0]) * wb + @as(u32, s[1]) * wg + @as(u32, s[2]) * wr;
+        if (k == 2) {
+            out[p] = @intCast((l + (1 << 15)) >> 16);
+        } else {
+            const f: f32 = @floatFromInt(l);
+            out[p] = @intFromFloat(@min(255, f * inv + 0.5));
+        }
     }
 }
 
@@ -205,6 +273,42 @@ test "fused shrink equals resize(area) + cvtColor + widening" {
             try testing.expectEqual(want, planes[ch * pw * ph + y * pw + x]);
         };
     }
+}
+
+test "fillGray equals fill and grayDownsample" {
+    const gpa = testing.allocator;
+    const frame = @import("../videoio/frame.zig");
+    var prng = std.Random.DefaultPrng.init(5);
+    const rnd = prng.random();
+    inline for (.{ 4, 3 }) |cn| for ([_]u32{ 2, 3, 4, 5, 6, 8, 16 }) |k| {
+        // Widths with a segment tail and a sub-8 tail.
+        for ([_]u32{ 7, 45, 70 }) |w| {
+            const h: u32 = 3;
+            var src = try Image(u8).init(gpa, w * k, h * k, cn);
+            defer src.deinit(gpa);
+            for (src.slice()) |*v| v.* = rnd.int(u8);
+            const pw = w + 3;
+            const ph = h + 1;
+            const want = try gpa.alloc(f32, 3 * pw * ph);
+            defer gpa.free(want);
+            const got = try gpa.alloc(f32, 3 * pw * ph);
+            defer gpa.free(got);
+            @memset(got, -1);
+            const t: Target = .{ .planes = want, .pw = pw, .ph = ph, .w = w, .h = h };
+            fill(Exec.serial, src, t, .{ k, k });
+            var gw = try Image(u8).init(gpa, w, h, 1);
+            defer gw.deinit(gpa);
+            try frame.grayDownsample(Exec.serial, src, gw, k);
+            var gg = try Image(u8).init(gpa, w, h, 1);
+            defer gg.deinit(gpa);
+            var tg = t;
+            tg.planes = got;
+            try testing.expect(grayFits(tg, .{ k, k }, gg));
+            fillGray(Exec.serial, src, tg, .{ k, k }, gg);
+            try testing.expectEqualSlices(f32, want, got);
+            try testing.expectEqualSlices(u8, gw.slice(), gg.slice());
+        }
+    };
 }
 
 test "factors" {

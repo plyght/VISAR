@@ -200,6 +200,10 @@ int visar_face_detector_detect(visar_face_detector *d, const visar_image *img, f
 int visar_face_detector_detect_frame(visar_face_detector *d, const visar_image *img, float *out, size_t cap,
                                      size_t *count);
 int visar_face_detector_prepare(visar_face_detector *d, const visar_image *img);
+/* prepare() plus visar_gray_downsample(img, gray, img width / gray width): when the frame shrinks
+   by one integer factor k > 1 on both axes and gray is the detector size, both come from one pass
+   over the frame (the same results as the two calls). */
+int visar_face_detector_prepare_gray(visar_face_detector *d, const visar_image *img, const visar_image *gray);
 int visar_face_detector_infer(visar_face_detector *d);
 int visar_face_detector_decode(visar_face_detector *d, float *out, size_t cap, size_t *count);
 

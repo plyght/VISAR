@@ -717,6 +717,11 @@ pub const FaceStats = struct {
     tracks_started: u64 = 0,
     tracks_dropped: u64 = 0,
     max_faces: u32 = 0,
+    /// Frames whose tracking image `FaceTracker.trackingImage` produced in
+    /// one pass with the whole-frame detector input, and those of them
+    /// whose step then ran no whole-frame detection (the input unused).
+    fused_preps: u64 = 0,
+    fused_unused: u64 = 0,
 
     pub fn detectMs(s: FaceStats) f64 {
         return s.full_ms + s.crop_ms;
@@ -781,6 +786,9 @@ pub const FaceTracker = struct {
     last: FaceStep = .tracked,
     last_detect_ms: f64 = 0,
     use_clock: u64 = 0,
+    /// The whole-frame detector's input already holds the frame of the
+    /// next `step` (written by `trackingImage`).
+    prepared: bool = false,
 
     const Plan = struct { w: u32, h: u32, det: visar.dnn.FaceDetector, used: u64 };
     const max_plans = 8;
@@ -872,13 +880,47 @@ pub const FaceTracker = struct {
         return self.tracks.items;
     }
 
+    /// Writes `small`, the tracking image of `frame` for the next `step`
+    /// (videoio.frame.grayDownsample by k). When that step will probably
+    /// run a whole-frame detection and the detector shrinks the frame by k
+    /// itself, the detector input comes from the same pass over the frame
+    /// (the same block sums; both outputs bit-identical to separate
+    /// passes), and `step` skips its own.
+    pub fn trackingImage(self: *FaceTracker, exec: visar.Exec, frame: Image(u8), small: Image(u8)) !void {
+        self.prepared = false;
+        if (self.fused != null and self.fullLikely()) {
+            if (try self.plans.items[0].det.prepareWithGray(exec, frame, small)) {
+                self.prepared = true;
+                self.stats.fused_preps += 1;
+                return;
+            }
+        }
+        try visar.videoio.frame.grayDownsample(exec, frame, small, self.k);
+    }
+
+    /// Whether the next step probably detects on the whole frame (the
+    /// schedule of `step` with the tracks' health unknown; whether a still
+    /// frame postpones the detection is guessed from the last step).
+    fn fullLikely(self: *const FaceTracker) bool {
+        if (self.tracks.items.len == 0) return true;
+        const since = self.since + 1;
+        if (since < @max(1, self.opts.detect_every)) return false;
+        if (self.opts.level >= 2 and self.crops_in_row + 1 < @max(1, self.opts.full_every)) return false;
+        return !(self.opts.level >= 1 and self.last == .postponed and since < self.opts.max_postpone);
+    }
+
     /// Processes one frame: `frame` (BGRA, the frame size) and `small`, its
-    /// grayscale tracking image (1 channel, the frame size / k). With an
-    /// `io`, the stages are timed.
+    /// grayscale tracking image (1 channel, the frame size / k; from
+    /// `trackingImage`, or else any equal image). With an `io`, the stages
+    /// are timed.
     pub fn step(self: *FaceTracker, exec: visar.Exec, io: ?Io, frame: Image(u8), small: Image(u8)) !FaceStep {
+        const s = &self.stats;
+        defer if (self.prepared) {
+            self.prepared = false;
+            s.fused_unused += 1;
+        };
         if (frame.channels != 4 or frame.width != self.frame_w or frame.height != self.frame_h) return error.SizeMismatch;
         if (small.channels != 1 or small.width != self.frame_w / self.k or small.height != self.frame_h / self.k) return error.SizeMismatch;
-        const s = &self.stats;
         var clock: Clock = .{ .io = io };
         _ = clock.lap();
         s.frames += 1;
@@ -965,8 +1007,14 @@ pub const FaceTracker = struct {
         const det = try self.plan(w, h);
         if (self.fused) |f| {
             // The window of the frame, shrunk into the detector's input;
-            // results come back in window pixels.
-            const res = try det.detectFrame(exec, try frame.roi(x * f[0], y * f[1], w * f[0], h * f[1]));
+            // results come back in window pixels (the whole frame's input
+            // may be in place already, see `trackingImage`).
+            const whole = x == 0 and y == 0 and w == self.det_w and h == self.det_h;
+            const res = if (whole and self.prepared) blk: {
+                self.prepared = false;
+                try det.infer(exec);
+                break :blk try det.decode();
+            } else try det.detectFrame(exec, try frame.roi(x * f[0], y * f[1], w * f[0], h * f[1]));
             const ox: f32 = @floatFromInt(x * f[0]);
             const oy: f32 = @floatFromInt(y * f[1]);
             for (res) |r| {
@@ -1382,15 +1430,21 @@ test "face tracking follows a moving selfie with few detector runs" {
     defer frame.deinit(gpa);
     var small = try Image(u8).init(gpa, W / k, H / k, 1);
     defer small.deinit(gpa);
+    var ref = try Image(u8).init(gpa, W / k, H / k, 1);
+    defer ref.deinit(gpa);
     var truth: StillTruth = .{};
     const n = StillScene.period + 60;
     for (0..n) |_| {
         const off = scene.render(frame);
-        try visar.videoio.frame.grayDownsample(exec, frame, small, k);
+        try ft.trackingImage(exec, frame, small);
+        // The same tracking image whether or not it came with the detector input.
+        try visar.videoio.frame.grayDownsample(exec, frame, ref, k);
+        try std.testing.expectEqualSlices(u8, ref.slice(), small.slice());
         _ = try ft.step(exec, std.testing.io, frame, small);
         truth.score(ft.faces(), off);
     }
     const s = ft.stats;
+    try std.testing.expect(s.fused_preps > s.fused_unused);
     try std.testing.expect(truth.n >= 1);
     // Every frame has a face that moved with the image.
     try std.testing.expectEqual(@as(u64, n), truth.frames);

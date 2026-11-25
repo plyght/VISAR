@@ -733,6 +733,12 @@ class FaceDetector:
         d = desc(img)
         _check(lib.visar_face_detector_prepare(self._h, ctypes.byref(d)))
 
+    def prepare_gray(self, img, gray):
+        """prepare(img) and gray_downsample(img, k, gray) for k = the width
+        ratio, in one pass over the frame where the factors allow."""
+        d, g = desc(img), desc(gray)
+        _check(lib.visar_face_detector_prepare_gray(self._h, ctypes.byref(d), ctypes.byref(g)))
+
     def infer(self):
         _check(lib.visar_face_detector_infer(self._h))
 

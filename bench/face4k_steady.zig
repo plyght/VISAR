@@ -5,12 +5,17 @@
 //! real pipeline does: the gray tracking image (gray + downscale in one
 //! pass) and the tracker step (MOSSE on every face; YuNet when scheduled,
 //! on the whole frame or only around the faces). Rendering the scene is
-//! not timed (a camera delivers the frame). Prints one JSON object.
+//! not timed (a camera delivers the frame). Prints one JSON object. The
+//! tracking image comes from FaceTracker.trackingImage, which on frames
+//! that will probably run a whole-frame detection also writes the
+//! detector input in the same pass (counted in "fused_preps"; the time
+//! then sits in "gray_ms", not in the detection).
 //!
 //!   zig build face4k -Doptimize=ReleaseFast    (bench/face4k.py runs this)
 //!   visar-face4k-steady [--models DIR] [--threads N] [--face-width N]
 //!       [--level L] [--detect-every N] [--frames N] [--size WxH]
-//!       [--backend auto|cpu|metal]
+//!       [--backend auto|cpu|metal] [--separate]
+//!   --separate: the tracking image always on its own (grayDownsample).
 //!   --profile: instead, the CPU program of YuNet step by step at 1 and
 //!       --threads threads (each step timed alone).
 
@@ -31,11 +36,16 @@ pub fn main(init: std.process.Init) !void {
     var W: u32 = 3840;
     var H: u32 = 2160;
     var profile = false;
+    var separate = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--profile")) {
             profile = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--separate")) {
+            separate = true;
             continue;
         }
         const v = if (i + 1 < args.len) args[i + 1] else "";
@@ -93,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
     var truth: track.StillTruth = .{};
     for (0..track.StillScene.period) |_| {
         _ = scene.render(frame);
-        try visar.videoio.frame.grayDownsample(exec, frame, small, k);
+        if (separate) try visar.videoio.frame.grayDownsample(exec, frame, small, k) else try ft.trackingImage(exec, frame, small);
         _ = try ft.step(exec, io, frame, small);
     }
     const s0 = ft.stats;
@@ -103,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
     for (times) |*t| {
         const off = scene.render(frame);
         const t0 = Io.Clock.awake.now(io);
-        try visar.videoio.frame.grayDownsample(exec, frame, small, k);
+        if (separate) try visar.videoio.frame.grayDownsample(exec, frame, small, k) else try ft.trackingImage(exec, frame, small);
         const tg = Io.Clock.awake.now(io);
         _ = try ft.step(exec, io, frame, small);
         const t1 = Io.Clock.awake.now(io);
@@ -124,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
         \\"mean_ms":{d:.3},"p50_ms":{d:.3},"p95_ms":{d:.3},"max_ms":{d:.3},"fps":{d:.1},
         \\"full_runs":{d},"crop_rounds":{d},"crops":{d},"postponed":{d},"mean_full_ms":{d:.3},"mean_crop_ms":{d:.3},
         \\"gray_ms":{d:.3},"track_ms":{d:.3},"detect_ms":{d:.3},
-        \\"faces":{d},"followed":{d},"truth_frames":{d}}}
+        \\"faces":{d},"followed":{d},"truth_frames":{d},"fused_preps":{d},"fused_unused":{d}}}
         \\
     , .{
         W,                                                               H,
@@ -139,7 +149,8 @@ pub fn main(init: std.process.Init) !void {
         meanOr0(s.crop_ms - s0.crop_ms, s.crop_rounds - s0.crop_rounds), gray_ms / @as(f64, @floatFromInt(frames)),
         (s.track_ms - s0.track_ms) / @as(f64, @floatFromInt(frames)),    (s.detectMs() - s0.detectMs()) / @as(f64, @floatFromInt(frames)),
         ft.faces().len,                                                  truth.followed,
-        truth.frames,
+        truth.frames,                                                    s.fused_preps - s0.fused_preps,
+        s.fused_unused - s0.fused_unused,
     });
     try w.flush();
 }
