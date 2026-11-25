@@ -29,6 +29,7 @@ See [PRD.md](PRD.md) for the full scope and roadmap. VISAR is early: the roadmap
 | Codecs | PNG (all colour types and depths, Adam7; custom inflate), JPEG (in progress), QOI, PNM/PAM, BMP (incl. RLE), animated GIF (encode) |
 | dnn | ONNX inference engine (protobuf reader, graph IR, fusion passes, liveness memory plan with in-place concatenation, blocked-layout SIMD CPU kernels with row-streamed conv chains and cache-blocked GEMM-class convolutions; a Metal GPU backend on macOS that runs the whole plan in one command buffer, loaded at run time with no SDK); `FaceDetector` runs YuNet with results matching `cv2.FaceDetectorYN` and about 3.5x faster on CPU; `ObjectDetector` runs the Model Zoo's NanoDet and YOLOX (COCO) with the zoo pipelines' detections, faster than `cv2.dnn` |
 | calib3d | `findHomography` (all points, RANSAC, LMeDS + LM refinement), `getPerspectiveTransform`/`getAffineTransform`, `perspectiveTransform`, `estimateAffine2D`/`estimateAffinePartial2D`, `findFundamentalMat` (7/8-point, RANSAC, LMeDS), Rodrigues, `projectPoints` (with Jacobians), `undistortPoints`, `solvePnP` (ITERATIVE, EPnP), `solvePnPRansac`, `findChessboardCorners`, `cornerSubPix`, `calibrateCamera`, `undistort` (bit-exact), `initUndistortRectifyMap`, `remap`; RANSAC draws OpenCV's own samples, so inlier sets match OpenCV's |
+| photo | `fastNlMeansDenoising` (1-4 channels) and `fastNlMeansDenoisingColored`, `inpaint` (Telea, Navier-Stokes; 8-bit 1/3 channels, 16-bit, float), all bit-exact; `edgePreservingFilter` (recursive and normalized-convolution), `stylization`, `pencilSketch`; `bilateralFilter` (imgproc) |
 | Video | Background subtraction, multi-object tracker, MOSSE correlation tracker (follows a selected object, ~5000 updates/s per object with its three-scale search) |
 | features2d | FAST (9/16, 7/12, 5/8, non-maximum suppression) and ORB (pyramid, Harris ranking, orientation, rBRIEF with WTA_K 2/3/4, masks) with keypoints and descriptors bit-identical to cv2 on x86-64 and Apple Silicon; `BFMatcher` `match`/`knnMatch`/cross-check under Hamming, Hamming2, L1 and L2, Lowe's ratio test; `drawKeypoints`, `drawMatches` |
 | Video I/O | `VideoCapture` / `VideoWriter`: AVI (Motion-JPEG, uncompressed, I420/YV12/Y800; idx1 and OpenDML indexes, seeking by frame) and YUV4MPEG2 in pure Zig on every platform; .mp4/.mov (H.264, HEVC) through AVFoundation on macOS; cameras (AVFoundation, V4L2) |
@@ -126,6 +127,25 @@ Frames are read into a caller-owned BGR, BGRA or gray image; the frame count, ra
 | write (encode q95 + mux) | 1.94x | 1.81x | 3.23x | 2.04x |
 
 On macOS, .mp4/.mov frames come out of AVFoundation as 4:2:0 and are converted by VISAR, so they are bit-identical to FFmpeg's decode of the same file read through `.y4m` (checked in CI on H.264 and HEVC clips, including seeking). On the CI runner (a VM with no hardware decoder) AVFoundation reads at 0.4-0.7x of cv2's multi-threaded FFmpeg software decoding.
+
+### Denoising, inpainting and edge-preserving filters (photo)
+
+`visar.photo` (C ABI: `visar_fast_nl_means_denoising`, `visar_inpaint`, `visar_edge_preserving_filter`, ...) reproduces OpenCV's photo module. Non-local means is integer arithmetic once OpenCV's weight table is built, so VISAR's results are identical to `cv2.fastNlMeansDenoising` for every window size and strength; the colored variant goes through the same 8-bit linear Lab conversion as OpenCV (its softfloat tables replayed at compile time, identical over all 2^24 colours). VISAR walks the search window offset by offset instead of pixel by pixel and uses the symmetry of the patch distance, so each distance and table lookup serves two pixels. `inpaint` replays OpenCV's fast marching order (its queue key is unique, so any priority queue pops in the same order) and every float operation of Telea's and the Navier-Stokes weights, so its output is identical too, for 8-bit, 16-bit and float images. The domain-transform filters (`edgePreservingFilter`, `stylization`, `pencilSketch`) follow OpenCV's float operations per sample and match it in nearly every pixel; a few in 10^5 can differ by one level, because OpenCV raises the feedback coefficient with the C library's `powf` and takes Sobel magnitudes with fused multiply-adds on some CPUs, and the normalized-convolution filter on images narrower than its window reads past the end of OpenCV's table. `bilateralFilter` (8-bit, 1 or 3 channels) agrees with OpenCV to within one level; OpenCV's own result depends on the build (IPP on x86). Not yet: `detailEnhance`, `decolor`, `seamlessClone`, `colorChange`, `illuminationChange`, `textureFlattening`, the multi-frame and HDR functions.
+
+Speed against OpenCV 5.0 at one thread (`zig build bench -- --threads 1 --filter <name>`; noisy photo-like images, inpainting masks of strokes and discs covering 5%; above 1x = VISAR faster):
+
+| Case (640x480 / 1280x720) | Apple M1 (3-core VM) | x86-64 (Xeon, AVX-512) |
+| --- | ---: | ---: |
+| fastNlMeansDenoising, h 10, 7/21 windows | 2.4x / 2.0x | 2.7x / 2.9x |
+| fastNlMeansDenoisingColored, h 10 | 2.8x / 2.8x | 2.9x / 3.0x |
+| inpaint TELEA, radius 3, BGR / gray | 1.83x / 1.81x, 1.70x / 1.71x | 2.14x / 1.81x, 2.01x / 1.65x |
+| inpaint NS, radius 3, BGR / gray | 1.62x / 1.82x, 1.68x / 1.84x | 1.73x / 2.21x, 1.69x / 1.95x |
+| edgePreservingFilter RECURS / NORMCONV | 5.0x / 3.6x, 5.1x / 3.7x | 2.7x / 4.3x, 2.4x / 4.5x |
+| stylization | 3.5x / 3.7x | 4.0x / 4.5x |
+| pencilSketch | 4.1x / 3.9x | 3.2x / 4.0x |
+| bilateralFilter d 9, sigmas 75, BGR / gray | 0.99x / 1.01x, 1.23x / 1.01x | 2.9x / 0.87x, 2.9x / 0.83x |
+
+`bilateralFilter` is at parity where OpenCV calls IPP (gray on x86) or its own NEON code (Apple Silicon); the rest of the module is 1.6x to 5x faster.
 
 ### Camera geometry (calib3d)
 
