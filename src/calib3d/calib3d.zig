@@ -7,6 +7,8 @@ const std = @import("std");
 pub const linalg = @import("linalg.zig");
 pub const ransac = @import("ransac.zig");
 pub const homography = @import("homography.zig");
+pub const camera = @import("camera.zig");
+pub const pose = @import("pose.zig");
 
 pub const Point2f = homography.Point2f;
 pub const Method = homography.Method;
@@ -16,6 +18,13 @@ pub const getAffineTransform = homography.getAffineTransform;
 pub const perspectiveTransform = homography.perspectiveTransform;
 pub const estimateAffine2D = homography.estimateAffine2D;
 pub const estimateAffinePartial2D = homography.estimateAffinePartial2D;
+
+pub const rodrigues = camera.rodrigues;
+pub const rodriguesInv = camera.rodriguesInv;
+pub const projectPoints = camera.projectPoints;
+pub const undistortPoints = camera.undistortPoints;
+pub const solvePnP = pose.solvePnP;
+pub const solvePnPRansac = pose.solvePnPRansac;
 
 test {
     std.testing.refAllDecls(@This());
