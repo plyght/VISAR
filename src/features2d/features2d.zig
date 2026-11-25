@@ -25,6 +25,11 @@ pub const knnMatch = matcher.knnMatch;
 pub const match = matcher.match;
 pub const ratioTest = matcher.ratioTest;
 
+pub const draw = @import("draw.zig");
+pub const DrawFlags = draw.Flags;
+pub const drawKeypoints = draw.drawKeypoints;
+pub const drawMatches = draw.drawMatches;
+
 test {
     std.testing.refAllDecls(@This());
 }

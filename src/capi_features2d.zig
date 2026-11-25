@@ -156,3 +156,33 @@ export fn visar_ratio_test(knn: [*]const DMatch, counts: [*]const u32, nq: usize
     count.* = f2d.ratioTest(knn[0 .. nq * kk], counts[0..nq], kk, ratio, out[0..nq]);
     return 0;
 }
+
+fn optColor(c: ?*const [4]f64) ?[3]u8 {
+    const v = c orelse return null;
+    if (v[0] < 0) return null;
+    var o: [3]u8 = undefined;
+    for (&o, v[0..3]) |*d, s| d.* = @intFromFloat(std.math.clamp(@round(s), 0, 255));
+    return o;
+}
+
+/// drawKeypoints: `out` is BGR u8 of the size of `img` (1, 3 or 4 channels).
+/// A null colour (or one with a negative first value) colours each keypoint
+/// differently. flags: DrawMatchesFlags (1 DRAW_OVER_OUTIMG, 4 DRAW_RICH_KEYPOINTS).
+export fn visar_draw_keypoints(img: *const CImage, kps: ?[*]const KeyPoint, count: usize, out: *const CImage, color: ?*const [4]f64, flags: c_int) c_int {
+    const s = typed(u8, img) catch |e| return fail(e);
+    const o = typed(u8, out) catch |e| return fail(e);
+    const k: []const KeyPoint = if (kps) |p| p[0..count] else &.{};
+    return run(f2d.drawKeypoints(exec(), s, k, o, optColor(color), .fromInt(@bitCast(flags))));
+}
+
+/// drawMatches: `out` is BGR u8, max(h1, h2) x (w1 + w2). flags as above,
+/// plus 2 NOT_DRAW_SINGLE_POINTS.
+export fn visar_draw_matches(img1: *const CImage, kp1: ?[*]const KeyPoint, n1: usize, img2: *const CImage, kp2: ?[*]const KeyPoint, n2: usize, matches: ?[*]const DMatch, nm: usize, out: *const CImage, match_color: ?*const [4]f64, single_color: ?*const [4]f64, flags: c_int) c_int {
+    const a = typed(u8, img1) catch |e| return fail(e);
+    const b = typed(u8, img2) catch |e| return fail(e);
+    const o = typed(u8, out) catch |e| return fail(e);
+    const k1: []const KeyPoint = if (kp1) |p| p[0..n1] else &.{};
+    const k2: []const KeyPoint = if (kp2) |p| p[0..n2] else &.{};
+    const m: []const DMatch = if (matches) |p| p[0..nm] else &.{};
+    return run(f2d.drawMatches(exec(), a, k1, b, k2, m, o, optColor(match_color), optColor(single_color), .fromInt(@bitCast(flags))));
+}

@@ -129,6 +129,51 @@ int visar_fit_ellipse(const void *pts, size_t n, int depth, visar_rotated_rect *
 int visar_approx_poly_dp(const void *pts, size_t n, int depth, double epsilon, int closed, void *out, size_t *count);
 int visar_point_polygon_test(const void *pts, size_t n, int depth, float x, float y, int measure_dist, double *out);
 int visar_match_shapes(const void *a, size_t na, int depth_a, const void *b, size_t nb, int depth_b, int method, double *out);
+
+/* features2d: keypoints and matches use cv::KeyPoint / cv::DMatch layouts. Arrays returned by VISAR are
+   released with visar_keypoints_free / visar_matches_free; ORB descriptors (count * 32 bytes) with visar_free.
+   Keypoints match cv2 exactly (FAST in OpenCV's order; ORB per pyramid level, within a level in FAST's
+   row-major order where OpenCV leaves std::nth_element's order). */
+typedef struct visar_keypoint {
+    float x, y, size, angle, response;
+    int32_t octave, class_id;
+} visar_keypoint;
+typedef struct visar_dmatch {
+    int32_t query_idx, train_idx, img_idx;
+    float distance;
+} visar_dmatch;
+/* FAST corners of a one-channel VISAR_8U image; type: 0 TYPE_5_8, 1 TYPE_7_12, 2 TYPE_9_16 */
+int visar_fast(const visar_image *src, int threshold, int nonmax_suppression, int type, visar_keypoint **out, size_t *count);
+void visar_keypoints_free(visar_keypoint *kps, size_t count);
+/* cv2.ORB_create parameters (visar_orb_default_params fills the defaults); score_type 0 HARRIS, 1 FAST */
+typedef struct visar_orb_params {
+    int nfeatures;
+    float scale_factor;
+    int nlevels, edge_threshold, first_level, wta_k, score_type, patch_size, fast_threshold;
+} visar_orb_params;
+void visar_orb_default_params(visar_orb_params *p);
+/* ORB detectAndCompute: src VISAR_8U gray, BGR or BGRA; mask (VISAR_8U, may be NULL); params NULL = defaults;
+   descriptors NULL = keypoints only */
+int visar_orb_detect_and_compute(const visar_image *src, const visar_image *mask, const visar_orb_params *params,
+                                 visar_keypoint **kps, size_t *count, uint8_t **descriptors);
+/* BFMatcher: descriptors are images with one row per descriptor, VISAR_8U (any norm) or VISAR_32F (L1, L2,
+   L2SQR). norm: NORM_L1 2, NORM_L2 4, NORM_L2SQR 5, NORM_HAMMING 6, NORM_HAMMING2 7 */
+int visar_bf_match(const visar_image *query, const visar_image *train, int norm, int cross_check, visar_dmatch **out,
+                   size_t *count);
+void visar_matches_free(visar_dmatch *m, size_t count);
+/* out: room for query rows * k matches (row q's at q * k); counts: query rows (matches found per query) */
+int visar_bf_knn_match(const visar_image *query, const visar_image *train, int k, int norm, visar_dmatch *out,
+                       uint32_t *counts);
+/* Lowe's ratio test over visar_bf_knn_match output (k >= 2); out: room for nq matches */
+int visar_ratio_test(const visar_dmatch *knn, const uint32_t *counts, size_t nq, int k, float ratio, visar_dmatch *out,
+                     size_t *count);
+/* drawing: out is VISAR_8U BGR (img's size; for matches max(h1, h2) x (w1 + w2)); color NULL = one colour per
+   keypoint/match; flags: 1 DRAW_OVER_OUTIMG, 2 NOT_DRAW_SINGLE_POINTS, 4 DRAW_RICH_KEYPOINTS */
+int visar_draw_keypoints(const visar_image *img, const visar_keypoint *kps, size_t count, const visar_image *out,
+                         const double color[4], int flags);
+int visar_draw_matches(const visar_image *img1, const visar_keypoint *kp1, size_t n1, const visar_image *img2,
+                       const visar_keypoint *kp2, size_t n2, const visar_dmatch *matches, size_t nm, const visar_image *out,
+                       const double match_color[4], const double single_color[4], int flags);
 /* video: pyramidal Lucas-Kanade on VISAR_8U images; points are n (x, y) float pairs; err may be NULL.
    criteria_type: 1 COUNT | 2 EPS; flags: 4 USE_INITIAL_FLOW | 8 LK_GET_MIN_EIGENVALS */
 int visar_calc_optical_flow_pyr_lk(const visar_image *prev, const visar_image *next, const float *prev_pts, float *next_pts,
