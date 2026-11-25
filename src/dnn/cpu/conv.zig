@@ -75,10 +75,12 @@ pub const Epilogue = struct {
     /// Lanes of the last output block that hold real channels.
     tail_mask: @Vector(B, bool),
     coutb: usize,
+    /// The last block has padding lanes (cout % B != 0).
+    tail: bool,
 
     fn init(c: ir.Conv, cout: usize) Epilogue {
         const rem = cout % B;
-        return .{ .act = c.act, .slope = vec.linearSlope(c.act), .residual_after_act = c.residual_after_act, .tail_mask = vec.laneMask(if (rem == 0) B else rem), .coutb = (cout + B - 1) / B };
+        return .{ .act = c.act, .slope = vec.linearSlope(c.act), .residual_after_act = c.residual_after_act, .tail_mask = vec.laneMask(if (rem == 0) B else rem), .coutb = (cout + B - 1) / B, .tail = rem != 0 };
     }
 
     inline fn apply(e: *const Epilogue, comptime ak: ActKind, acc: V, res: ?[*]const f32, cob: usize) V {
@@ -90,7 +92,7 @@ pub const Epilogue = struct {
         if (res) |r| {
             if (e.residual_after_act) v += vec.load(r);
         }
-        if (cob + 1 == e.coutb) v = @select(f32, e.tail_mask, v, vec.splat(0));
+        if (e.tail and cob + 1 == e.coutb) v = @select(f32, e.tail_mask, v, vec.splat(0));
         return v;
     }
 
@@ -98,12 +100,19 @@ pub const Epilogue = struct {
     /// epilogue (a `deferred` activation in a second pass over the stored
     /// sums): `o` and `res` point at block `cob`, pixel 0 of the tile;
     /// `os`, `rs` are the distances between their blocks.
-    inline fn storeTile(e: *const Epilogue, comptime ak: ActKind, comptime R: usize, comptime NB: usize, acc: *const [R][NB]V, o: [*]f32, os: usize, res: ?[*]const f32, rs: usize, cob: usize) void {
+    inline fn storeTile(ep: *const Epilogue, comptime ak: ActKind, comptime R: usize, comptime NB: usize, acc: *const [R][NB]V, o: [*]f32, os: usize, res: ?[*]const f32, rs: usize, cob: usize) void {
+        // A local copy (the stores could alias `ep`: every one would reload
+        // its fields), and the residual tested once per tile.
+        const ev = ep.*;
+        const e = &ev;
         if (ak != .deferred) {
-            inline for (0..NB) |nb| {
-                inline for (0..R) |r| {
-                    const rp: ?[*]const f32 = if (res) |rr| rr + nb * rs + r * B else null;
-                    vec.store(o + nb * os + r * B, e.apply(ak, acc[r][nb], rp, cob + nb));
+            if (res) |rr| {
+                inline for (0..NB) |nb| {
+                    inline for (0..R) |r| vec.store(o + nb * os + r * B, e.apply(ak, acc[r][nb], rr + nb * rs + r * B, cob + nb));
+                }
+            } else {
+                inline for (0..NB) |nb| {
+                    inline for (0..R) |r| vec.store(o + nb * os + r * B, e.apply(ak, acc[r][nb], null, cob + nb));
                 }
             }
             return;
@@ -225,7 +234,9 @@ pub const Pointwise = struct {
         }
     }
 
-    fn tile(k: *const Pointwise, comptime R: usize, comptime NB: usize, comptime ak: ActKind, x: [*]const f32, xs: usize, out: [*]f32, os: usize, res: ?[*]const f32, rs: usize, cob: usize, px: usize) void {
+    fn tile(kp: *const Pointwise, comptime R: usize, comptime NB: usize, comptime ak: ActKind, x: [*]const f32, xs: usize, out: [*]f32, os: usize, res: ?[*]const f32, rs: usize, cob: usize, px: usize) void {
+        const kv = kp.*; // (as in Depthwise.row)
+        const k = &kv;
         @setEvalBranchQuota(100000);
         const wcs = k.cin_pad * B;
         const w = k.w.ptr + cob * wcs;
@@ -317,10 +328,18 @@ pub const Depthwise = struct {
     }
 
     fn row(k: *const Depthwise, comptime ak: ActKind, src: Rows, dst: Rows, res_rows: ?Rows, cb: usize, oy: usize) void {
+        // The residual decided once per row, not at every pixel.
+        if (res_rows) |r| k.rowRes(ak, src, dst, r.at(cb, oy), cb, oy) else k.rowRes(ak, src, dst, null, cb, oy);
+    }
+
+    inline fn rowRes(kp: *const Depthwise, comptime ak: ActKind, src: Rows, dst: Rows, res: ?[*]const f32, cb: usize, oy: usize) void {
+        // A local copy: the stores below could alias the kernel, so LLVM
+        // would reload its fields (epilogue flags, slope) at every store.
+        const kv = kp.*;
+        const k = &kv;
         @setEvalBranchQuota(10000);
         const g = k.g;
         const out = dst.at(cb, oy);
-        const res: ?[*]const f32 = if (res_rows) |r| r.at(cb, oy) else null;
         const kk = g.kh * g.kw;
         const w = k.w.ptr + cb * kk * B;
         const bias = vec.load(k.bias.ptr + cb * B);
