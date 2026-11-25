@@ -60,6 +60,8 @@ $ visar pipeline scan.jpg mask.png -- gray , blur --sigma 1.5 , threshold --otsu
 $ cat photo.png | visar gray - - --format png | visar inspect -
 $ visar demo track --out track.gif          # the demo above, on your machine
 $ visar bench --filter blur,resize          # time the kernels on this CPU
+$ visar faces group.jpg --out boxed.png     # YuNet faces: score, box and landmarks per line (or --json)
+$ visar faces clip.y4m --json               # tracked through a video (ffmpeg -i clip.mp4 clip.y4m)
 ```
 
 ### Live tracking and face tracking
@@ -75,6 +77,13 @@ Faces are detected with YuNet (`visar.dnn.FaceDetector`) and followed by MOSSE f
 
 ```sh
 visar track --faces face_detection_yunet_2023mar.onnx --source image:selfie.jpg --face-width 640 --headless --frames 600 --json
+```
+
+`visar faces` runs the same detector and tracker on files: an image (one detection; `--out` draws the faces), or a video as a YUV4MPEG2 file or a list of frame images (the tracker with the same `--detect-every` / `--change-level` options; `--out` writes an annotated GIF). The model comes from `--model FILE` or `VISAR_MODELS`:
+
+```sh
+VISAR_MODELS=. visar faces selfie.jpg --json --out boxed.png
+ffmpeg -i clip.mp4 -pix_fmt yuv420p clip.y4m && VISAR_MODELS=. visar faces clip.y4m --out tracked.gif
 ```
 
 ### 4K face detection: measured, and what 120 fps on an M3 needs

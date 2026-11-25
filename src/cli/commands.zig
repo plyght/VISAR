@@ -12,6 +12,7 @@ const cmd_image = @import("cmd_image.zig");
 const cmd_bench = @import("cmd_bench.zig");
 const cmd_demo = @import("cmd_demo.zig");
 const cmd_track = @import("cmd_track.zig");
+const cmd_faces = @import("cmd_faces.zig");
 
 pub const tagline = "computer vision in pure Zig";
 pub const about = "Inspect, convert and process images with VISAR, a dependency-free computer-vision library.";
@@ -281,6 +282,22 @@ pub const list = [_]Command{
         .opts = &cmd_demo.opts,
         .writes = true,
         .run = cmd_demo.run,
+    },
+    .{
+        .name = "faces",
+        .group = .look,
+        .summary = "Find faces (YuNet): boxes, scores and landmarks, in an image or a video",
+        .usage = &.{ "faces <image> [--model FILE] [--face-width N] [--score S] [--out FILE] [--json]", "faces <video.y4m | frame...> [--detect-every N] [--change-level N] [--out FILE.gif]" },
+        .about = "Detects faces with the YuNet model of the OpenCV Model Zoo (face_detection_yunet_2023mar.onnx, from --model or the VISAR_MODELS directory) and prints one line per face: its score, box (x,y,w,h) and five landmarks (eyes, nose tip, mouth corners) in input pixels, or JSON with --json. An image is detected once, at its own size up to --face-width (default 1280). A video, a YUV4MPEG2 file (ffmpeg -i clip.mp4 -pix_fmt yuv420p clip.y4m) or several images as its frames, is tracked as 'visar track --faces' does it: the detector every --detect-every frames, postponed while nothing changes and mostly only around the faces (--change-level), MOSSE filters in between; every line then starts with the frame number and faces keep their number from frame to frame. --out writes the input with the faces drawn on it, an animated GIF for a video.",
+        .examples = &.{
+            .{ .cmd = "visar faces group.jpg", .note = "one line per face" },
+            .{ .cmd = "visar faces group.jpg --json --out boxed.png", .note = "JSON, and the faces drawn" },
+            .{ .cmd = "visar faces clip.y4m --out tracked.gif", .note = "track through a video" },
+            .{ .cmd = "visar faces f001.png f002.png f003.png --change-level 0", .note = "frames as images, detector on schedule" },
+        },
+        .opts = &cmd_faces.opts,
+        .writes = true,
+        .run = cmd_faces.run,
     },
     .{
         .name = "track",

@@ -6,12 +6,14 @@
 //!   frame.zig         FrameRing (lock-free frame passing between threads)
 //!                     and the fused gray + downscale used for detection
 //!   objc.zig          the Objective-C runtime loader (macOS)
+//!   y4m.zig           YUV4MPEG2 video files (uncompressed, from ffmpeg)
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const camera = @import("camera.zig");
 pub const frame = @import("frame.zig");
+pub const y4m = @import("y4m.zig");
 pub const Camera = camera.Camera;
 pub const FrameRing = frame.FrameRing;
 
@@ -22,6 +24,7 @@ test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(camera);
     std.testing.refAllDecls(frame);
+    std.testing.refAllDecls(y4m);
     // The ABI helpers are plain Zig and are tested on every host.
     _ = @import("objc.zig");
     if (camera.backend == .v4l2) _ = @import("camera_linux.zig");
