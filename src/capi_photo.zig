@@ -74,3 +74,26 @@ fn inpaintT(comptime T: type, src: *const capi.CImage, m: visar.core.Image(u8), 
     const d = typed(T, dst) catch |e| return fail(e);
     return run(photo.inpaint(T, gpa, s, m, d, radius, meth));
 }
+
+/// edgePreservingFilter: BGR VISAR_8U; flags 1 RECURS_FILTER, 2 NORMCONV_FILTER.
+export fn visar_edge_preserving_filter(src: *const capi.CImage, dst: *const capi.CImage, flags: c_int, sigma_s: f32, sigma_r: f32) c_int {
+    const s = typed(u8, src) catch |e| return fail(e);
+    const d = typed(u8, dst) catch |e| return fail(e);
+    const f = std.enums.fromInt(photo.EdgePreservingFlags, flags) orelse return fail(error.InvalidArgument);
+    return run(photo.edgePreservingFilter(gpa, s, d, f, sigma_s, sigma_r));
+}
+
+/// stylization: BGR VISAR_8U.
+export fn visar_stylization(src: *const capi.CImage, dst: *const capi.CImage, sigma_s: f32, sigma_r: f32) c_int {
+    const s = typed(u8, src) catch |e| return fail(e);
+    const d = typed(u8, dst) catch |e| return fail(e);
+    return run(photo.stylization(exec(), gpa, s, d, sigma_s, sigma_r));
+}
+
+/// pencilSketch: BGR VISAR_8U in; gray (1 channel) and color (BGR) out.
+export fn visar_pencil_sketch(src: *const capi.CImage, gray: *const capi.CImage, color: *const capi.CImage, sigma_s: f32, sigma_r: f32, shade_factor: f32) c_int {
+    const s = typed(u8, src) catch |e| return fail(e);
+    const g = typed(u8, gray) catch |e| return fail(e);
+    const c = typed(u8, color) catch |e| return fail(e);
+    return run(photo.pencilSketch(gpa, s, g, c, sigma_s, sigma_r, shade_factor));
+}

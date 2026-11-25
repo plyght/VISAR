@@ -45,3 +45,29 @@ def inpaint(src, mask, radius, flags):
     _check(lib.visar_inpaint(ctypes.byref(desc(src)), ctypes.byref(desc(mask)), ctypes.byref(desc(out)), float(radius),
                              int(flags)))
     return out
+
+
+lib.visar_edge_preserving_filter.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_float, ctypes.c_float]
+lib.visar_stylization.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_float]
+lib.visar_pencil_sketch.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_float,
+                                    ctypes.c_float]
+
+
+def edge_preserving_filter(src, flags=1, sigma_s=60, sigma_r=0.4):
+    """cv2.edgePreservingFilter(src, flags=flags, sigma_s=sigma_s, sigma_r=sigma_r)."""
+    return _run(lib.visar_edge_preserving_filter, src, int(flags), float(sigma_s), float(sigma_r))
+
+
+def stylization(src, sigma_s=60, sigma_r=0.45):
+    """cv2.stylization(src, sigma_s=sigma_s, sigma_r=sigma_r)."""
+    return _run(lib.visar_stylization, src, float(sigma_s), float(sigma_r))
+
+
+def pencil_sketch(src, sigma_s=60, sigma_r=0.07, shade_factor=0.02):
+    """cv2.pencilSketch(src, ...) -> (gray, color)."""
+    src = np.ascontiguousarray(src)
+    gray = np.empty(src.shape[:2], np.uint8)
+    color = np.empty_like(src)
+    _check(lib.visar_pencil_sketch(ctypes.byref(desc(src)), ctypes.byref(desc(gray)), ctypes.byref(desc(color)),
+                                   float(sigma_s), float(sigma_r), float(shade_factor)))
+    return gray, color
