@@ -99,6 +99,56 @@ fn distF32(norm: Norm, a: []const f32, b: []const f32) f32 {
     return if (norm == .l2) @sqrt(s) else s;
 }
 
+const hw_fma = switch (builtin.cpu.arch) {
+    .aarch64 => true,
+    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .fma),
+    else => false,
+};
+
+/// distF32 of one query against train rows [j0, j0 + out.len), eight rows
+/// at a time so each query chunk is loaded once per eight rows.
+fn f32Block(norm: Norm, q: []const f32, train: Image(f32), j0: usize, out: []f32) void {
+    switch (norm) {
+        .l1 => f32BlockT(true, norm, q, train, j0, out),
+        else => f32BlockT(false, norm, q, train, j0, out),
+    }
+}
+
+fn f32BlockT(comptime l1: bool, norm: Norm, q: []const f32, train: Image(f32), j0: usize, out: []f32) void {
+    const V = 8;
+    const R = 8;
+    const VF = @Vector(V, f32);
+    const n = q.len;
+    var j: usize = 0;
+    while (j + R <= out.len) : (j += R) {
+        var r: [R][*]const f32 = undefined;
+        inline for (0..R) |k| r[k] = train.row(j0 + j + k).ptr;
+        var acc: [R]VF = @splat(@as(VF, @splat(0)));
+        var i: usize = 0;
+        while (i + V <= n) : (i += V) {
+            const qv: VF = q[i..][0..V].*;
+            inline for (0..R) |k| {
+                const dv = qv - @as(VF, r[k][i..][0..V].*);
+                if (l1) {
+                    acc[k] += @abs(dv);
+                } else if (hw_fma) {
+                    acc[k] = @mulAdd(VF, dv, dv, acc[k]);
+                } else acc[k] += dv * dv;
+            }
+        }
+        inline for (0..R) |k| {
+            var s = @reduce(.Add, acc[k]);
+            var ii = i;
+            while (ii < n) : (ii += 1) {
+                const dd = q[ii] - r[k][ii];
+                s += if (l1) @abs(dd) else dd * dd;
+            }
+            out[j + k] = if (norm == .l2) @sqrt(s) else s;
+        }
+    }
+    while (j < out.len) : (j += 1) out[j] = distF32(norm, q, train.row(j0 + j));
+}
+
 fn check(comptime T: type, query: Image(T), train: Image(T), norm: Norm) Error!void {
     if (query.channels != 1 or train.channels != 1) return error.UnsupportedChannels;
     if (query.width != train.width) return error.SizeMismatch;
@@ -183,21 +233,27 @@ fn topK(comptime T: type, exec: Exec, query: Image(T), train: Image(T), norm: No
     exec.parallelFor(query.height, 16, Ctx(T){ .query = query, .train = train, .norm = norm, .k = k, .dist = dist, .idx = idx }, struct {
         fn run(c: Ctx(T), q0: usize, q1: usize) void {
             const n = c.train.height;
+            // A block of train rows small enough to stay in cache while
+            // every query of this range is compared with it.
+            const row_bytes = @max(1, c.train.width * @sizeOf(T));
             const B = 256;
+            const blk = std.math.clamp(32768 / row_bytes, 16, B);
             var buf: [B]f32 = undefined;
             const ham32 = T == u8 and c.norm == .hamming and c.query.width == 32;
-            for (q0..q1) |q| {
-                const qd = c.query.row(q);
-                const dl = c.dist[q * c.k ..][0..c.k];
-                const il = c.idx[q * c.k ..][0..c.k];
-                var j0: usize = 0;
-                while (j0 < n) : (j0 += B) {
-                    const m = @min(B, n - j0);
-                    const d = buf[0..m];
+            var j0: usize = 0;
+            while (j0 < n) : (j0 += blk) {
+                const m = @min(blk, n - j0);
+                const d = buf[0..m];
+                for (q0..q1) |q| {
+                    const qd = c.query.row(q);
+                    const dl = c.dist[q * c.k ..][0..c.k];
+                    const il = c.idx[q * c.k ..][0..c.k];
                     if (ham32) {
                         hamming32Block(qd[0..32], c.train, j0, d);
+                    } else if (T == f32) {
+                        f32Block(c.norm, qd, c.train, j0, d);
                     } else for (d, 0..) |*o, j| {
-                        o.* = if (T == u8) distU8(c.norm, qd, c.train.row(j0 + j)) else distF32(c.norm, qd, c.train.row(j0 + j));
+                        o.* = distU8(c.norm, qd, c.train.row(j0 + j));
                     }
                     if (c.k == 1) {
                         const lo = minOf(d);

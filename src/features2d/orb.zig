@@ -198,6 +198,35 @@ const Axis = struct {
     w1: []u16,
     lo: usize,
     hi: usize,
+    /// Blocks of 8 outputs from `lo` for the byte-shuffle path: the source
+    /// window start (or `no_block` when the 8 pairs do not fit 16 bytes)
+    /// and the 16 byte indices of the (s[i], s[i + 1]) pairs.
+    base: []u32 = &.{},
+    idx: []@Vector(16, u8) = &.{},
+
+    const no_block = std.math.maxInt(u32);
+
+    fn initBlocks(a: *Axis, gpa: Allocator, src: usize) Allocator.Error!void {
+        if (!has_shuffle) return;
+        const nb = (a.hi - a.lo) / 8;
+        a.base = try gpa.alloc(u32, nb);
+        a.idx = try gpa.alloc(@Vector(16, u8), nb);
+        for (0..nb) |b| {
+            const d = a.lo + 8 * b;
+            const b0 = a.ofs[d];
+            if (a.ofs[d + 7] + 1 - b0 > 15 or b0 + 16 > src) {
+                a.base[b] = no_block;
+                continue;
+            }
+            a.base[b] = b0;
+            var ix: [16]u8 = undefined;
+            for (0..8) |k| {
+                ix[2 * k] = @intCast(a.ofs[d + k] - b0);
+                ix[2 * k + 1] = @intCast(a.ofs[d + k] - b0 + 1);
+            }
+            a.idx[b] = ix;
+        }
+    }
 
     fn init(gpa: Allocator, src: usize, dst: usize) Allocator.Error!Axis {
         const ofs = try gpa.alloc(u32, dst);
@@ -237,6 +266,8 @@ const Axis = struct {
         gpa.free(a.ofs);
         gpa.free(a.w0);
         gpa.free(a.w1);
+        gpa.free(a.base);
+        gpa.free(a.idx);
     }
 };
 
@@ -246,12 +277,67 @@ fn roundTiesEven(x: f64) f64 {
     return r;
 }
 
+/// A runtime 16-byte table lookup: pshufb (AVX encoding) on x86, tbl on
+/// AArch64 (both need the LLVM backend).
+const has_shuffle = builtin.zig_backend == .stage2_llvm and switch (builtin.cpu.arch) {
+    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .avx),
+    .aarch64 => simd.llvm_intrinsics,
+    else => false,
+};
+extern fn @"llvm.aarch64.neon.tbl1.v16i8"(@Vector(16, u8), @Vector(16, u8)) @Vector(16, u8);
+
+inline fn shuffle16(t: @Vector(16, u8), i: @Vector(16, u8)) @Vector(16, u8) {
+    if (builtin.cpu.arch == .aarch64) return @"llvm.aarch64.neon.tbl1.v16i8"(t, i);
+    return asm ("vpshufb %[i], %[t], %[r]"
+        : [r] "=x" (-> @Vector(16, u8)),
+        : [t] "x" (t),
+          [i] "x" (i),
+    );
+}
+
 /// Horizontal pass of one source row into 8.8 fixed point.
 fn hline(ax: *const Axis, s: []const u8, out: []u16) void {
     const last: u16 = @as(u16, s[s.len - 1]) << 8;
     const first: u16 = @as(u16, s[0]) << 8;
     for (out[0..ax.lo]) |*o| o.* = first;
-    for (ax.lo..ax.hi) |d| {
+    if (has_shuffle) {
+        // Eight outputs per 16-byte load and byte shuffle.
+        const VU8 = @Vector(8, u16);
+        var d = ax.lo;
+        for (ax.base, ax.idx) |b0, ix| {
+            if (b0 != Axis.no_block) {
+                const t: @Vector(16, u8) = s[b0..][0..16].*;
+                const pv: VU8 = @bitCast(shuffle16(t, ix));
+                const w0: VU8 = ax.w0[d..][0..8].*;
+                const w1: VU8 = ax.w1[d..][0..8].*;
+                out[d..][0..8].* = w0 * (pv & @as(VU8, @splat(0xff))) + w1 * (pv >> @splat(8));
+            } else for (d..d + 8) |e| {
+                const i = ax.ofs[e];
+                out[e] = ax.w0[e] * @as(u16, s[i]) + ax.w1[e] * @as(u16, s[i + 1]);
+            }
+            d += 8;
+        }
+        while (d < ax.hi) : (d += 1) {
+            const i = ax.ofs[d];
+            out[d] = ax.w0[d] * @as(u16, s[i]) + ax.w1[d] * @as(u16, s[i + 1]);
+        }
+        for (out[ax.hi..]) |*o| o.* = last;
+        return;
+    }
+    // Sixteen outputs at a time: gather the source pairs as u16 (s[i] in
+    // the low byte), then weight them with vector arithmetic.
+    const V = 16;
+    const VU16 = @Vector(V, u16);
+    var d = ax.lo;
+    while (d + V <= ax.hi) : (d += V) {
+        var pairs: [V]u16 = undefined;
+        inline for (0..V) |k| pairs[k] = std.mem.readInt(u16, s[ax.ofs[d + k]..][0..2], .little);
+        const pv: VU16 = pairs;
+        const w0: VU16 = ax.w0[d..][0..V].*;
+        const w1: VU16 = ax.w1[d..][0..V].*;
+        out[d..][0..V].* = w0 * (pv & @as(VU16, @splat(0xff))) + w1 * (pv >> @splat(8));
+    }
+    while (d < ax.hi) : (d += 1) {
         const i = ax.ofs[d];
         out[d] = ax.w0[d] * @as(u16, s[i]) + ax.w1[d] * @as(u16, s[i + 1]);
     }
@@ -267,6 +353,7 @@ pub fn resizeLinearExact(gpa: Allocator, src: Image(u8), dst: Image(u8)) Allocat
     if (sw == 2 * dw and sh == 2 * dh) return halve(src, dst);
     var ax = try Axis.init(gpa, sw, dw);
     defer ax.deinit(gpa);
+    try ax.initBlocks(gpa, sw);
     var ay = try Axis.init(gpa, sh, dh);
     defer ay.deinit(gpa);
     const buf = try gpa.alloc(u16, 2 * dw);
@@ -358,15 +445,18 @@ const Level = struct {
 
 fn fillBorder(l: Level, border: usize) void {
     const b = border;
-    // Columns of the interior rows, then whole rows.
+    // Source columns of the left and right padding (at most 2 * 4096 + 2).
+    var lmap: [4097]u32 = undefined;
+    var rmap: [4097]u32 = undefined;
+    for (0..b) |i| {
+        lmap[i] = @intCast(imgproc.border.map(-@as(isize, @intCast(b - i)), l.w, .reflect101).?);
+        rmap[i] = @intCast(imgproc.border.map(@intCast(l.w + i), l.w, .reflect101).?);
+    }
     for (0..l.h) |y| {
         const row = l.buf[(y + b) * l.stride ..][0..l.stride];
-        for (0..b) |i| {
-            const xl = imgproc.border.map(-@as(isize, @intCast(b - i)), l.w, .reflect101).?;
-            row[i] = row[b + xl];
-            const xr = imgproc.border.map(@intCast(l.w + i), l.w, .reflect101).?;
-            row[b + l.w + i] = row[b + xr];
-        }
+        const in = row[b..][0..l.w];
+        for (row[0..b], lmap[0..b]) |*o, x| o.* = in[x];
+        for (row[b + l.w ..][0..b], rmap[0..b]) |*o, x| o.* = in[x];
     }
     for (0..b) |i| {
         const yt = imgproc.border.map(-@as(isize, @intCast(b - i)), l.h, .reflect101).?;
@@ -412,7 +502,8 @@ inline fn fmaV(comptime n: comptime_int, a: @Vector(n, f32), b: @Vector(n, f32),
 }
 
 /// GaussianBlur(level, 7x7, sigma 2, BORDER_REFLECT_101) on the interior of
-/// `src` (reading its padding), written to the interior of `dst`. On a
+/// `src` (reading its padding), written to the interior of `dst` (which may
+/// be `src`: row y is written after rows up to y + 3 were read). On a
 /// submatrix OpenCV skips its fixed-point Gaussian and runs the separable
 /// f32 filter: the row pass accumulates k[i] * p[x + i] with fused
 /// multiply-adds from i = 0, the column pass starts from k[3] * r[y] and
@@ -736,7 +827,7 @@ fn levelKeypoints(st: Stage, li: usize) Error!void {
 pub fn detectAndCompute(exec: Exec, gpa: Allocator, src: Image(u8), mask: ?Image(u8), opt: Options, descriptors: bool) Error!Features {
     if (!(opt.scale_factor > 1) or opt.nlevels == 0 or opt.patch_size < 2) return error.InvalidArgument;
     if (opt.wta_k < 2 or opt.wta_k > 4) return error.InvalidArgument;
-    if (opt.nlevels > 64 or opt.first_level > 64 or opt.patch_size > 255 or opt.edge_threshold > 4096) return error.InvalidArgument;
+    if (opt.nlevels > 64 or opt.first_level > 64 or opt.patch_size > 255 or opt.edge_threshold > 4000) return error.InvalidArgument;
     if (mask) |m| {
         if (m.channels != 1) return error.UnsupportedChannels;
         if (m.width != src.width or m.height != src.height) return error.SizeMismatch;
@@ -760,15 +851,13 @@ pub fn detectAndCompute(exec: Exec, gpa: Allocator, src: Image(u8), mask: ?Image
     const border: usize = @max(opt.edge_threshold, @max(desc_patch, 4)) + 1;
     const nl: usize = opt.nlevels;
 
-    // Level geometry and storage.
+    // Level geometry, and one allocation for every level (and mask level).
     const levels = try gpa.alloc(Level, nl);
     defer gpa.free(levels);
     @memset(levels, .{});
-    defer for (levels) |l| gpa.free(l.buf);
     const mlevels: ?[]Level = if (mask != null) try gpa.alloc(Level, nl) else null;
     defer if (mlevels) |m| gpa.free(m);
-    if (mlevels) |m| @memset(m, .{});
-    defer if (mlevels) |ms| for (ms) |l| gpa.free(l.buf);
+    var total_bytes: usize = 0;
     for (levels, 0..) |*l, i| {
         const sc = levelScale(opt, i);
         const inv: f32 = 1.0 / sc;
@@ -779,12 +868,24 @@ pub fn detectAndCompute(exec: Exec, gpa: Allocator, src: Image(u8), mask: ?Image
         l.w = @intCast(w);
         l.h = @intCast(h);
         l.stride = l.w + 2 * border;
-        l.buf = try gpa.alloc(u8, l.stride * (l.h + 2 * border));
-        if (mlevels) |ms| {
-            ms[i] = l.*;
-            ms[i].buf = &.{};
-            ms[i].buf = try gpa.alloc(u8, l.buf.len);
+        total_bytes += l.stride * (l.h + 2 * border);
+    }
+    const slab = try gpa.alloc(u8, if (mask != null) 2 * total_bytes else total_bytes);
+    defer gpa.free(slab);
+    {
+        var off: usize = 0;
+        for (levels) |*l| {
+            if (l.w == 0) break;
+            const n = l.stride * (l.h + 2 * border);
+            l.buf = slab[off..][0..n];
+            off += n;
         }
+        if (mlevels) |ms| for (ms, levels) |*m, l| {
+            m.* = l;
+            if (l.w == 0) continue;
+            m.buf = slab[off..][0..l.buf.len];
+            off += l.buf.len;
+        };
     }
 
     // The pyramid: each level resized from the previous one (levels up to
@@ -870,17 +971,9 @@ pub fn detectAndCompute(exec: Exec, gpa: Allocator, src: Image(u8), mask: ?Image
     }
     if (!descriptors or total == 0) return .{ .keypoints = kps, .descriptors = try gpa.alloc(u8, 0) };
 
-    // Blur every level (into a copy that keeps the unblurred padding).
-    const blurred = try gpa.alloc(Level, nl);
-    defer gpa.free(blurred);
-    @memset(blurred, .{});
-    defer for (blurred) |l| gpa.free(l.buf);
-    for (levels, blurred) |l, *b| {
-        if (l.w == 0) continue;
-        b.* = l;
-        b.buf = &.{};
-        b.buf = try gpa.dupe(u8, l.buf);
-    }
+    // Blur every level in place (as OpenCV does: the padding keeps the
+    // unblurred pixels). The keypoint stages above needed the raw levels.
+    const blurred = levels;
     const BlurCtx = struct { src: []const Level, dst: []const Level, border: usize, gpa: Allocator, failed: *std.atomic.Value(bool) };
     exec.parallelFor(nl, 1, BlurCtx{ .src = levels, .dst = blurred, .border = border, .gpa = gpa, .failed = &failed }, struct {
         fn run(c: BlurCtx, a: usize, b: usize) void {
