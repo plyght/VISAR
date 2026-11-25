@@ -52,7 +52,7 @@ pub const opts = [_]args.Opt{
     .{ .long = "headless", .help = "No window: print stats every second and a summary" },
     .{ .long = "frames", .short = 'n', .value = "N", .help = "Stop after N processed frames" },
     .{ .long = "detect-width", .value = "N", .help = "Width the detector works at (default 640; 0 = full size)" },
-    .{ .long = "record", .value = "FILE", .help = "Also write the annotated frames: .gif, or .avi / .y4m (full size); same as -o" },
+    .{ .long = "record", .value = "FILE", .help = "Also write the annotated frames (.gif; .avi, .y4m full size); or -o" },
     .{ .long = "lock", .value = "X,Y,W,H", .help = "Lock onto the object in this box (frame pixels); repeatable" },
     .{ .long = "mode", .value = "MODE", .help = "both (default), motion, locks or faces (default with --faces); Tab cycles" },
     .{ .long = "faces", .value = "MODEL", .help = "Track faces with this YuNet model (face_detection_yunet_2023mar.onnx)" },
