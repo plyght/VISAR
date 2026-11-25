@@ -40,6 +40,7 @@ zig build -Doptimize=ReleaseFast          # library, C ABI (zig-out/lib) and CLI
 zig build test                            # unit tests
 zig build difftest -Doptimize=ReleaseSafe # compare against OpenCV (needs python3, numpy, opencv-python-headless)
 zig build bench -Doptimize=ReleaseFast -- --threads 1   # speed vs OpenCV
+zig build face4k -Doptimize=ReleaseFast         # the 4K face pipeline vs OpenCV, stage by stage (needs VISAR_MODELS)
 zig build demo-track -Doptimize=ReleaseFast -- --out track.gif
 ```
 
@@ -75,6 +76,23 @@ Faces are detected with YuNet (`visar.dnn.FaceDetector`) and followed by MOSSE f
 ```sh
 visar track --faces face_detection_yunet_2023mar.onnx --source image:selfie.jpg --face-width 640 --headless --frames 600 --json
 ```
+
+### 4K face detection: measured, and what 120 fps on an M3 needs
+
+`zig build face4k -Doptimize=ReleaseFast` (needs `VISAR_MODELS` with the YuNet model and `largest_selfie.jpg`) times the whole pipeline on a camera-native 3840x2160 BGRA frame (the zoo selfie enlarged to 4K): colour + downscale straight into the network's planar f32 input in one pass (`FaceDetector.prepare`, bit-identical to `cvtColor` + `resize(INTER_AREA)` + `blobFromImage`), YuNet on the CPU, boxes mapped back to 4K, against `cv2.cvtColor` + `cv2.resize` + `cv2.FaceDetectorYN` at the same thread count. The detector runs at 640x360 (4K / 6): it finds faces from about 190 px wide at 4K (5% of the frame width; 960x540 finds them from about 124 px at roughly twice the network cost). Both libraries return the same boxes. Median ms (GitHub `macos-latest`, an M1-class VM; x86 is a 4-core Sapphire Rapids VM with AVX-512):
+
+| 640x360, ms | macOS 1T | macOS 3T | macOS 5T¹ | x86 1T | x86 4T |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| colour + downscale into the input | 1.99 | 1.32 | 0.45 | 2.05 | 0.58 |
+| YuNet (CPU; 206 M MACs) | 7.59 | 2.64 | 1.53 | 4.91 | 1.95 |
+| decode + NMS + map to 4K | 0.01 | 0.01 | 0.01 | 0.01 | 0.01 |
+| **VISAR end to end** | **9.97** | **3.52** | **2.03** | **7.11** | **2.84** |
+| OpenCV end to end | 26.19 | 12.42 | 8.05 | 28.41 | 9.98 |
+| VISAR change-driven steady state² | 4.45 | 3.06 | 1.09 | 3.48 | 1.39 |
+
+¹ A second `macos-latest` run that got a 5-core VM (1T end to end there: 9.75 ms). ² `visar track`'s face tracker at level 2, a detection scheduled every 4th frame, the selfie moving slowly over a 4K canvas (`bench/face4k_steady.zig`): effective ms per frame including the gray tracking image (1.5-3 ms of it at 1T: one more pass over the 4K frame) and MOSSE; whole-frame detections run on 38 of 600 frames, crop-only ones on 84, 112 are skipped as unchanged. The runners are noisy VMs: medians move by 20-50% between runs (the bench prints the minimum too).
+
+So on the M1-class runner the end-to-end detection of every 4K frame already fits 8.3 ms with 3 threads (284 fps) and the change-driven tracker fits it on one thread. *Extrapolation, not measured:* an M3 performance core runs scalar and NEON code roughly 1.3-1.4x faster than an M1's and a base M3 has 4 of them, so the one-thread end-to-end time would be about 7 ms (just inside 8.3 ms with no headroom) and about 2 ms on the performance cores; 960x540 (about 15 ms on one M1 thread) needs at least 2-3 cores. What blocks a comfortable 4K120 on one M3 core is the network (75% of the time, at about 55% of the core's FMA peak; the first two row-streamed chains of 3x3/1x1 convs at full resolution take 60% of it); the per-frame gray tracking image is the next cost once detections are change-driven. The Metal backend ran YuNet in 2-4 ms on the runners' paravirtual GPU, which says nothing about a real M3 GPU.
 
 Commands: `info`, `inspect`, `convert`, `resize`, `rotate`, `flip`, `gray`, `blur`, `threshold`, `edges`, `equalize`, `morph`, `pipeline`, `bench`, `demo`, `track`. Every command takes `--json`, `--threads`, `-q` and `-v`. Errors come with a hint, and mistyped commands, options and file names get a "did you mean". An existing output file is never overwritten without `-f`. Run `visar help <command>` for examples.
 
