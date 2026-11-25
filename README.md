@@ -28,6 +28,7 @@ See [PRD.md](PRD.md) for the full scope and roadmap. VISAR is early: the roadmap
 | imgproc | `cvtColor` (gray, BGR/RGB/A reorders, HSV, YCrCb), resize (nearest, linear, area, cubic), Gaussian/box/Sobel/Scharr/separable filters, threshold (incl. Otsu, triangle), `inRange`, morphology (all `morphologyEx` ops and element shapes), flip/rotate/transpose, `warpAffine`/`warpPerspective`, `copyMakeBorder`, `equalizeHist`, `integral`, `connectedComponentsWithStats`, `findContours` (all modes and methods, exact), shape analysis (moments, Hu, area, length, hulls, defects, minAreaRect, minEnclosingCircle, fitEllipse, approxPolyDP, pointPolygonTest, matchShapes), drawing (incl. OpenCV-exact `drawContours`, `fillPoly`, `polylines`) |
 | Codecs | PNG (all colour types and depths, Adam7; custom inflate), JPEG (in progress), QOI, PNM/PAM, BMP (incl. RLE), animated GIF (encode) |
 | dnn | ONNX inference engine (protobuf reader, graph IR, fusion passes, liveness memory plan with in-place concatenation, blocked-layout SIMD CPU kernels with row-streamed conv chains and cache-blocked GEMM-class convolutions; a Metal GPU backend on macOS that runs the whole plan in one command buffer, loaded at run time with no SDK); `FaceDetector` runs YuNet with results matching `cv2.FaceDetectorYN` and about 3.5x faster on CPU; `ObjectDetector` runs the Model Zoo's NanoDet and YOLOX (COCO) with the zoo pipelines' detections, faster than `cv2.dnn` |
+| calib3d | `findHomography` (all points, RANSAC, LMeDS + LM refinement), `getPerspectiveTransform`/`getAffineTransform`, `perspectiveTransform`, `estimateAffine2D`/`estimateAffinePartial2D`, `findFundamentalMat` (7/8-point, RANSAC, LMeDS), Rodrigues, `projectPoints` (with Jacobians), `undistortPoints`, `solvePnP` (ITERATIVE, EPnP), `solvePnPRansac`, `findChessboardCorners`, `cornerSubPix`, `calibrateCamera`, `undistort` (bit-exact), `initUndistortRectifyMap`, `remap`; RANSAC draws OpenCV's own samples, so inlier sets match OpenCV's |
 | Video | Background subtraction, multi-object tracker, MOSSE correlation tracker (follows a selected object, ~5000 updates/s per object with its three-scale search) |
 | Video I/O | `VideoCapture` / `VideoWriter`: AVI (Motion-JPEG, uncompressed, I420/YV12/Y800; idx1 and OpenDML indexes, seeking by frame) and YUV4MPEG2 in pure Zig on every platform; .mp4/.mov (H.264, HEVC) through AVFoundation on macOS; cameras (AVFoundation, V4L2) |
 | Interfaces | Zig module, C ABI, `visar` CLI (clig.dev-style: JSON output, helpful errors, pipelines, bench, demos) |
@@ -110,6 +111,31 @@ Frames are read into a caller-owned BGR, BGRA or gray image; the frame count, ra
 | write (encode q95 + mux) | 1.94x | 1.81x | 3.23x | 2.04x |
 
 On macOS, .mp4/.mov frames come out of AVFoundation as 4:2:0 and are converted by VISAR, so they are bit-identical to FFmpeg's decode of the same file read through `.y4m` (checked in CI on H.264 and HEVC clips, including seeking). On the CI runner (a VM with no hardware decoder) AVFoundation reads at 0.4-0.7x of cv2's multi-threaded FFmpeg software decoding.
+
+### Camera geometry (calib3d)
+
+`visar.calib3d` (C ABI: `visar_find_homography`, `visar_solve_pnp`, `visar_calibrate_camera`, ...) covers OpenCV's calib3d core: homographies, affine and fundamental-matrix estimation, Rodrigues, `projectPoints`, `undistortPoints`, `solvePnP` (ITERATIVE, EPnP) and `solvePnPRansac`, `findChessboardCorners` + `cornerSubPix`, `calibrateCamera`, `undistort`, `initUndistortRectifyMap` and `remap`. The small dense solvers are OpenCV's (Jacobi eigen and SVD, LU, its two Levenberg-Marquardt loops), and RANSAC/LMeDS use OpenCV's random generator, seed and subset sampler: with the default seed VISAR visits the same minimal samples in the same order as OpenCV, so results are deterministic and the inlier sets are OpenCV's. A `seed` option draws other samples.
+
+`zig build difftest` checks 1200 cases against OpenCV 5.0. Bit-exact or rounding-level: `getPerspectiveTransform`, `getAffineTransform`, Rodrigues (and its Jacobian), `projectPoints`, `undistortPoints`, EPnP, `cornerSubPix` (same window sampler, < 1e-4 px), `findFundamentalMat` (1e-12), `undistort` (identical pixels: the same fixed-point map and 15-bit bilinear blend, fused without storing the map) and `remap` (OpenCV 5's f32 kernels). Robust fits on noisy data: identical inlier masks for `findHomography`, `estimateAffine2D` and `findFundamentalMat`, matrices within 1e-6; `solvePnP` within 1e-8 and `calibrateCamera` within 1e-10 (rms, intrinsics, poses). `findChessboardCorners` finds the same boards with corners in OpenCV's order (W per row, clockwise; the first corner by the board's colours, or for symmetric boards OpenCV's choice); its raw corners are within a couple of pixels of OpenCV's (both come out of a 5x5 `cornerSubPix` started from slightly different quad vertices) and within 0.05 px after the usual 11x11 refinement. Square boards (W = H) can come out rotated by a quarter turn where OpenCV's quad traversal picks another start. Not yet: `findEssentialMat`, `recoverPose`, SQPnP/P3P, `stereoCalibrate`.
+
+Speed against OpenCV 5.0 at one thread (x86_64 VM, AVX-512; `bench/bench_vs_opencv.py --threads 1`; above 1x = VISAR faster):
+
+| Case | VISAR | OpenCV | Speedup |
+| --- | ---: | ---: | ---: |
+| findHomography RANSAC, 500 points, 30% outliers | 0.079 ms | 0.50 ms | 6.3x |
+| findHomography LMEDS, same points | 0.47 ms | 1.12 ms | 2.4x |
+| estimateAffine2D RANSAC, 500 points | 0.029 ms | 0.059 ms | 2.0x |
+| findFundamentalMat RANSAC, 300 points, 30% outliers | 0.19 ms | 0.73 ms | 3.9x |
+| solvePnP ITERATIVE, 100 points | 0.062 ms | 0.131 ms | 2.1x |
+| solvePnP EPNP, 100 points | 0.048 ms | 0.048 ms | 1.0x |
+| solvePnPRansac, 100 points, 30% outliers | 1.04 ms | 1.42 ms | 1.4x |
+| projectPoints, 1000 points | 0.027 ms | 0.145 ms | 5.3x |
+| findChessboardCorners 9x6, 1280x720 | 0.86 ms | 1.23 ms | 1.4x |
+| cornerSubPix, 54 corners, 11x11 | 0.16 ms | 0.36 ms | 2.3x |
+| undistort 1280x720 BGR / gray | 4.4 / 2.7 ms | 6.6 / 5.4 ms | 1.5x / 2.0x |
+| initUndistortRectifyMap 1280x720 | 2.0 ms | 2.5 ms | 1.2x |
+| remap linear 1280x720 BGR | 2.7 ms | 5.9 ms | 2.2x |
+| calibrateCamera, 10 views of 9x6 | 3.0 ms | 10.8 ms | 3.6x |
 
 ### 4K face detection: measured, and what 120 fps on an M3 needs
 

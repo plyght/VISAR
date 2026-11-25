@@ -222,6 +222,12 @@ def pnp():
                 run(tag + " tvec", lambda: (t1, t2), 1e-3)
 
 
+# OpenCV builds with an ARM HAL (KleidiCV, Carotene) may route remap to
+# kernels that round differently from OpenCV's reference code (see
+# test_core_vs_opencv.py); allow them a level of difference there.
+PIX_TOL, PIX_PCT = (1, 5.0) if base.HAS_HAL else (0, 100.0)
+
+
 def undistortion():
     for (h, w) in ((720, 1280), (37, 53)):
         Kw = K.copy()
@@ -230,11 +236,11 @@ def undistortion():
         for nm, d in DISTS.items():
             for cn in (1, 3, 4):
                 img = natural(h, w, cn) if cn != 4 else np.dstack([natural(h, w, 3), natural(h, w, 1)])
-                run(f"undistort {nm} c{cn} {w}x{h}", lambda: (vc.undistort(img, Kw, d), cv2.undistort(img, Kw, d)), 0)
+                run(f"undistort {nm} c{cn} {w}x{h}", lambda: (vc.undistort(img, Kw, d), cv2.undistort(img, Kw, d)), PIX_TOL, PIX_PCT)
             nk = Kw.copy()
             nk[0, 0] *= 0.8
             img = natural(h, w, 3)
-            run(f"undistort newK {nm} {w}x{h}", lambda: (vc.undistort(img, Kw, d, nk), cv2.undistort(img, Kw, d, None, nk)), 0)
+            run(f"undistort newK {nm} {w}x{h}", lambda: (vc.undistort(img, Kw, d, nk), cv2.undistort(img, Kw, d, None, nk)), PIX_TOL, PIX_PCT)
             Rr = cv2.Rodrigues(np.array([0.01, -0.02, 0.005]))[0]
             mx, my = vc.init_undistort_rectify_map(Kw, d, Rr, nk, (w, h))
             cx, cy = cv2.initUndistortRectifyMap(Kw, d, Rr, nk, (w, h), cv2.CV_32FC1)
@@ -242,7 +248,7 @@ def undistortion():
             run(f"initUndistortRectifyMap {nm} {w}x{h} y", lambda: (my, cy), 1e-4 * max(h, 1))
             for cn in (1, 3):
                 src = natural(h, w, cn)
-                run(f"remap linear {nm} c{cn} {w}x{h}", lambda: (vc.remap(src, cx, cy), cv2.remap(src, cx, cy, cv2.INTER_LINEAR)), 0)
+                run(f"remap linear {nm} c{cn} {w}x{h}", lambda: (vc.remap(src, cx, cy), cv2.remap(src, cx, cy, cv2.INTER_LINEAR)), PIX_TOL, PIX_PCT)
 
 
 def board(cols, rows, sq=40, margin=60):
