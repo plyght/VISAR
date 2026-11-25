@@ -1,0 +1,31 @@
+name: objdetect-mac
+
+# Throwaway: objdetect differential tests and 1-thread timings on Apple
+# Silicon (branch ab/objdetect-1 only).
+
+on:
+  push:
+    branches: [ab/objdetect-1]
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install numpy "opencv-python-headless==5.0.0.*"
+      - run: zig build -Doptimize=ReleaseFast
+      - name: Differential tests
+        continue-on-error: true
+        run: python3 -u -X faulthandler tests/py/test_objdetect_vs_opencv.py --lib zig-out/lib/libvisar.dylib > diff.txt 2>&1; echo "exit $?" >> diff.txt; cat diff.txt
+      - name: Bench 1 thread
+        run: |
+          for f in "QR " "ArUco"; do
+            python3 bench/bench_vs_opencv.py --lib zig-out/lib/libvisar.dylib --threads 1 --filter "$f" | tee -a bench.txt
+          done
+          { echo '```'; cat diff.txt; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
